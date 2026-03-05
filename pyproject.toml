@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pg-emigrant"
+version = "0.1.0"
+description = "PostgreSQL migration and replication orchestrator"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.29",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "typer>=0.9",
+    "rich>=13.0",
+]
+
+[project.scripts]
+replicator = "replicator.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["replicator*"]

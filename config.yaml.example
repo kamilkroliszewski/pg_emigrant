@@ -1,0 +1,31 @@
+source:
+  host: localhost
+  port: 5432
+  user: migrator
+  password: CHANGE_ME
+  dbname: postgres
+
+target:
+  host: localhost
+  port: 5433
+  user: migrator
+  password: CHANGE_ME
+  dbname: postgres
+
+schemas:
+  - public
+
+# Leave empty to auto-discover all non-system databases
+databases: []
+
+exclude_databases:
+  - template0
+  - template1
+  - postgres
+
+publication_name: pg_emigrant_pub
+subscription_name: pg_emigrant_sub
+replication_slot_name: pg_emigrant_slot
+
+parallel_workers: 4
+sequence_sync_interval: 10
