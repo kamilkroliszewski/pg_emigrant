@@ -1,14 +1,39 @@
 # pg_emigrant
 
-**PostgreSQL migration & replication orchestrator** — combines the reliability of native PostgreSQL logical replication with the automatic sequence synchronisation found in Bucardo.
+**PostgreSQL migration & replication orchestrator** — native logical replication with sequence sync, DDL drift detection, parallel initial copy, and automatic recovery from Patroni failover/switchover events.
 
 ---
 
 ## What is pg_emigrant?
 
-Native PostgreSQL logical replication is efficient and stable, but it has one well-known limitation: **it does not replicate sequence value changes**. This means that after cutting traffic over to the target server, `SERIAL` / `BIGSERIAL` columns may generate primary keys that conflict with existing data.
+Migrating a PostgreSQL database between servers is usually a headache: taking the application offline, a lengthy dump/restore, manual sequence synchronisation, and ultimately — the fear of the final cutover. **pg_emigrant** eliminates that pain.
 
-Bucardo addresses this problem but is complex to configure and does not use PostgreSQL's native replication mechanisms.
+The tool is built on top of PostgreSQL's native logical replication, but goes a step further — it resolves its well-known limitations and delivers a set of capabilities you won't find in any other open-source solution of this kind.
+
+### Why pg_emigrant?
+
+**Full failover and switchover support for Patroni clusters**
+Patroni clusters can promote a new primary at any moment. Typical replication solutions lose track after such an event — pg_emigrant deliberately manages connections and subscriptions to minimise the risk of data loss when cutting traffic over to a new target server.
+
+**Sequence synchronisation without the risk of primary key conflicts**
+Native PostgreSQL logical replication does not replicate sequence advances. This means that after the cutover, `SERIAL` / `BIGSERIAL` columns may generate primary keys that collide with existing records. pg_emigrant tracks sequences on the source and periodically updates them on the target — always moving forward, never backward.
+
+**Schema drift detection and automatic repair (DDL drift)**
+DDL changes applied on the source server (new tables, columns, indexes, constraints) are not replicated by PostgreSQL. pg_emigrant compares schemas on both servers and can automatically generate and apply corrective DDL — with no downtime and no manual work.
+
+**Lightning-fast initial copy using parallel workers**
+Instead of a serial `pg_dump | pg_restore`, pg_emigrant exports data using multiple parallel workers leveraging the COPY protocol and a consistent transaction snapshot. Many tables are copied simultaneously — reducing migration time by an order of magnitude on large databases.
+
+**Automatic database discovery**
+You don't need to enumerate every database to migrate. pg_emigrant automatically discovers databases on the source server (skipping system ones), creates them on the target, and starts replication immediately — zero per-database configuration.
+
+**Clean YAML configuration with Pydantic validation**
+The entire configuration fits in a single YAML file. Pydantic enforces correctness and reports errors before anything runs. No hidden parameters, no magic defaults.
+
+**Real-time monitoring**
+The built-in status dashboard shows subscription state, replication slot activity, WAL lag, and sequence drift for every database — all in one place, without having to dig through `pg_stat_replication`.
+
+---
 
 **pg_emigrant** combines both approaches:
 
@@ -19,8 +44,7 @@ Bucardo addresses this problem but is complex to configure and does not use Post
 | Schema drift detection (DDL drift) | ❌ | ❌ | ✅ |
 | Parallel initial copy (COPY protocol) | ❌ | ❌ | ✅ |
 | Auto-discovery of databases | ❌ | ❌ | ✅ |
-| Pydantic config + YAML | ❌ | ❌ | ✅ |
-
+| Pydantic config + YAML | ❌ | ❌ | ✅ || Patroni failover/switchover recovery | ❌ | ❌ | ✅ |
 ---
 
 ## Architecture
@@ -29,7 +53,7 @@ Bucardo addresses this problem but is complex to configure and does not use Post
 ┌─────────────────────────────────────────────────────────────────┐
 │                         pg_emigrant CLI                         │
 │  bootstrap │ start │ stop │ teardown │ status │ sync-sequences  │
-│                         detect-ddl                              │
+│                  detect-ddl │ reinit-sync                      │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
          ┌─────────────────▼──────────────────┐
@@ -335,6 +359,53 @@ Sample report:
 │ column     │ public │ users     │ phone_number    │ missing_on_target │ Column phone_number (...)│ ALTER TABLE "public"."users" ADD ...  │
 │ index      │ public │ orders    │ idx_orders_date │ missing_on_target │ CREATE INDEX ...         │ CREATE INDEX idx_orders_date ON ...  │
 └────────────┴────────┴───────────┴─────────────────┴───────────────────┴──────────────────────────┴──────────────────────────────────────┘
+```
+
+---
+
+### `replicator reinit-sync`
+
+Re-initializes replication after a **Patroni switchover or failover** — the command that makes pg_emigrant production-safe in HA environments.
+
+When Patroni promotes a new primary, the old replication slot and subscription can become broken or stale. `reinit-sync` performs a full health check and repairs whatever is needed — **without re-copying any data**.
+
+Checks performed (in order):
+1. **Publication** exists on source → recreates it if missing.
+2. **Replication slot** exists on source and has a healthy `wal_status` (not `lost`).
+3. **Subscription** on target matches the slot state:
+   - Slot healthy, subscription disabled → re-enables the subscription.
+   - Slot healthy, subscription enabled but apply worker not running → refreshes publication list.
+   - Slot missing/unhealthy or subscription missing → drops broken subscription and orphaned slot, then creates a fresh subscription with a new slot.
+
+Safe to run at any time — it only touches components that are missing or broken.
+
+```bash
+# Check and repair all databases
+replicator reinit-sync
+
+# Repair a specific database only
+replicator reinit-sync --database mydb
+
+# With a custom config
+replicator reinit-sync --config /path/to/config.yaml
+```
+
+Sample output after a Patroni switchover:
+
+```
+──────────────────── Reinit Sync — myapp ────────────────────
+  ⚠  Replication slot 'pg_emigrant_sub_myapp' not found on source
+  ⚠  Subscription 'pg_emigrant_sub_myapp' not found on target
+  ✓  Recreated subscription 'pg_emigrant_sub_myapp' with a fresh replication slot
+──────────────────── Reinit complete — issues were detected and repaired ────────────────────
+```
+
+Sample output when everything is healthy:
+
+```
+──────────────────── Reinit Sync — myapp ────────────────────
+  Replication for 'myapp' is healthy — nothing to do
+──────────────────────── All databases are healthy ──────────────────────────
 ```
 
 ---
