@@ -53,7 +53,7 @@ The built-in status dashboard shows subscription state, replication slot activit
 ┌─────────────────────────────────────────────────────────────────┐
 │                         pg_emigrant CLI                         │
 │  bootstrap │ start │ stop │ teardown │ status │ sync-sequences  │
-│                  detect-ddl │ reinit-sync                      │
+│                  detect-ddl │ reinit-sync                       │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
          ┌─────────────────▼──────────────────┐
@@ -94,7 +94,7 @@ The built-in status dashboard shows subscription state, replication slot activit
 Source DB ──────────────────────────────────────────► Target DB
     │                                                     │
     │  1. pg_export_snapshot()                            │
-    │  2. COPY TO (CSV format, parallel workers) ─────────►│
+    │  2. COPY TO (CSV format, parallel workers) ────────►│
     │                                                     │
     │  CREATE PUBLICATION pg_emigrant_pub                 │
     │         FOR TABLES IN SCHEMA public     ◄───────────┤
