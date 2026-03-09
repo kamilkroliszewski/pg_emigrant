@@ -5,7 +5,7 @@ from __future__ import annotations
 from rich.table import Table
 
 from replicator.config import ReplicatorConfig
-from replicator.db import connect, discover_databases
+from replicator.db import connect, discover_databases, discover_schemas
 from replicator.ddl_detector import detect_drift
 from replicator.replication import get_replication_slots, get_subscription_status, sub_name
 from replicator.schema_sync import get_sequences, get_tables
@@ -131,12 +131,29 @@ async def build_status(cfg: ReplicatorConfig, database: str | None = None) -> No
         # --- Table count ---
         try:
             async with connect(cfg.source, dbname) as src:
-                src_tables = await get_tables(src, cfg.schemas)
+                schemas = await discover_schemas(src, cfg)
+                src_tables = await get_tables(src, schemas)
             async with connect(cfg.target, dbname) as tgt:
-                tgt_tables = await get_tables(tgt, cfg.schemas)
-            console.print(
-                f"  Tables: source={len(src_tables)}, target={len(tgt_tables)}"
-            )
+                tgt_tables = await get_tables(tgt, schemas)
+
+            src_by_schema: dict[str, int] = {}
+            for t in src_tables:
+                src_by_schema[t["schema_name"]] = src_by_schema.get(t["schema_name"], 0) + 1
+            tgt_by_schema: dict[str, int] = {}
+            for t in tgt_tables:
+                tgt_by_schema[t["schema_name"]] = tgt_by_schema.get(t["schema_name"], 0) + 1
+
+            count_table = Table(title="Tables per Schema", show_lines=True)
+            count_table.add_column("Schema")
+            count_table.add_column("Source", justify="right")
+            count_table.add_column("Target", justify="right")
+            for schema in sorted(set(list(src_by_schema) + list(tgt_by_schema))):
+                src_n = src_by_schema.get(schema, 0)
+                tgt_n = tgt_by_schema.get(schema, 0)
+                match = src_n == tgt_n
+                style = "" if match else "yellow"
+                count_table.add_row(schema, str(src_n), str(tgt_n), style=style)
+            console.print(count_table)
         except Exception as exc:
             console.print(f"[red]Cannot count tables: {exc}")
 
