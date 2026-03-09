@@ -52,6 +52,43 @@ async def create_pool(
         await pool.close()
 
 
+# System schemas that are never migrated regardless of configuration.
+_SYSTEM_SCHEMAS = {
+    "information_schema",
+    "pg_catalog",
+    "pg_toast",
+}
+
+
+async def discover_schemas(
+    conn: asyncpg.Connection,
+    cfg: ReplicatorConfig,
+) -> list[str]:
+    """Return user-defined schemas present in the connected database.
+
+    If ``cfg.schemas`` is non-empty those are returned directly (explicit list
+    always wins).  Otherwise every schema that is not a PostgreSQL internal
+    schema (``pg_catalog``, ``information_schema``, ``pg_toast``,
+    ``pg_temp_*``, ``pg_toast_temp_*``) is included.
+    """
+    if cfg.schemas:
+        return list(cfg.schemas)
+
+    rows = await conn.fetch(
+        """
+        SELECT nspname
+        FROM pg_namespace
+        WHERE nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+          AND nspname NOT LIKE 'pg_temp_%'
+          AND nspname NOT LIKE 'pg_toast_temp_%'
+        ORDER BY nspname
+        """
+    )
+    schemas = [r["nspname"] for r in rows]
+    log.info("Discovered schemas: %s", schemas)
+    return schemas
+
+
 async def discover_databases(cfg: ReplicatorConfig) -> list[str]:
     """Return the list of user databases on the source server.
 
