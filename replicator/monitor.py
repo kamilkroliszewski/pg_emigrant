@@ -34,15 +34,19 @@ async def build_status(cfg: ReplicatorConfig, database: str | None = None) -> No
         sub_table.add_column("PID")
         sub_table.add_column("Received LSN")
         sub_table.add_column("Latest End LSN")
+        sub_table.add_column("Lag", style="bold")
         sub_table.add_column("Last Msg Sent")
         sub_table.add_column("Last Msg Received")
 
         for r in sub_rows:
+            lag = str(r.get("lag", ""))
+            lag_style = "red" if lag and lag != "0 bytes" else "green"
             sub_table.add_row(
                 str(r.get("subname", "")),
                 str(r.get("pid", "")),
                 str(r.get("received_lsn", "")),
                 str(r.get("latest_end_lsn", "")),
+                f"[{lag_style}]{lag}[/{lag_style}]",
                 str(r.get("last_msg_send_time", "")),
                 str(r.get("last_msg_receipt_time", "")),
             )
