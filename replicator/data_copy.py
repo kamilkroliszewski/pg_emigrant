@@ -95,7 +95,7 @@ async def copy_table_data_pipe(
         _col_query = """
             SELECT a.attname AS column_name
             FROM pg_attribute a
-            WHERE a.attrelid = ($1 || '.' || $2)::regclass
+            WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass
               AND a.attnum > 0
               AND NOT a.attisdropped
               AND a.attgenerated = ''
