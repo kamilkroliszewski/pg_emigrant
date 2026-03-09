@@ -53,10 +53,20 @@ async def create_pool(
 
 
 # System schemas that are never migrated regardless of configuration.
+# Includes PostgreSQL built-ins and TimescaleDB internal schemas — those are
+# managed exclusively by the extension and must not be manually reproduced.
 _SYSTEM_SCHEMAS = {
     "information_schema",
     "pg_catalog",
     "pg_toast",
+    # TimescaleDB-managed internal schemas
+    "_timescaledb_catalog",
+    "_timescaledb_config",
+    "_timescaledb_internal",
+    "_timescaledb_cache",
+    "timescaledb_information",
+    "timescaledb_experimental",
+    "toolkit_experimental",
 }
 
 
@@ -78,11 +88,12 @@ async def discover_schemas(
         """
         SELECT nspname
         FROM pg_namespace
-        WHERE nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
-          AND nspname NOT LIKE 'pg_temp_%'
+        WHERE nspname NOT LIKE 'pg_temp_%'
           AND nspname NOT LIKE 'pg_toast_temp_%'
+          AND nspname != ALL($1::text[])
         ORDER BY nspname
-        """
+        """,
+        list(_SYSTEM_SCHEMAS),
     )
     schemas = [r["nspname"] for r in rows]
     log.info("Discovered schemas: %s", schemas)
