@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncpg
 
-from replicator.utils import get_logger, qi, qt
+from replicator.utils import console, get_logger, qi, qt
 
 log = get_logger(__name__)
 
@@ -517,6 +517,54 @@ async def sync_enum_types(
                     await target_conn.execute(ddl)
 
 
+async def sync_replica_identity(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> None:
+    """Set REPLICA IDENTITY FULL on tables that have no primary key.
+
+    Logical replication requires a way to identify updated/deleted rows.
+    Without a PK (or a unique index marked as replica identity), PostgreSQL
+    rejects DML on the subscriber.  REPLICA IDENTITY FULL makes PostgreSQL
+    include all columns in the WAL record so rows can be matched by value.
+    This is set on BOTH source and target so the publication and subscription
+    are consistent.
+    """
+    no_pk_tables = await source_conn.fetch(
+        """
+        SELECT n.nspname AS schema_name, c.relname AS table_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY($1::text[])
+          AND c.relkind = 'r'
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_index ix
+              WHERE ix.indrelid = c.oid AND ix.indisprimary
+          )
+        ORDER BY n.nspname, c.relname
+        """,
+        schemas,
+    )
+    for row in no_pk_tables:
+        fqn = f"{qi(row['schema_name'])}.{qi(row['table_name'])}"
+        console.print(
+            f"  [bold yellow]⚠ No PRIMARY KEY:[/bold yellow] {fqn} — setting REPLICA IDENTITY FULL"
+        )
+        stmt = f"ALTER TABLE {fqn} REPLICA IDENTITY FULL;"
+        for conn, label in ((source_conn, "source"), (target_conn, "target")):
+            try:
+                await conn.execute(stmt)
+                log.debug(
+                    "Set REPLICA IDENTITY FULL on %s (%s)", fqn, label
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not set REPLICA IDENTITY FULL on %s (%s): %s",
+                    fqn, label, exc,
+                )
+
+
 async def sync_extensions(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
@@ -585,6 +633,10 @@ async def sync_schemas(
     # Second pass: foreign keys
     for t in tables:
         await _sync_foreign_keys(source_conn, target_conn, t["schema_name"], t["table_name"])
+
+    # Set REPLICA IDENTITY FULL on tables without PK on both sides so that
+    # logical replication can handle UPDATE/DELETE without a unique row identifier.
+    await sync_replica_identity(source_conn, target_conn, schemas)
 
     log.info("Schema synchronization complete for schemas: %s", schemas)
 
