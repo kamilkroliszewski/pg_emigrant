@@ -16,6 +16,7 @@ from replicator.schema_sync import (
     generate_full_table_ddl,
     get_columns,
     get_constraints,
+    get_enum_types,
     get_indexes,
     get_tables,
 )
@@ -197,6 +198,52 @@ async def detect_drift(
                     detail=c["constraint_def"],
                     fix_ddl=fix,
                 ))
+
+        # Enum types
+        src_enums = await get_enum_types(src, cfg.schemas)
+        tgt_enums = await get_enum_types(tgt, cfg.schemas)
+        tgt_enum_map = {
+            (e["schema_name"], e["type_name"]): list(e["labels"]) for e in tgt_enums
+        }
+
+        for src_enum in src_enums:
+            schema = src_enum["schema_name"]
+            type_name = src_enum["type_name"]
+            src_labels: list[str] = list(src_enum["labels"])
+            key = (schema, type_name)
+
+            if key not in tgt_enum_map:
+                labels_sql = ", ".join(f"'{lbl}'" for lbl in src_labels)
+                fix = (
+                    f"CREATE TYPE {qi(schema)}.{qi(type_name)} "
+                    f"AS ENUM ({labels_sql});"
+                )
+                report.items.append(DriftItem(
+                    object_type="enum",
+                    schema=schema,
+                    table="",
+                    name=type_name,
+                    drift_type="missing_on_target",
+                    detail=f"Enum type {schema}.{type_name} missing on target",
+                    fix_ddl=fix,
+                ))
+            else:
+                tgt_label_set = set(tgt_enum_map[key])
+                for label in src_labels:
+                    if label not in tgt_label_set:
+                        fix = (
+                            f"ALTER TYPE {qi(schema)}.{qi(type_name)} "
+                            f"ADD VALUE IF NOT EXISTS '{label}';"
+                        )
+                        report.items.append(DriftItem(
+                            object_type="enum",
+                            schema=schema,
+                            table="",
+                            name=type_name,
+                            drift_type="different",
+                            detail=f"Enum value '{label}' missing on target",
+                            fix_ddl=fix,
+                        ))
 
     return report
 
