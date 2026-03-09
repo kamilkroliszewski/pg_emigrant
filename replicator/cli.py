@@ -168,10 +168,14 @@ def detect_ddl(
         False, "--drop-extra",
         help="Also DROP tables/objects on target that no longer exist on source (destructive!)",
     ),
+    fix_roles: bool = typer.Option(
+        False, "--fix-roles",
+        help="Detect and fix ownership drift for tables, sequences, and schemas",
+    ),
 ):
     """Detect schema drift between source and target."""
     from replicator.db import discover_databases
-    from replicator.ddl_detector import apply_drift_fixes, detect_drift
+    from replicator.ddl_detector import apply_drift_fixes, detect_drift, detect_ownership_drift
 
     cfg = load_config(config)
 
@@ -183,54 +187,89 @@ def detect_ddl(
 
             if not report.has_drift:
                 console.print("[green]No schema drift detected")
-                continue
+            else:
+                tbl = Table(title=f"Schema Drift — {db}", show_lines=True)
+                tbl.add_column("Type")
+                tbl.add_column("Schema")
+                tbl.add_column("Table")
+                tbl.add_column("Name")
+                tbl.add_column("Drift")
+                tbl.add_column("Detail")
+                tbl.add_column("Fix DDL")
 
-            tbl = Table(title=f"Schema Drift — {db}", show_lines=True)
-            tbl.add_column("Type")
-            tbl.add_column("Schema")
-            tbl.add_column("Table")
-            tbl.add_column("Name")
-            tbl.add_column("Drift")
-            tbl.add_column("Detail")
-            tbl.add_column("Fix DDL")
-
-            for item in report.items:
-                style = ""
-                if item.drift_type == "missing_on_target":
-                    style = "yellow"
-                elif item.drift_type == "missing_on_source":
-                    style = "red"
-                elif item.drift_type == "different":
-                    style = "red"
-                # Truncate long DDL for readability in the table
-                ddl_preview = item.fix_ddl
-                if ddl_preview and len(ddl_preview) > 80:
-                    ddl_preview = ddl_preview[:77] + "..."
-                tbl.add_row(
-                    item.object_type,
-                    item.schema,
-                    item.table,
-                    item.name,
-                    item.drift_type,
-                    item.detail,
-                    ddl_preview or "—",
-                    style=style,
-                )
-            console.print(tbl)
-
-            if apply:
-                if drop_extra:
-                    console.print(
-                        "[bold red]WARNING:[/bold red] --drop-extra will DROP tables on target "
-                        "that do not exist on source. This is destructive!"
+                for item in report.items:
+                    style = ""
+                    if item.drift_type == "missing_on_target":
+                        style = "yellow"
+                    elif item.drift_type == "missing_on_source":
+                        style = "red"
+                    elif item.drift_type == "different":
+                        style = "red"
+                    ddl_preview = item.fix_ddl
+                    if ddl_preview and len(ddl_preview) > 80:
+                        ddl_preview = ddl_preview[:77] + "..."
+                    tbl.add_row(
+                        item.object_type,
+                        item.schema,
+                        item.table,
+                        item.name,
+                        item.drift_type,
+                        item.detail,
+                        ddl_preview or "—",
+                        style=style,
                     )
-                applied = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
-                console.print(f"[green]Applied {applied} fix(es) for {db}")
-            elif report.has_drift:
-                console.print(
-                    "[dim]Run with [bold]--apply[/bold] to fix missing objects, "
-                    "or [bold]--apply --drop-extra[/bold] to also drop extra tables.[/dim]"
-                )
+                console.print(tbl)
+
+                if apply:
+                    if drop_extra:
+                        console.print(
+                            "[bold red]WARNING:[/bold red] --drop-extra will DROP tables on target "
+                            "that do not exist on source. This is destructive!"
+                        )
+                    applied = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
+                    console.print(f"[green]Applied {applied} fix(es) for {db}")
+                else:
+                    console.print(
+                        "[dim]Run with [bold]--apply[/bold] to fix missing objects, "
+                        "or [bold]--apply --drop-extra[/bold] to also drop extra tables.[/dim]"
+                    )
+
+            # Ownership drift
+            if fix_roles:
+                ownership_items = await detect_ownership_drift(cfg, db)
+                if not ownership_items:
+                    console.print("[green]No ownership drift detected")
+                else:
+                    own_tbl = Table(title=f"Ownership Drift — {db}", show_lines=True)
+                    own_tbl.add_column("Kind")
+                    own_tbl.add_column("Schema")
+                    own_tbl.add_column("Object")
+                    own_tbl.add_column("Detail")
+                    own_tbl.add_column("Fix DDL")
+                    for item in ownership_items:
+                        ddl_preview = item.fix_ddl or "[red]role missing on target[/red]"
+                        own_tbl.add_row(
+                            item.object_type,
+                            item.schema,
+                            item.name,
+                            item.detail,
+                            ddl_preview,
+                            style="yellow" if item.fix_ddl else "red",
+                        )
+                    console.print(own_tbl)
+
+                    if apply:
+                        own_applied = 0
+                        from replicator.db import connect as db_connect
+                        from replicator.schema_sync import sync_ownership
+                        async with db_connect(cfg.source, db) as src_conn, \
+                                   db_connect(cfg.target, db) as tgt_conn:
+                            own_applied = await sync_ownership(src_conn, tgt_conn, cfg.schemas)
+                        console.print(f"[green]Applied {own_applied} ownership change(s) for {db}")
+                    else:
+                        console.print(
+                            "[dim]Run with [bold]--apply[/bold] to apply ownership fixes.[/dim]"
+                        )
 
     _run(_detect())
 
