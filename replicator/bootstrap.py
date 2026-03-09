@@ -16,7 +16,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from replicator.config import ReplicatorConfig
 from replicator.data_copy import copy_all_tables
-from replicator.db import connect, discover_databases
+from replicator.db import connect, discover_databases, discover_schemas
 from replicator.replication import create_publication, create_subscription
 from replicator.schema_sync import get_tables, sync_deferred_indexes, sync_schemas
 from replicator.utils import console, get_logger
@@ -61,15 +61,17 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             progress.update(task, description=f"[{dbname}] Creating database…")
             await ensure_database_exists(cfg, dbname)
 
-            # Step 3: synchronize schemas
+            # Step 3: discover schemas for this database, then synchronize them
             progress.update(task, description=f"[{dbname}] Syncing schemas…")
             async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                await sync_schemas(src, tgt, cfg.schemas)
+                schemas = await discover_schemas(src, cfg)
+                console.print(f"  [{dbname}] Schemas: {schemas}")
+                await sync_schemas(src, tgt, schemas)
 
             # Step 4: copy initial data
             progress.update(task, description=f"[{dbname}] Copying data…")
             async with connect(cfg.source, dbname) as src:
-                tables = await get_tables(src, cfg.schemas)
+                tables = await get_tables(src, schemas)
 
             if tables:
                 results = await copy_all_tables(cfg, dbname, tables)
@@ -83,11 +85,11 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             # Step 4b: create non-unique indexes after COPY (faster than during insert)
             progress.update(task, description=f"[{dbname}] Creating indexes…")
             async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                await sync_deferred_indexes(src, tgt, cfg.schemas)
+                await sync_deferred_indexes(src, tgt, schemas)
 
             # Step 5: create publication + subscription
             progress.update(task, description=f"[{dbname}] Setting up replication…")
-            await create_publication(cfg, dbname)
+            await create_publication(cfg, dbname, schemas=schemas)
             await create_subscription(cfg, dbname)
 
             progress.update(task, description=f"[{dbname}] ✓ Done")
