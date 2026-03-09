@@ -79,6 +79,20 @@ _SEQUENCE_STATE_SQL = """
 SELECT last_value, is_called FROM {seq};
 """
 
+_ENUM_TYPES_SQL = """
+SELECT
+    n.nspname                                              AS schema_name,
+    t.typname                                              AS type_name,
+    array_agg(e.enumlabel ORDER BY e.enumsortorder)        AS labels
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+JOIN pg_enum e ON e.enumtypid = t.oid
+WHERE n.nspname = ANY($1::text[])
+  AND t.typtype = 'e'
+GROUP BY n.nspname, t.typname
+ORDER BY n.nspname, t.typname;
+"""
+
 
 # ---------------------------------------------------------------------------
 # Data classes (plain dicts for simplicity)
@@ -117,6 +131,13 @@ async def get_sequences(
 ) -> list[dict]:
     """Return sequences in the given schemas."""
     return [dict(r) for r in await conn.fetch(_SEQUENCES_SQL, schemas)]
+
+
+async def get_enum_types(
+    conn: asyncpg.Connection, schemas: list[str]
+) -> list[dict]:
+    """Return enum types in the given schemas with their ordered label lists."""
+    return [dict(r) for r in await conn.fetch(_ENUM_TYPES_SQL, schemas)]
 
 
 async def get_sequence_value(
@@ -305,20 +326,41 @@ async def _sync_indexes(
     target_conn: asyncpg.Connection,
     schema: str,
     table: str,
+    *,
+    deferred: bool = False,
 ) -> None:
+    """Synchronize indexes for a single table.
+
+    deferred=False (default, schema-sync phase): creates only UNIQUE non-PK
+    indexes, which are needed to back constraints and FK references before data
+    is loaded.
+
+    deferred=True (post-COPY phase): creates only non-unique, non-PK indexes.
+    Building them after COPY is significantly faster because PostgreSQL can do
+    a single sequential scan instead of incrementally updating each index on
+    every inserted row.
+    """
     fqn = f"{qi(schema)}.{qi(table)}"
     src_indexes = await get_indexes(source_conn, fqn)
     tgt_indexes = await get_indexes(target_conn, fqn)
     tgt_names = {i["index_name"] for i in tgt_indexes}
 
     for idx in src_indexes:
-        if idx["index_name"] not in tgt_names and not idx["is_primary"]:
-            stmt = idx["index_def"] + ";"
-            log.info("Creating index %s on %s", idx["index_name"], fqn)
-            try:
-                await target_conn.execute(stmt)
-            except asyncpg.DuplicateObjectError:
-                log.debug("Index %s already exists", idx["index_name"])
+        if idx["is_primary"] or idx["index_name"] in tgt_names:
+            continue
+        is_non_unique = not idx["is_unique"]
+        # deferred phase  → only non-unique indexes
+        # schema-sync phase → only unique indexes
+        if deferred and not is_non_unique:
+            continue
+        if not deferred and is_non_unique:
+            continue
+        stmt = idx["index_def"] + ";"
+        log.info("Creating index %s on %s", idx["index_name"], fqn)
+        try:
+            await target_conn.execute(stmt)
+        except asyncpg.DuplicateObjectError:
+            log.debug("Index %s already exists", idx["index_name"])
 
 
 async def sync_sequence(
@@ -370,15 +412,69 @@ async def sync_sequence(
     log.debug("Sequence %s synced to %s", fqn, src_val["last_value"])
 
 
+async def sync_enum_types(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> None:
+    """Create missing enum types on the target before tables are created."""
+    rows = await source_conn.fetch(_ENUM_TYPES_SQL, schemas)
+    for row in rows:
+        schema = row["schema_name"]
+        type_name = row["type_name"]
+        labels: list[str] = list(row["labels"])
+
+        exists = await target_conn.fetchval(
+            "SELECT EXISTS ("
+            "  SELECT 1 FROM pg_type t"
+            "  JOIN pg_namespace n ON n.oid = t.typnamespace"
+            "  WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'e'"
+            ")",
+            schema,
+            type_name,
+        )
+        if not exists:
+            labels_sql = ", ".join(f"'{label}'" for label in labels)
+            ddl = f"CREATE TYPE {qi(schema)}.{qi(type_name)} AS ENUM ({labels_sql});"
+            log.info("Creating enum type %s.%s", schema, type_name)
+            await target_conn.execute(ddl)
+        else:
+            # Ensure all source labels exist on target (enums can only grow)
+            tgt_labels: list[str] = list(
+                await target_conn.fetchval(
+                    "SELECT array_agg(enumlabel ORDER BY enumsortorder) "
+                    "FROM pg_enum e "
+                    "JOIN pg_type t ON t.oid = e.enumtypid "
+                    "JOIN pg_namespace n ON n.oid = t.typnamespace "
+                    "WHERE n.nspname = $1 AND t.typname = $2",
+                    schema,
+                    type_name,
+                )
+                or []
+            )
+            tgt_label_set = set(tgt_labels)
+            for label in labels:
+                if label not in tgt_label_set:
+                    ddl = (
+                        f"ALTER TYPE {qi(schema)}.{qi(type_name)} "
+                        f"ADD VALUE IF NOT EXISTS '{label}';"
+                    )
+                    log.info("Adding enum value '%s' to %s.%s", label, schema, type_name)
+                    await target_conn.execute(ddl)
+
+
 async def sync_schemas(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
 ) -> None:
-    """Full schema synchronization: schemas → sequences → tables → FKs."""
+    """Full schema synchronization: schemas → enums → sequences → tables → FKs."""
     # Ensure target schemas exist
     for s in schemas:
         await ensure_schema_exists(target_conn, s)
+
+    # Sync enum types BEFORE tables so columns with enum types can be created
+    await sync_enum_types(source_conn, target_conn, schemas)
 
     # Sync sequences FIRST so that table DDL with DEFAULT nextval(...) succeeds
     sequences = await get_sequences(source_conn, schemas)
@@ -467,8 +563,29 @@ async def _sync_table_structure(
             except asyncpg.DuplicateObjectError:
                 pass
 
-    # Indexes
-    await _sync_indexes(source_conn, target_conn, schema, table)
+    # Unique indexes only — non-unique indexes are deferred until after COPY
+    await _sync_indexes(source_conn, target_conn, schema, table, deferred=False)
+
+
+async def sync_deferred_indexes(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> None:
+    """Create non-unique indexes for all tables in *schemas*.
+
+    Called after the initial data COPY so that PostgreSQL builds each index in
+    a single pass rather than updating it row-by-row during bulk insert.
+    PK and UNIQUE indexes are already present from the schema-sync phase.
+    """
+    tables = await get_tables(source_conn, schemas)
+    for t in tables:
+        await _sync_indexes(
+            source_conn, target_conn,
+            t["schema_name"], t["table_name"],
+            deferred=True,
+        )
+    log.info("Deferred index creation complete for schemas: %s", schemas)
 
 
 async def _sync_foreign_keys(
