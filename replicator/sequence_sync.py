@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from replicator.config import ReplicatorConfig
-from replicator.db import connect
+from replicator.db import connect, discover_schemas
 from replicator.schema_sync import get_sequences
 from replicator.utils import get_logger, qt
 
@@ -45,7 +45,8 @@ async def sync_sequences_once(
     all setval() calls, reducing round-trips from O(N) to O(1) per server.
     """
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-        sequences = await get_sequences(src, cfg.schemas)
+        schemas = await discover_schemas(src, cfg)
+        sequences = await get_sequences(src, schemas)
         if not sequences:
             return []
 
