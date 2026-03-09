@@ -60,21 +60,21 @@ The built-in status dashboard shows subscription state, replication slot activit
 ┌─────────────────────────────────────────────────────────────────┐
 │                         pg_emigrant CLI                         │
 │  bootstrap │ start │ stop │ teardown │ status │ sync-sequences  │
-│                  detect-ddl │ reinit-sync                      │
+│                  detect-ddl │ reinit-sync                       │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
-         ┌─────────────────▼──────────────────┐
-         │           bootstrap.py             │
-         │  1. discover databases             │
-         │  2. create DBs on target           │
-         │  3. discover schemas (per DB)      │
-         │  4. sync schemas (no plain indexes)│
-         │  5. parallel COPY (snapshot safe)  │
-         │  6. create plain indexes (post-COPY│
+         ┌─────────────────▼───────────────────┐
+         │           bootstrap.py              │
+         │  1. discover databases              │
+         │  2. create DBs on target            │
+         │  3. discover schemas (per DB)       │
+         │  4. sync schemas (no plain indexes) │
+         │  5. parallel COPY (snapshot safe)   │
+         │  6. create plain indexes (post-COPY │
          │  7. sync ownership (tables/seq/sch) │
-         │  8. create publication             │
-         │  9. create subscription            │
-         └─────────────────┬──────────────────┘
+         │  8. create publication              │
+         │  9. create subscription             │
+         └─────────────────┬───────────────────┘
                            │
     ┌──────────────────────┼──────────────────────┐
     │                      │                      │
@@ -104,7 +104,7 @@ The built-in status dashboard shows subscription state, replication slot activit
 Source DB ──────────────────────────────────────────► Target DB
     │                                                     │
     │  1. pg_export_snapshot()                            │
-    │  2. COPY TO (CSV format, parallel workers) ─────────►│
+    │  2. COPY TO (CSV format, parallel workers) ───────►│
     │                                                     │
     │  CREATE PUBLICATION pg_emigrant_pub                 │
     │         FOR TABLES IN SCHEMA public     ◄───────────┤
@@ -321,8 +321,8 @@ replicator sync-sequences --database mydb --loop
 One-off synchronisation output:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                 Sequence Sync — myapp                    │
+┌─────────────────────────────────────────────────────────┐
+│                 Sequence Sync — myapp                   │
 ├────────┬────────────────┬────────┬────────┬─────────────┤
 │ Schema │ Sequence       │ Source │ Target │ Status      │
 ├────────┼────────────────┼────────┼────────┼─────────────┤
@@ -375,12 +375,12 @@ Sample ownership drift report:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━ Ownership Drift — myapp ━━━━━━━━━━━━━━━━━━━━━━
-┌──────────────────┬────────┬───────────┬─────────────────────────────────────┬────────────────────────────────────────────┐
-│ Kind             │ Schema │ Object    │ Detail                              │ Fix DDL                                    │
-├──────────────────┼────────┼───────────┼─────────────────────────────────────┼────────────────────────────────────────────┤
+┌──────────────────┬────────┬───────────┬─────────────────────────────────────┬────────────────────────────────────────────────┐
+│ Kind             │ Schema │ Object    │ Detail                              │ Fix DDL                                        │
+├──────────────────┼────────┼───────────┼─────────────────────────────────────┼────────────────────────────────────────────────┤
 │ ownership(table) │ public │ orders    │ Owner mismatch: src=app, tgt=postgres│ ALTER TABLE "public"."orders" OWNER TO "app"; │
 │ ownership(schema)│ public │ public    │ Owner mismatch: src=app, tgt=postgres│ ALTER SCHEMA "public" OWNER TO "app";         │
-└──────────────────┴────────┴───────────┴─────────────────────────────────────┴────────────────────────────────────────────┘
+└──────────────────┴────────┴───────────┴─────────────────────────────────────┴────────────────────────────────────────────────┘
 ```
 
 Sample report:
@@ -390,7 +390,7 @@ Sample report:
 ┌────────────┬────────┬───────────┬─────────────────┬───────────────────┬──────────────────────────┬──────────────────────────────────────┐
 │ Type       │ Schema │ Table     │ Name            │ Drift             │ Detail                   │ Fix DDL                              │
 ├────────────┼────────┼───────────┼─────────────────┼───────────────────┼──────────────────────────┼──────────────────────────────────────┤
-│ column     │ public │ users     │ phone_number    │ missing_on_target │ Column phone_number (...)│ ALTER TABLE "public"."users" ADD ...  │
+│ column     │ public │ users     │ phone_number    │ missing_on_target │ Column phone_number (...)│ ALTER TABLE "public"."users" ADD ... │
 │ index      │ public │ orders    │ idx_orders_date │ missing_on_target │ CREATE INDEX ...         │ CREATE INDEX idx_orders_date ON ...  │
 └────────────┴────────┴───────────┴─────────────────┴───────────────────┴──────────────────────────┴──────────────────────────────────────┘
 ```
