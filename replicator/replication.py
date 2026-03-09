@@ -35,9 +35,15 @@ def sub_name(cfg: ReplicatorConfig, dbname: str) -> str:
 async def create_publication(
     cfg: ReplicatorConfig,
     dbname: str,
+    schemas: list[str] | None = None,
 ) -> None:
-    """Create a publication for all tables in the configured schemas."""
+    """Create a publication for all tables in *schemas*.
+
+    *schemas* defaults to ``cfg.schemas`` when not provided.  Pass an explicit
+    list when schemas were auto-discovered per-database during bootstrap.
+    """
     pub = pub_name(cfg, dbname)
+    resolved_schemas = schemas if schemas is not None else cfg.schemas
     async with connect(cfg.source, dbname) as conn:
         exists = await conn.fetchval(
             "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", pub
@@ -47,11 +53,11 @@ async def create_publication(
             return
 
         # Publication for all tables in the listed schemas
-        schema_list = ", ".join(qi(s) for s in cfg.schemas)
+        schema_list = ", ".join(qi(s) for s in resolved_schemas)
         await conn.execute(
             f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
         )
-        log.info("Created publication %s in %s for schemas %s", pub, dbname, cfg.schemas)
+        log.info("Created publication %s in %s for schemas %s", pub, dbname, resolved_schemas)
 
 
 async def drop_publication(
