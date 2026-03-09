@@ -567,6 +567,100 @@ async def _sync_table_structure(
     await _sync_indexes(source_conn, target_conn, schema, table, deferred=False)
 
 
+_OBJECT_OWNERS_SQL = """
+SELECT
+    n.nspname   AS schema_name,
+    c.relname   AS object_name,
+    CASE c.relkind
+        WHEN 'r' THEN 'table'
+        WHEN 'S' THEN 'sequence'
+    END         AS kind,
+    r.rolname   AS owner
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_roles r     ON r.oid = c.relowner
+WHERE n.nspname = ANY($1::text[])
+  AND c.relkind IN ('r', 'S')
+ORDER BY n.nspname, c.relkind, c.relname;
+"""
+
+_SCHEMA_OWNERS_SQL = """
+SELECT n.nspname AS schema_name, r.rolname AS owner
+FROM pg_namespace n
+JOIN pg_roles r ON r.oid = n.nspowner
+WHERE n.nspname = ANY($1::text[])
+ORDER BY n.nspname;
+"""
+
+
+async def get_object_owners(
+    conn: asyncpg.Connection, schemas: list[str]
+) -> list[dict]:
+    """Return owner metadata for tables, sequences, and schemas in *schemas*."""
+    rows = [dict(r) for r in await conn.fetch(_OBJECT_OWNERS_SQL, schemas)]
+    schema_rows = [
+        {"schema_name": r["schema_name"], "object_name": r["schema_name"],
+         "kind": "schema", "owner": r["owner"]}
+        for r in await conn.fetch(_SCHEMA_OWNERS_SQL, schemas)
+    ]
+    return schema_rows + rows
+
+
+async def sync_ownership(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> int:
+    """Synchronize ownership of tables, sequences, and schemas from source to target.
+
+    Emits ``ALTER TABLE/SEQUENCE/SCHEMA ... OWNER TO`` for every object whose
+    owner on the target differs from the source.  Roles that do not exist on the
+    target are skipped with a warning — create them manually beforehand if needed.
+
+    Returns the number of ownership changes applied.
+    """
+    src_owners = {
+        (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
+        for r in await get_object_owners(source_conn, schemas)
+    }
+    tgt_owners = {
+        (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
+        for r in await get_object_owners(target_conn, schemas)
+    }
+
+    # Pre-fetch roles that exist on target to avoid erroring on missing roles
+    existing_roles = {
+        r["rolname"]
+        for r in await target_conn.fetch("SELECT rolname FROM pg_roles")
+    }
+
+    applied = 0
+    for (schema, obj, kind), src_owner in src_owners.items():
+        tgt_owner = tgt_owners.get((schema, obj, kind))
+        if tgt_owner == src_owner:
+            continue
+        if src_owner not in existing_roles:
+            log.warning(
+                "Skipping ownership of %s %s.%s — role '%s' does not exist on target",
+                kind, schema, obj, src_owner,
+            )
+            continue
+        if kind == "table":
+            stmt = f"ALTER TABLE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
+        elif kind == "sequence":
+            stmt = f"ALTER SEQUENCE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
+        else:  # schema
+            stmt = f"ALTER SCHEMA {qi(obj)} OWNER TO {qi(src_owner)};"
+        try:
+            await target_conn.execute(stmt)
+            log.info("Set owner of %s %s.%s to %s", kind, schema, obj, src_owner)
+            applied += 1
+        except Exception as exc:
+            log.error("Failed to set owner of %s %s.%s — %s", kind, schema, obj, exc)
+
+    return applied
+
+
 async def sync_deferred_indexes(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
