@@ -133,19 +133,26 @@ def sync_sequences(
             tasks = [run_sequence_sync_loop(cfg, db) for db in dbs]
             await asyncio.gather(*tasks)
         else:
-            for db in dbs:
-                report = await sync_sequences_once(cfg, db)
+            reports = await asyncio.gather(*[sync_sequences_once(cfg, db) for db in dbs])
+            for db, report in zip(dbs, reports):
                 tbl = Table(title=f"Sequence Sync — {db}", show_lines=True)
                 tbl.add_column("Schema")
                 tbl.add_column("Sequence")
                 tbl.add_column("Source")
                 tbl.add_column("Target")
                 tbl.add_column("Status")
+                _STATUS_STYLE = {
+                    "ok": "green",
+                    "updated": "yellow",
+                    "target_ahead": "cyan",
+                }
                 for r in report:
+                    status = r["status"]
+                    style = _STATUS_STYLE.get(status, "")
                     tbl.add_row(
                         r["schema"], r["sequence"],
                         str(r["source_value"]), str(r["target_value"]),
-                        r["status"],
+                        f"[{style}]{status}[/{style}]" if style else status,
                     )
                 console.print(tbl)
 
@@ -226,6 +233,53 @@ def detect_ddl(
                 )
 
     _run(_detect())
+
+
+@app.command(name="reinit-sync")
+def reinit_sync(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file"),
+    database: Optional[str] = typer.Option(
+        None, "--database", "-d",
+        help="Reinit only this database (default: all discovered)",
+    ),
+):
+    """Re-initialize replication after a Patroni switchover/failover.
+
+    Checks each database for missing or broken publications, replication slots,
+    and subscriptions, then repairs them without re-copying data.
+
+    Safe to run at any time — it only creates/enables/refreshes components
+    that are missing or not working.
+    """
+    from replicator.db import discover_databases
+    from replicator.replication import reinit_sync as do_reinit
+
+    cfg = load_config(config)
+
+    async def _reinit():
+        dbs = [database] if database else await discover_databases(cfg)
+        all_healthy = True
+
+        for db in dbs:
+            console.rule(f"[bold cyan]Reinit Sync — {db}")
+            result = await do_reinit(cfg, db)
+
+            if result["issues_found"]:
+                all_healthy = False
+                for issue in result["issues_found"]:
+                    console.print(f"  [yellow]⚠  {issue}")
+            if result["actions_taken"]:
+                for action in result["actions_taken"]:
+                    console.print(f"  [green]✓  {action}")
+            if result["was_healthy"]:
+                console.print(f"  [green]Replication for '{db}' is healthy — nothing to do")
+
+        if all_healthy:
+            console.rule("[bold green]All databases are healthy")
+        else:
+            console.rule("[bold yellow]Reinit complete — issues were detected and repaired")
+
+    _run(_reinit())
 
 
 if __name__ == "__main__":
