@@ -18,6 +18,7 @@ from replicator.schema_sync import (
     get_constraints,
     get_enum_types,
     get_indexes,
+    get_object_owners,
     get_tables,
 )
 from replicator.utils import get_logger, qi, qt
@@ -246,6 +247,62 @@ async def detect_drift(
                         ))
 
     return report
+
+
+async def detect_ownership_drift(
+    cfg: ReplicatorConfig,
+    dbname: str,
+) -> list[DriftItem]:
+    """Return DriftItems for every object whose owner differs between source and target.
+
+    Covers tables, sequences, and user schemas.  Objects whose source owner
+    does not exist on the target are flagged but marked with an empty fix_ddl
+    so that callers can warn the user without attempting to apply a broken
+    ALTER statement.
+    """
+    items: list[DriftItem] = []
+    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+        src_owners = {
+            (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
+            for r in await get_object_owners(src, cfg.schemas)
+        }
+        tgt_owners = {
+            (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
+            for r in await get_object_owners(tgt, cfg.schemas)
+        }
+        existing_roles = {
+            r["rolname"]
+            for r in await tgt.fetch("SELECT rolname FROM pg_roles")
+        }
+
+    for (schema, obj, kind), src_owner in src_owners.items():
+        tgt_owner = tgt_owners.get((schema, obj, kind))
+        if tgt_owner == src_owner:
+            continue
+        if src_owner not in existing_roles:
+            fix = ""
+            detail = (
+                f"Owner mismatch: source={src_owner!r}, target={tgt_owner!r}; "
+                f"role '{src_owner}' does not exist on target — create it first"
+            )
+        else:
+            if kind == "table":
+                fix = f"ALTER TABLE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
+            elif kind == "sequence":
+                fix = f"ALTER SEQUENCE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
+            else:  # schema
+                fix = f"ALTER SCHEMA {qi(obj)} OWNER TO {qi(src_owner)};"
+            detail = f"Owner mismatch: source={src_owner!r}, target={tgt_owner!r}"
+        items.append(DriftItem(
+            object_type=f"ownership ({kind})",
+            schema=schema,
+            table=obj if kind == "table" else "",
+            name=obj,
+            drift_type="different",
+            detail=detail,
+            fix_ddl=fix,
+        ))
+    return items
 
 
 async def apply_drift_fixes(
