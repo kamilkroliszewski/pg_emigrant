@@ -87,10 +87,31 @@ async def copy_table_data_pipe(
         # don't fail due to parent tables not yet being loaded.
         await tgt.execute("SET session_replication_role = 'replica';")
 
+        # Resolve the column intersection between source and target so that
+        # extra columns present only on the source (e.g. due to schema version
+        # drift) don't cause "extra data after last expected column" errors.
+        # Generated columns (attgenerated = 's') are excluded from both sides
+        # because they are computed by the server and cannot be written via COPY.
+        _col_query = """
+            SELECT a.attname AS column_name
+            FROM pg_attribute a
+            WHERE a.attrelid = ($1 || '.' || $2)::regclass
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND a.attgenerated = ''
+            ORDER BY a.attnum
+        """
+        src_cols = {r["column_name"] for r in await src.fetch(_col_query, schema, table)}
+        tgt_col_rows = await tgt.fetch(_col_query, schema, table)
+        # Preserve target column order; skip columns absent from source.
+        common_columns = [r["column_name"] for r in tgt_col_rows if r["column_name"] in src_cols]
+
+        cols_select = ", ".join(qi(c) for c in common_columns)
+
         # Use CSV text format for cross-version safety
         buf = io.BytesIO()
         await src.copy_from_query(
-            f"SELECT * FROM {fqn}",
+            f"SELECT {cols_select} FROM {fqn}",
             output=buf,
             format="csv",
         )
@@ -102,6 +123,7 @@ async def copy_table_data_pipe(
                 schema_name=schema,
                 source=io.BytesIO(data),
                 format="csv",
+                columns=common_columns,
             )
 
         row_count = await tgt.fetchval(f"SELECT count(*) FROM {fqn};")
