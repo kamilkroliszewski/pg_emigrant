@@ -18,7 +18,7 @@ from replicator.config import ReplicatorConfig
 from replicator.data_copy import copy_all_tables
 from replicator.db import connect, discover_databases, discover_schemas
 from replicator.replication import create_publication, create_subscription
-from replicator.schema_sync import get_tables, sync_deferred_indexes, sync_schemas
+from replicator.schema_sync import get_tables, sync_deferred_indexes, sync_ownership, sync_schemas
 from replicator.utils import console, get_logger
 
 log = get_logger(__name__)
@@ -86,6 +86,13 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             progress.update(task, description=f"[{dbname}] Creating indexes…")
             async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                 await sync_deferred_indexes(src, tgt, schemas)
+
+            # Step 4c: synchronize ownership (tables, sequences, schemas)
+            progress.update(task, description=f"[{dbname}] Syncing ownership…")
+            async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                own_count = await sync_ownership(src, tgt, schemas)
+                if own_count:
+                    console.print(f"  [{dbname}] Applied {own_count} ownership change(s)")
 
             # Step 5: create publication + subscription
             progress.update(task, description=f"[{dbname}] Setting up replication…")
