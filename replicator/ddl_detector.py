@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import asyncpg
 
 from replicator.config import ReplicatorConfig
-from replicator.db import connect
+from replicator.db import connect, discover_schemas
 from replicator.schema_sync import (
     generate_full_table_ddl,
     get_columns,
@@ -69,8 +69,9 @@ async def detect_drift(
     report = DriftReport(database=dbname)
 
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-        src_tables = await get_tables(src, cfg.schemas)
-        tgt_tables = await get_tables(tgt, cfg.schemas)
+        schemas = await discover_schemas(src, cfg)
+        src_tables = await get_tables(src, schemas)
+        tgt_tables = await get_tables(tgt, schemas)
 
         src_table_set = {(t["schema_name"], t["table_name"]) for t in src_tables}
         tgt_table_set = {(t["schema_name"], t["table_name"]) for t in tgt_tables}
@@ -201,8 +202,8 @@ async def detect_drift(
                 ))
 
         # Enum types
-        src_enums = await get_enum_types(src, cfg.schemas)
-        tgt_enums = await get_enum_types(tgt, cfg.schemas)
+        src_enums = await get_enum_types(src, schemas)
+        tgt_enums = await get_enum_types(tgt, schemas)
         tgt_enum_map = {
             (e["schema_name"], e["type_name"]): list(e["labels"]) for e in tgt_enums
         }
@@ -246,6 +247,48 @@ async def detect_drift(
                             fix_ddl=fix,
                         ))
 
+        # Ownership drift — tables, sequences, schemas
+        src_owners_map = {
+            (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
+            for r in await get_object_owners(src, schemas)
+        }
+        tgt_owners_map = {
+            (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
+            for r in await get_object_owners(tgt, schemas)
+        }
+        existing_roles = {
+            r["rolname"]
+            for r in await tgt.fetch("SELECT rolname FROM pg_roles")
+        }
+
+        for (own_schema, obj, kind), src_owner in src_owners_map.items():
+            tgt_owner = tgt_owners_map.get((own_schema, obj, kind))
+            if tgt_owner == src_owner:
+                continue
+            if src_owner not in existing_roles:
+                fix = ""
+                detail = (
+                    f"Owner mismatch: source={src_owner!r}, target={tgt_owner!r}; "
+                    f"role '{src_owner}' does not exist on target — create it first"
+                )
+            else:
+                if kind == "table":
+                    fix = f"ALTER TABLE {qi(own_schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
+                elif kind == "sequence":
+                    fix = f"ALTER SEQUENCE {qi(own_schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
+                else:  # schema
+                    fix = f"ALTER SCHEMA {qi(obj)} OWNER TO {qi(src_owner)};"
+                detail = f"Owner mismatch: source={src_owner!r}, target={tgt_owner!r}"
+            report.items.append(DriftItem(
+                object_type=f"ownership ({kind})",
+                schema=own_schema,
+                table=obj if kind == "table" else "",
+                name=obj,
+                drift_type="different",
+                detail=detail,
+                fix_ddl=fix,
+            ))
+
     return report
 
 
@@ -262,13 +305,14 @@ async def detect_ownership_drift(
     """
     items: list[DriftItem] = []
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+        schemas = await discover_schemas(src, cfg)
         src_owners = {
             (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-            for r in await get_object_owners(src, cfg.schemas)
+            for r in await get_object_owners(src, schemas)
         }
         tgt_owners = {
             (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-            for r in await get_object_owners(tgt, cfg.schemas)
+            for r in await get_object_owners(tgt, schemas)
         }
         existing_roles = {
             r["rolname"]
@@ -351,6 +395,16 @@ async def apply_drift_fixes(
                 except Exception as exc:
                     log.error(
                         "Failed to drop %s %s.%s — %s",
+                        item.object_type, item.schema, item.name, exc,
+                    )
+            elif item.drift_type == "different":
+                try:
+                    await tgt.execute(item.fix_ddl)
+                    log.info("Applied fix for %s %s.%s", item.object_type, item.schema, item.name)
+                    applied += 1
+                except Exception as exc:
+                    log.error(
+                        "Failed to apply DDL for %s %s.%s — %s",
                         item.object_type, item.schema, item.name, exc,
                     )
 
