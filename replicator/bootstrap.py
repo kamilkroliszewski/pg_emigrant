@@ -18,7 +18,7 @@ from replicator.config import ReplicatorConfig
 from replicator.data_copy import copy_all_tables
 from replicator.db import connect, discover_databases
 from replicator.replication import create_publication, create_subscription
-from replicator.schema_sync import get_tables, sync_schemas
+from replicator.schema_sync import get_tables, sync_deferred_indexes, sync_schemas
 from replicator.utils import console, get_logger
 
 log = get_logger(__name__)
@@ -79,6 +79,11 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
                 )
             else:
                 console.print(f"  [{dbname}] No tables to copy")
+
+            # Step 4b: create non-unique indexes after COPY (faster than during insert)
+            progress.update(task, description=f"[{dbname}] Creating indexes…")
+            async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                await sync_deferred_indexes(src, tgt, cfg.schemas)
 
             # Step 5: create publication + subscription
             progress.update(task, description=f"[{dbname}] Setting up replication…")
