@@ -25,7 +25,7 @@ class ReplicatorConfig(BaseModel):
 
     source: DatabaseConfig
     target: DatabaseConfig
-    schemas: list[str] = Field(default_factory=lambda: ["public"])
+    schemas: list[str] = Field(default_factory=list)  # empty = auto-discover (all non-system schemas)
     databases: list[str] = Field(default_factory=list)  # empty = auto-discover
     publication_name: str = "pg_emigrant_pub"
     subscription_name: str = "pg_emigrant_sub"
