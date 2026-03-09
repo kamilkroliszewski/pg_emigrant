@@ -163,19 +163,15 @@ def sync_sequences(
 def detect_ddl(
     config: str = typer.Option("config.yaml", "--config", "-c"),
     database: Optional[str] = typer.Option(None, "--database", "-d"),
-    apply: bool = typer.Option(False, "--apply", help="Apply fixes for missing objects"),
+    apply: bool = typer.Option(False, "--apply", help="Apply fixes for missing objects and ownership drift"),
     drop_extra: bool = typer.Option(
         False, "--drop-extra",
         help="Also DROP tables/objects on target that no longer exist on source (destructive!)",
     ),
-    fix_roles: bool = typer.Option(
-        False, "--fix-roles",
-        help="Detect and fix ownership drift for tables, sequences, and schemas",
-    ),
 ):
-    """Detect schema drift between source and target."""
+    """Detect schema drift between source and target (including ownership)."""
     from replicator.db import discover_databases
-    from replicator.ddl_detector import apply_drift_fixes, detect_drift, detect_ownership_drift
+    from replicator.ddl_detector import apply_drift_fixes, detect_drift
 
     cfg = load_config(config)
 
@@ -186,7 +182,7 @@ def detect_ddl(
             console.rule(f"[bold]Drift Report — {db}")
 
             if not report.has_drift:
-                console.print("[green]No schema drift detected")
+                console.print("[green]No drift detected")
             else:
                 tbl = Table(title=f"Schema Drift — {db}", show_lines=True)
                 tbl.add_column("Type")
@@ -204,7 +200,7 @@ def detect_ddl(
                     elif item.drift_type == "missing_on_source":
                         style = "red"
                     elif item.drift_type == "different":
-                        style = "red"
+                        style = "yellow" if item.fix_ddl else "red"
                     ddl_preview = item.fix_ddl
                     if ddl_preview and len(ddl_preview) > 80:
                         ddl_preview = ddl_preview[:77] + "..."
@@ -230,46 +226,9 @@ def detect_ddl(
                     console.print(f"[green]Applied {applied} fix(es) for {db}")
                 else:
                     console.print(
-                        "[dim]Run with [bold]--apply[/bold] to fix missing objects, "
+                        "[dim]Run with [bold]--apply[/bold] to fix missing objects and ownership drift, "
                         "or [bold]--apply --drop-extra[/bold] to also drop extra tables.[/dim]"
                     )
-
-            # Ownership drift
-            if fix_roles:
-                ownership_items = await detect_ownership_drift(cfg, db)
-                if not ownership_items:
-                    console.print("[green]No ownership drift detected")
-                else:
-                    own_tbl = Table(title=f"Ownership Drift — {db}", show_lines=True)
-                    own_tbl.add_column("Kind")
-                    own_tbl.add_column("Schema")
-                    own_tbl.add_column("Object")
-                    own_tbl.add_column("Detail")
-                    own_tbl.add_column("Fix DDL")
-                    for item in ownership_items:
-                        ddl_preview = item.fix_ddl or "[red]role missing on target[/red]"
-                        own_tbl.add_row(
-                            item.object_type,
-                            item.schema,
-                            item.name,
-                            item.detail,
-                            ddl_preview,
-                            style="yellow" if item.fix_ddl else "red",
-                        )
-                    console.print(own_tbl)
-
-                    if apply:
-                        own_applied = 0
-                        from replicator.db import connect as db_connect
-                        from replicator.schema_sync import sync_ownership
-                        async with db_connect(cfg.source, db) as src_conn, \
-                                   db_connect(cfg.target, db) as tgt_conn:
-                            own_applied = await sync_ownership(src_conn, tgt_conn, cfg.schemas)
-                        console.print(f"[green]Applied {own_applied} ownership change(s) for {db}")
-                    else:
-                        console.print(
-                            "[dim]Run with [bold]--apply[/bold] to apply ownership fixes.[/dim]"
-                        )
 
     _run(_detect())
 
