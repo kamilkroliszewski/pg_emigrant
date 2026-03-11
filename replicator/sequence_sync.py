@@ -43,6 +43,11 @@ async def sync_sequences_once(
 
     Uses two batch SELECTs (one per server) and a single DO-block to apply
     all setval() calls, reducing round-trips from O(N) to O(1) per server.
+    
+    Also handles orphaned sequences (exist on target but not on source):
+    - If a sequence exists only on target, it attempts to determine its proper
+      value by finding the maximum ID in tables that use it as DEFAULT.
+    - If unable to find the table, logs a warning for manual intervention.
     """
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
         schemas = await discover_schemas(src, cfg)
@@ -98,6 +103,96 @@ async def sync_sequences_once(
                 "target_value": tgt_last,
                 "status": status,
             })
+
+        # --- Handle orphaned sequences (target-only) ---------------------------
+        # These sequences may have been created during migration/bootstrap but
+        # don't exist on the source. We need to find their proper values to
+        # avoid conflicts with newly inserted rows.
+        src_keys = set(src_map.keys())
+        tgt_only_keys = [k for k in tgt_map.keys() if k not in src_keys]
+        
+        if tgt_only_keys:
+            log.warning(
+                "[db: %s] Found %d sequences on target not found on source: %s. "
+                "These should be either removed or have their values synchronized.",
+                dbname,
+                len(tgt_only_keys),
+                ", ".join(f"{k[0]}.{k[1]}" for k in tgt_only_keys),
+            )
+            
+            # Try to find proper values for orphaned sequences
+            for schema, seq_name in tgt_only_keys:
+                fqn = qt(schema, seq_name)
+                tgt_row = tgt_map[(schema, seq_name)]
+                tgt_last, _ = _effective_value(tgt_row)
+                
+                # Try to find which table uses this sequence
+                # Query: find all columns that use this sequence in DEFAULT
+                find_users_sql = f"""
+                SELECT t.tablename, c.attname
+                FROM pg_tables t
+                JOIN pg_class pc ON pc.relname = t.tablename AND pc.relnamespace = 
+                    (SELECT oid FROM pg_namespace WHERE nspname = t.schemaname)
+                JOIN pg_attribute c ON c.attrelid = pc.oid
+                WHERE pg_get_serial_sequence(
+                    quote_ident(t.schemaname) || '.' || quote_ident(t.tablename), 
+                    c.attname
+                ) = {repr(fqn)}
+                LIMIT 1;
+                """
+                
+                try:
+                    user_rows = await tgt.fetch(find_users_sql)
+                    if user_rows:
+                        table_name = user_rows[0]["tablename"]
+                        column_name = user_rows[0]["attname"]
+                        # Find max value in that column
+                        max_id_sql = f"SELECT COALESCE(MAX({qt(column_name)}), 0) as max_id FROM {qt(schema, table_name)}"
+                        max_id_row = await tgt.fetchrow(max_id_sql)
+                        max_id = max_id_row["max_id"]
+                        new_val = max(max_id + 1, tgt_last)
+                        
+                        if new_val > tgt_last:
+                            updates.append((schema, seq_name, new_val, True))
+                            log.info(
+                                "Sequence %s [db: %s] (orphaned): %d → %d (based on MAX(%s.%s) = %d)",
+                                fqn, dbname, tgt_last, new_val, table_name, column_name, max_id
+                            )
+                            report.append({
+                                "schema": schema,
+                                "sequence": seq_name,
+                                "source_value": None,
+                                "target_value": new_val,
+                                "status": "orphaned_fixed",
+                            })
+                        else:
+                            log.debug(
+                                "Sequence %s (orphaned) on target already at %d, table max id is %d",
+                                fqn, tgt_last, max_id
+                            )
+                    else:
+                        # Can't find which table uses this sequence
+                        log.warning(
+                            "Cannot determine which table uses orphaned sequence %s. "
+                            "Please check manually and consider dropping it or recreating the column DEFAULT.",
+                            fqn
+                        )
+                        report.append({
+                            "schema": schema,
+                            "sequence": seq_name,
+                            "source_value": None,
+                            "target_value": tgt_last,
+                            "status": "orphaned_unknown",
+                        })
+                except Exception as e:
+                    log.error("Error handling orphaned sequence %s: %s", fqn, e)
+                    report.append({
+                        "schema": schema,
+                        "sequence": seq_name,
+                        "source_value": None,
+                        "target_value": tgt_last,
+                        "status": "orphaned_error",
+                    })
 
         # --- batch write (single round-trip) ------------------------------
         if updates:
