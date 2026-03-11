@@ -65,6 +65,19 @@ async def sync_sequences_once(
         src_map = {(r["schemaname"], r["sequencename"]): r for r in src_rows}
         tgt_map = {(r["schemaname"], r["sequencename"]): r for r in tgt_rows}
 
+        # --- guard: skip if target has no sequences yet -------------------
+        # An empty tgt_map means the database exists but hasn't been bootstrapped
+        # (schemas/tables/sequences not yet created). Writing setval() here would
+        # create sequences on a bare database and later cause _seq1 duplicates
+        # when bootstrap runs CREATE TABLE with IDENTITY/nextval columns.
+        if not tgt_map:
+            log.info(
+                "[db: %s] Target has no sequences in schemas %s — "
+                "database not bootstrapped yet, skipping sync.",
+                dbname, schemas,
+            )
+            return []
+
         # --- compute updates ----------------------------------------------
         report: list[dict] = []
         updates: list[tuple[str, str, int, bool]] = []  # (schema, name, value, is_called)
@@ -202,6 +215,62 @@ async def sync_sequences_once(
             )
             do_block = f"DO $$\nBEGIN\n  {calls}\nEND;\n$$;"
             await tgt.execute(do_block)
+
+    return report
+
+
+async def get_sequence_status(
+    cfg: ReplicatorConfig,
+    dbname: str,
+) -> list[dict]:
+    """Read-only comparison of source vs target sequences.  Never writes to target."""
+    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+        schemas = await discover_schemas(src, cfg)
+        sequences = await get_sequences(src, schemas)
+        if not sequences:
+            return []
+
+        schemas = list({s["schema_name"] for s in sequences})
+
+        src_rows, tgt_rows = await asyncio.gather(
+            src.fetch(_BATCH_SEQ_VALUES_SQL, schemas),
+            tgt.fetch(_BATCH_SEQ_VALUES_SQL, schemas),
+        )
+        src_map = {(r["schemaname"], r["sequencename"]): r for r in src_rows}
+        tgt_map = {(r["schemaname"], r["sequencename"]): r for r in tgt_rows}
+
+        report: list[dict] = []
+        for seq in sequences:
+            schema = seq["schema_name"]
+            name = seq["sequence_name"]
+
+            src_row = src_map.get((schema, name))
+            tgt_row = tgt_map.get((schema, name))
+
+            if src_row is None:
+                continue
+
+            src_last, _ = _effective_value(src_row)
+
+            if tgt_row is None:
+                status = "missing_on_target"
+                tgt_last = None
+            else:
+                tgt_last, _ = _effective_value(tgt_row)
+                if src_last > tgt_last:
+                    status = "behind"
+                elif src_last < tgt_last:
+                    status = "target_ahead"
+                else:
+                    status = "ok"
+
+            report.append({
+                "schema": schema,
+                "sequence": name,
+                "source_value": src_last,
+                "target_value": tgt_last,
+                "status": status,
+            })
 
     return report
 
