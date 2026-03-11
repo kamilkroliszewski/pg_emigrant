@@ -70,6 +70,27 @@ async def detect_drift(
 
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
         schemas = await discover_schemas(src, cfg)
+
+        # Detect schemas missing on target (must run before table comparison so
+        # fix_ddl for missing tables can safely assume the schema exists).
+        tgt_schema_rows = await tgt.fetch(
+            "SELECT nspname FROM pg_namespace WHERE nspname = ANY($1::text[])",
+            schemas,
+        )
+        tgt_schemas: set[str] = {r["nspname"] for r in tgt_schema_rows}
+        missing_schemas: set[str] = set(schemas) - tgt_schemas
+
+        for schema in sorted(missing_schemas):
+            report.items.append(DriftItem(
+                object_type="schema",
+                schema=schema,
+                table="",
+                name=schema,
+                drift_type="missing_on_target",
+                detail=f"Schema {schema!r} exists on source but not on target",
+                fix_ddl=f"CREATE SCHEMA IF NOT EXISTS {qi(schema)};",
+            ))
+
         src_tables = await get_tables(src, schemas)
         tgt_tables = await get_tables(tgt, schemas)
 
@@ -78,7 +99,13 @@ async def detect_drift(
 
         # Tables missing on target
         for schema, table in sorted(src_table_set - tgt_table_set):
-            fix_ddl = await generate_full_table_ddl(src, schema, table)
+            table_ddl = await generate_full_table_ddl(src, schema, table)
+            # Prepend schema creation when the schema itself is also missing so
+            # the fix_ddl is self-contained and can be applied as-is.
+            if schema in missing_schemas:
+                fix_ddl = f"CREATE SCHEMA IF NOT EXISTS {qi(schema)};\n{table_ddl}"
+            else:
+                fix_ddl = table_ddl
             report.items.append(DriftItem(
                 object_type="table",
                 schema=schema,
