@@ -82,6 +82,29 @@ async def discover_schemas(
     ``pg_temp_*``, ``pg_toast_temp_*``) is included.
     """
     if cfg.schemas:
+        # Warn about schemas that exist in the source database but are not in
+        # the explicit list — they will be silently skipped during migration
+        # and drift detection, which can lead to surprises like a missing
+        # pgboss (or any other extension-managed) schema on the target.
+        all_rows = await conn.fetch(
+            """
+            SELECT nspname
+            FROM pg_namespace
+            WHERE nspname NOT LIKE 'pg_temp_%'
+              AND nspname NOT LIKE 'pg_toast_temp_%'
+              AND nspname != ALL($1::text[])
+            ORDER BY nspname
+            """,
+            list(_SYSTEM_SCHEMAS),
+        )
+        all_source_schemas = {r["nspname"] for r in all_rows}
+        uncovered = all_source_schemas - set(cfg.schemas)
+        if uncovered:
+            log.warning(
+                "Explicit schemas list is set but the following schemas exist on "
+                "the source and will be SKIPPED (not checked/migrated): %s",
+                sorted(uncovered),
+            )
         return list(cfg.schemas)
 
     rows = await conn.fetch(
