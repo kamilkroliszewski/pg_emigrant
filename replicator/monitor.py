@@ -9,7 +9,7 @@ from replicator.db import connect, discover_databases, discover_schemas
 from replicator.ddl_detector import detect_drift
 from replicator.replication import get_replication_slots, get_subscription_status, sub_name
 from replicator.schema_sync import get_sequences, get_tables
-from replicator.sequence_sync import sync_sequences_once
+from replicator.sequence_sync import get_sequence_status
 from replicator.utils import console, get_logger
 
 log = get_logger(__name__)
@@ -159,7 +159,7 @@ async def build_status(cfg: ReplicatorConfig, database: str | None = None) -> No
 
         # --- Sequence sync status ---
         try:
-            seq_report = await sync_sequences_once(cfg, dbname)
+            seq_report = await get_sequence_status(cfg, dbname)
             seq_table = Table(title="Sequence Sync", show_lines=True)
             seq_table.add_column("Schema")
             seq_table.add_column("Sequence")
@@ -169,10 +169,12 @@ async def build_status(cfg: ReplicatorConfig, database: str | None = None) -> No
 
             for s in seq_report:
                 style = ""
-                if s["status"] == "updated":
+                if s["status"] == "behind":
                     style = "yellow"
                 elif s["status"] == "target_ahead":
                     style = "cyan"
+                elif s["status"] == "missing_on_target":
+                    style = "red"
                 seq_table.add_row(
                     s["schema"],
                     s["sequence"],
