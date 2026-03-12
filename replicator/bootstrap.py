@@ -74,10 +74,41 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
                 tables = await get_tables(src, schemas)
 
             if tables:
-                results = await copy_all_tables(cfg, dbname, tables)
+                n_total = len(tables)
+                n_done = 0
+                active: set[str] = set()
+
+                def _on_start(key: str) -> None:
+                    nonlocal active
+                    active.add(key)
+                    _active_str = ", ".join(sorted(active))
+                    progress.update(
+                        task,
+                        description=f"[{dbname}] Copying data… [{n_done}/{n_total}] → {_active_str}",
+                    )
+
+                def _on_done(key: str, rows: int) -> None:
+                    nonlocal n_done, active
+                    n_done += 1
+                    active.discard(key)
+                    if rows >= 0:
+                        console.print(f"    [{dbname}] ✓ {key} ({rows:,} rows)")
+                    else:
+                        console.print(f"    [{dbname}] ✗ {key} (failed)")
+                    _active_str = ", ".join(sorted(active)) if active else "…"
+                    progress.update(
+                        task,
+                        description=f"[{dbname}] Copying data… [{n_done}/{n_total}] → {_active_str}",
+                    )
+
+                results = await copy_all_tables(
+                    cfg, dbname, tables,
+                    on_table_start=_on_start,
+                    on_table_done=_on_done,
+                )
                 total_rows = sum(c for c in results.values() if c >= 0)
                 console.print(
-                    f"  [{dbname}] Copied {total_rows} rows across {len(results)} tables"
+                    f"  [{dbname}] Copied {total_rows:,} rows across {len(results)} tables"
                 )
             else:
                 console.print(f"  [{dbname}] No tables to copy")
