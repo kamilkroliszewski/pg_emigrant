@@ -31,6 +31,7 @@ class ReplicatorConfig(BaseModel):
     subscription_name: str = "pg_emigrant_sub"
     replication_slot_name: str = "pg_emigrant_slot"
     parallel_workers: int = 4
+    table_parallel_workers: int = 4
     sequence_sync_interval: int = 10  # seconds
     exclude_databases: list[str] = Field(
         default_factory=lambda: ["template0", "template1", "postgres"]
