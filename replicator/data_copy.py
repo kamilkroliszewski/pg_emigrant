@@ -7,7 +7,7 @@ Supports parallel workers and snapshot-consistent reads.
 from __future__ import annotations
 
 import asyncio
-from typing import Sequence
+from typing import Callable, Sequence
 
 import asyncpg
 
@@ -228,6 +228,8 @@ async def copy_all_tables(
     dbname: str,
     tables: list[dict],
     parallel: int | None = None,
+    on_table_start: Callable[[str], None] | None = None,
+    on_table_done: Callable[[str, int], None] | None = None,
 ) -> dict[str, int]:
     """Copy data for all tables with parallelism, using a shared snapshot.
 
@@ -259,14 +261,20 @@ async def copy_all_tables(
     async def _copy_one(schema: str, table: str) -> tuple[str, int]:
         key = f"{schema}.{table}"
         async with sem:
+            if on_table_start:
+                on_table_start(key)
             try:
                 count = await copy_table_data_pipe(
                     cfg.source, cfg.target, dbname, schema, table, snapshot_id,
                     table_workers=cfg.table_parallel_workers,
                 )
+                if on_table_done:
+                    on_table_done(key, count)
                 return key, count
             except Exception as exc:
                 log.error("Failed to copy %s: %s", key, exc)
+                if on_table_done:
+                    on_table_done(key, -1)
                 return key, -1
 
     tasks = [
