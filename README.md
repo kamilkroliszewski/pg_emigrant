@@ -139,6 +139,14 @@ max_replication_slots = 10   # at least 1 per database
 max_wal_senders = 10
 ```
 
+### PostgreSQL — minimum target configuration
+
+```ini
+max_active_replication_origins = 10  # min. one per source database)
+max_logical_replication_workers = 10 # min. one per source database)
+max_replication_slots = 10   # at least 1 per database
+```
+
 ---
 
 ## Installation
