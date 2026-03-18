@@ -216,8 +216,12 @@ exclude_tables: []
 publication_name: pg_emigrant_pub
 subscription_name: pg_emigrant_sub
 
-# Number of parallel workers for data copy
+# Number of parallel workers for data copy (how many tables are copied simultaneously)
 parallel_workers: 4
+
+# Number of parallel workers per table — each worker streams an independent ctid page-range slice.
+# Increase this for very large tables to speed up their initial COPY.
+table_parallel_workers: 4
 
 # Sequence synchronisation interval (seconds)
 sequence_sync_interval: 10
