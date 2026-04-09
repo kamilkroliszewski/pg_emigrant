@@ -22,6 +22,8 @@ from replicator.schema_sync import (
     get_object_owners,
     get_tables,
     get_triggers,
+    get_views,
+    make_owner_fix_ddl,
 )
 from replicator.utils import get_logger, qi, qt
 
@@ -350,21 +352,69 @@ async def detect_drift(
                     ),
                 ))
 
-        # Ownership drift — tables, sequences, schemas
-        src_owners_map = {
-            (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-            for r in await get_object_owners(src, schemas)
+        # Views and materialized views
+        src_views = await get_views(src, schemas)
+        tgt_views = await get_views(tgt, schemas)
+        tgt_view_map = {
+            (v["schema_name"], v["view_name"]): v for v in tgt_views
         }
+
+        for src_view in src_views:
+            vschema = src_view["schema_name"]
+            vname = src_view["view_name"]
+            relkind = src_view["relkind"]
+            src_def = src_view["view_def"]
+            fqn = f"{qi(vschema)}.{qi(vname)}"
+            tgt_view = tgt_view_map.get((vschema, vname))
+            obj_type = "view" if relkind == "v" else "materialized_view"
+
+            if tgt_view is None:
+                if relkind == "v":
+                    fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
+                else:
+                    fix = f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def} WITH NO DATA;"
+                report.items.append(DriftItem(
+                    object_type=obj_type,
+                    schema=vschema,
+                    table="",
+                    name=vname,
+                    drift_type="missing_on_target",
+                    detail=f"{obj_type} {vschema}.{vname} missing on target",
+                    fix_ddl=fix,
+                ))
+            elif src_def != tgt_view["view_def"]:
+                if relkind == "v":
+                    fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
+                else:
+                    fix = (
+                        f"DROP MATERIALIZED VIEW IF EXISTS {fqn};\n"
+                        f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def} WITH NO DATA;"
+                    )
+                report.items.append(DriftItem(
+                    object_type=obj_type,
+                    schema=vschema,
+                    table="",
+                    name=vname,
+                    drift_type="different",
+                    detail=f"{obj_type} {vschema}.{vname} definition differs",
+                    fix_ddl=fix,
+                ))
+
+        # Ownership drift
+        src_owners_list = await get_object_owners(src, schemas, dbname=dbname)
+        tgt_owners_list = await get_object_owners(tgt, schemas, dbname=dbname)
+        src_owners_map = {(r["schema_name"], r["object_name"], r["kind"]): r for r in src_owners_list}
         tgt_owners_map = {
             (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-            for r in await get_object_owners(tgt, schemas)
+            for r in tgt_owners_list
         }
         existing_roles = {
             r["rolname"]
             for r in await tgt.fetch("SELECT rolname FROM pg_roles")
         }
 
-        for (own_schema, obj, kind), src_owner in src_owners_map.items():
+        for (own_schema, obj, kind), src_rec in src_owners_map.items():
+            src_owner = src_rec["owner"]
             tgt_owner = tgt_owners_map.get((own_schema, obj, kind))
             if tgt_owner == src_owner:
                 continue
@@ -375,12 +425,7 @@ async def detect_drift(
                     f"role '{src_owner}' does not exist on target — create it first"
                 )
             else:
-                if kind == "table":
-                    fix = f"ALTER TABLE {qi(own_schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
-                elif kind == "sequence":
-                    fix = f"ALTER SEQUENCE {qi(own_schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
-                else:  # schema
-                    fix = f"ALTER SCHEMA {qi(obj)} OWNER TO {qi(src_owner)};"
+                fix = make_owner_fix_ddl(src_rec, src_owner)
                 detail = f"Owner mismatch: source={src_owner!r}, target={tgt_owner!r}"
             report.items.append(DriftItem(
                 object_type=f"ownership ({kind})",
@@ -401,7 +446,8 @@ async def detect_ownership_drift(
 ) -> list[DriftItem]:
     """Return DriftItems for every object whose owner differs between source and target.
 
-    Covers tables, sequences, and user schemas.  Objects whose source owner
+    Covers tables, sequences, views, materialized views, schemas, types,
+    functions, procedures, and the database itself.  Objects whose source owner
     does not exist on the target are flagged but marked with an empty fix_ddl
     so that callers can warn the user without attempting to apply a broken
     ALTER statement.
@@ -409,20 +455,20 @@ async def detect_ownership_drift(
     items: list[DriftItem] = []
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
         schemas = await discover_schemas(src, cfg)
-        src_owners = {
-            (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-            for r in await get_object_owners(src, schemas)
-        }
+        src_owners_list = await get_object_owners(src, schemas, dbname=dbname)
+        tgt_owners_list = await get_object_owners(tgt, schemas, dbname=dbname)
+        src_owners = {(r["schema_name"], r["object_name"], r["kind"]): r for r in src_owners_list}
         tgt_owners = {
             (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-            for r in await get_object_owners(tgt, schemas)
+            for r in tgt_owners_list
         }
         existing_roles = {
             r["rolname"]
             for r in await tgt.fetch("SELECT rolname FROM pg_roles")
         }
 
-    for (schema, obj, kind), src_owner in src_owners.items():
+    for (schema, obj, kind), src_rec in src_owners.items():
+        src_owner = src_rec["owner"]
         tgt_owner = tgt_owners.get((schema, obj, kind))
         if tgt_owner == src_owner:
             continue
@@ -433,12 +479,7 @@ async def detect_ownership_drift(
                 f"role '{src_owner}' does not exist on target — create it first"
             )
         else:
-            if kind == "table":
-                fix = f"ALTER TABLE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
-            elif kind == "sequence":
-                fix = f"ALTER SEQUENCE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
-            else:  # schema
-                fix = f"ALTER SCHEMA {qi(obj)} OWNER TO {qi(src_owner)};"
+            fix = make_owner_fix_ddl(src_rec, src_owner)
             detail = f"Owner mismatch: source={src_owner!r}, target={tgt_owner!r}"
         items.append(DriftItem(
             object_type=f"ownership ({kind})",
