@@ -118,10 +118,10 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                 await sync_deferred_indexes(src, tgt, schemas)
 
-            # Step 4c: synchronize ownership (tables, sequences, schemas)
+            # Step 4c: synchronize ownership (tables, sequences, views, functions, types, database)
             progress.update(task, description=f"[{dbname}] Syncing ownership…")
             async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                own_count = await sync_ownership(src, tgt, schemas)
+                own_count = await sync_ownership(src, tgt, schemas, dbname=dbname)
                 if own_count:
                     console.print(f"  [{dbname}] Applied {own_count} ownership change(s)")
 
