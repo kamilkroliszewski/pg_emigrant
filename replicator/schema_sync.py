@@ -107,6 +107,20 @@ WHERE n.nspname = ANY($1::text[])
 ORDER BY n.nspname, p.proname;
 """
 
+_TRIGGERS_SQL = """
+SELECT
+    n.nspname                                          AS schema_name,
+    c.relname                                          AS table_name,
+    t.tgname                                           AS trigger_name,
+    pg_get_triggerdef(t.oid)                           AS trigger_def
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1::text[])
+  AND NOT t.tgisinternal
+ORDER BY n.nspname, c.relname, t.tgname;
+"""
+
 
 # ---------------------------------------------------------------------------
 # Data classes (plain dicts for simplicity)
@@ -145,6 +159,20 @@ async def get_sequences(
 ) -> list[dict]:
     """Return sequences in the given schemas."""
     return [dict(r) for r in await conn.fetch(_SEQUENCES_SQL, schemas)]
+
+
+async def get_functions(
+    conn: asyncpg.Connection, schemas: list[str]
+) -> list[dict]:
+    """Return user-defined functions and procedures in the given schemas."""
+    return [dict(r) for r in await conn.fetch(_FUNCTIONS_SQL, schemas)]
+
+
+async def get_triggers(
+    conn: asyncpg.Connection, schemas: list[str]
+) -> list[dict]:
+    """Return triggers (excluding internal ones) in the given schemas."""
+    return [dict(r) for r in await conn.fetch(_TRIGGERS_SQL, schemas)]
 
 
 async def get_enum_types(
@@ -477,6 +505,36 @@ async def sync_functions(
             )
 
 
+async def sync_triggers(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> None:
+    """Create or replace triggers on the target.
+
+    Triggers must be synced AFTER tables and functions because they depend on both.
+    Any existing trigger with the same name on the same table is dropped first so
+    that definition changes are picked up (triggers have no CREATE OR REPLACE).
+    """
+    rows = await source_conn.fetch(_TRIGGERS_SQL, schemas)
+    for row in rows:
+        schema = row["schema_name"]
+        table = row["table_name"]
+        trigger_name = row["trigger_name"]
+        trigger_def: str = row["trigger_def"]
+        fqn = f"{qi(schema)}.{qi(table)}"
+        drop_stmt = f"DROP TRIGGER IF EXISTS {qi(trigger_name)} ON {fqn};"
+        try:
+            await target_conn.execute(drop_stmt)
+            await target_conn.execute(trigger_def + ";")
+            log.debug("Synced trigger %s on %s.%s", trigger_name, schema, table)
+        except Exception as exc:
+            log.warning(
+                "Could not sync trigger %s on %s.%s: %s",
+                trigger_name, schema, table, exc,
+            )
+
+
 async def sync_enum_types(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
@@ -644,6 +702,9 @@ async def sync_schemas(
     # Second pass: foreign keys
     for t in tables:
         await _sync_foreign_keys(source_conn, target_conn, t["schema_name"], t["table_name"])
+
+    # Sync triggers AFTER tables and functions — triggers depend on both
+    await sync_triggers(source_conn, target_conn, schemas)
 
     # Set REPLICA IDENTITY FULL on tables without PK on both sides so that
     # logical replication can handle UPDATE/DELETE without a unique row identifier.
