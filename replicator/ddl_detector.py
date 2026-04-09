@@ -17,9 +17,11 @@ from replicator.schema_sync import (
     get_columns,
     get_constraints,
     get_enum_types,
+    get_functions,
     get_indexes,
     get_object_owners,
     get_tables,
+    get_triggers,
 )
 from replicator.utils import get_logger, qi, qt
 
@@ -273,6 +275,80 @@ async def detect_drift(
                             detail=f"Enum value '{label}' missing on target",
                             fix_ddl=fix,
                         ))
+
+        # Functions
+        src_funcs = await get_functions(src, schemas)
+        tgt_funcs = await get_functions(tgt, schemas)
+        tgt_func_map = {
+            (f["schema_name"], f["func_name"]): f["func_def"] for f in tgt_funcs
+        }
+
+        for src_func in src_funcs:
+            func_schema = src_func["schema_name"]
+            func_name = src_func["func_name"]
+            key = (func_schema, func_name)
+            src_def: str = src_func["func_def"]
+            tgt_def = tgt_func_map.get(key)
+            if tgt_def is None:
+                report.items.append(DriftItem(
+                    object_type="function",
+                    schema=func_schema,
+                    table="",
+                    name=func_name,
+                    drift_type="missing_on_target",
+                    detail=f"Function {func_schema}.{func_name} missing on target",
+                    fix_ddl=src_def + ";",
+                ))
+            elif src_def != tgt_def:
+                report.items.append(DriftItem(
+                    object_type="function",
+                    schema=func_schema,
+                    table="",
+                    name=func_name,
+                    drift_type="different",
+                    detail=f"Function {func_schema}.{func_name} body differs",
+                    fix_ddl=src_def + ";",
+                ))
+
+        # Triggers
+        src_trigs = await get_triggers(src, schemas)
+        tgt_trigs = await get_triggers(tgt, schemas)
+        tgt_trig_map = {
+            (t["schema_name"], t["table_name"], t["trigger_name"]): t["trigger_def"]
+            for t in tgt_trigs
+        }
+
+        for src_trig in src_trigs:
+            trig_schema = src_trig["schema_name"]
+            trig_table = src_trig["table_name"]
+            trig_name = src_trig["trigger_name"]
+            src_def = src_trig["trigger_def"]
+            key = (trig_schema, trig_table, trig_name)
+            tgt_def = tgt_trig_map.get(key)
+            fqn = f"{qi(trig_schema)}.{qi(trig_table)}"
+            if tgt_def is None:
+                report.items.append(DriftItem(
+                    object_type="trigger",
+                    schema=trig_schema,
+                    table=trig_table,
+                    name=trig_name,
+                    drift_type="missing_on_target",
+                    detail=f"Trigger {trig_name} on {trig_schema}.{trig_table} missing on target",
+                    fix_ddl=src_def + ";",
+                ))
+            elif src_def != tgt_def:
+                report.items.append(DriftItem(
+                    object_type="trigger",
+                    schema=trig_schema,
+                    table=trig_table,
+                    name=trig_name,
+                    drift_type="different",
+                    detail=f"Trigger {trig_name} on {trig_schema}.{trig_table} body differs",
+                    fix_ddl=(
+                        f"DROP TRIGGER IF EXISTS {qi(trig_name)} ON {fqn};\n"
+                        + src_def + ";"
+                    ),
+                ))
 
         # Ownership drift — tables, sequences, schemas
         src_owners_map = {
