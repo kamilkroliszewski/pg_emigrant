@@ -121,6 +121,19 @@ WHERE n.nspname = ANY($1::text[])
 ORDER BY n.nspname, c.relname, t.tgname;
 """
 
+_VIEWS_SQL = """
+SELECT
+    n.nspname                               AS schema_name,
+    c.relname                               AS view_name,
+    c.relkind                               AS relkind,
+    pg_get_viewdef(c.oid, true)             AS view_def
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1::text[])
+  AND c.relkind IN ('v', 'm')
+ORDER BY n.nspname, c.relname;
+"""
+
 
 # ---------------------------------------------------------------------------
 # Data classes (plain dicts for simplicity)
@@ -173,6 +186,13 @@ async def get_triggers(
 ) -> list[dict]:
     """Return triggers (excluding internal ones) in the given schemas."""
     return [dict(r) for r in await conn.fetch(_TRIGGERS_SQL, schemas)]
+
+
+async def get_views(
+    conn: asyncpg.Connection, schemas: list[str]
+) -> list[dict]:
+    """Return views and materialized views in the given schemas."""
+    return [dict(r) for r in await conn.fetch(_VIEWS_SQL, schemas)]
 
 
 async def get_enum_types(
@@ -535,6 +555,75 @@ async def sync_triggers(
             )
 
 
+async def sync_views(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> None:
+    """Create or replace views and materialized views on the target.
+
+    Regular views use CREATE OR REPLACE.  Materialized views are dropped and
+    recreated when their definition changes (they hold no persistent data that
+    cannot be rebuilt with REFRESH MATERIALIZED VIEW).
+
+    Views are attempted in source-OID order (creation order) and retried up to
+    three times so that view-on-view dependency chains resolve without needing
+    an explicit topological sort.  Any still-failing views after all retries are
+    logged as warnings.
+
+    Note: materialized view data is NOT replicated via logical replication.
+    Run REFRESH MATERIALIZED VIEW on the target after migration.
+    """
+    rows = await source_conn.fetch(_VIEWS_SQL, schemas)
+    tgt_rows = await target_conn.fetch(_VIEWS_SQL, schemas)
+    tgt_view_map = {
+        (r["schema_name"], r["view_name"]): r["view_def"] for r in tgt_rows
+    }
+
+    pending = list(rows)
+    for _attempt in range(3):
+        if not pending:
+            break
+        failed = []
+        for row in pending:
+            schema = row["schema_name"]
+            view_name = row["view_name"]
+            relkind = row["relkind"]
+            view_def: str = row["view_def"]
+            fqn = f"{qi(schema)}.{qi(view_name)}"
+            tgt_def = tgt_view_map.get((schema, view_name))
+
+            if relkind == "v":
+                if tgt_def == view_def:
+                    continue
+                ddl = f"CREATE OR REPLACE VIEW {fqn} AS\n{view_def}"
+                try:
+                    await target_conn.execute(ddl)
+                    log.debug("Synced view %s.%s", schema, view_name)
+                except Exception as exc:
+                    log.debug("Failed to sync view %s.%s (will retry): %s", schema, view_name, exc)
+                    failed.append(row)
+            else:  # materialized view
+                if tgt_def == view_def:
+                    continue
+                try:
+                    await target_conn.execute(f"DROP MATERIALIZED VIEW IF EXISTS {fqn};")
+                    await target_conn.execute(
+                        f"CREATE MATERIALIZED VIEW {fqn} AS\n{view_def} WITH NO DATA;"
+                    )
+                    log.debug("Synced materialized view %s.%s", schema, view_name)
+                except Exception as exc:
+                    log.debug("Failed to sync materialized view %s.%s (will retry): %s", schema, view_name, exc)
+                    failed.append(row)
+        pending = failed
+
+    for row in pending:
+        log.warning(
+            "Could not sync view %s.%s after retries — check for unresolvable dependencies",
+            row["schema_name"], row["view_name"],
+        )
+
+
 async def sync_enum_types(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
@@ -706,6 +795,9 @@ async def sync_schemas(
     # Sync triggers AFTER tables and functions — triggers depend on both
     await sync_triggers(source_conn, target_conn, schemas)
 
+    # Sync views and materialized views AFTER tables (views may reference them)
+    await sync_views(source_conn, target_conn, schemas)
+
     # Set REPLICA IDENTITY FULL on tables without PK on both sides so that
     # logical replication can handle UPDATE/DELETE without a unique row identifier.
     await sync_replica_identity(source_conn, target_conn, schemas)
@@ -809,13 +901,15 @@ SELECT
     CASE c.relkind
         WHEN 'r' THEN 'table'
         WHEN 'S' THEN 'sequence'
+        WHEN 'v' THEN 'view'
+        WHEN 'm' THEN 'materialized_view'
     END         AS kind,
     r.rolname   AS owner
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_roles r     ON r.oid = c.relowner
 WHERE n.nspname = ANY($1::text[])
-  AND c.relkind IN ('r', 'S')
+  AND c.relkind IN ('r', 'S', 'v', 'm')
 ORDER BY n.nspname, c.relkind, c.relname;
 """
 
@@ -827,50 +921,149 @@ WHERE n.nspname = ANY($1::text[])
 ORDER BY n.nspname;
 """
 
+_TYPE_OWNERS_SQL = """
+SELECT
+    n.nspname   AS schema_name,
+    t.typname   AS object_name,
+    'type'      AS kind,
+    r.rolname   AS owner
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+JOIN pg_roles r     ON r.oid = t.typowner
+WHERE n.nspname = ANY($1::text[])
+  AND t.typtype IN ('e', 'd')
+  AND t.typname NOT LIKE '\_%'
+ORDER BY n.nspname, t.typname;
+"""
+
+_FUNCTION_OWNERS_SQL = """
+SELECT
+    n.nspname                                        AS schema_name,
+    p.proname                                        AS func_name,
+    pg_get_function_identity_arguments(p.oid)        AS func_args,
+    p.prokind                                        AS prokind,
+    r.rolname                                        AS owner
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_roles r     ON r.oid = p.proowner
+WHERE n.nspname = ANY($1::text[])
+  AND p.prokind IN ('f', 'p')
+ORDER BY n.nspname, p.proname;
+"""
+
 
 async def get_object_owners(
-    conn: asyncpg.Connection, schemas: list[str]
+    conn: asyncpg.Connection,
+    schemas: list[str],
+    *,
+    dbname: str | None = None,
 ) -> list[dict]:
-    """Return owner metadata for tables, sequences, and schemas in *schemas*."""
-    rows = [dict(r) for r in await conn.fetch(_OBJECT_OWNERS_SQL, schemas)]
+    """Return owner metadata for all schema objects in *schemas*.
+
+    Covers tables, sequences, views, materialized views, schemas,
+    user-defined types (enums, domains), and functions/procedures.
+    When *dbname* is given the database-level owner is also included.
+    """
+    rows: list[dict] = [dict(r) for r in await conn.fetch(_OBJECT_OWNERS_SQL, schemas)]
+
     schema_rows = [
         {"schema_name": r["schema_name"], "object_name": r["schema_name"],
          "kind": "schema", "owner": r["owner"]}
         for r in await conn.fetch(_SCHEMA_OWNERS_SQL, schemas)
     ]
-    return schema_rows + rows
+
+    type_rows = [
+        {"schema_name": r["schema_name"], "object_name": r["object_name"],
+         "kind": "type", "owner": r["owner"]}
+        for r in await conn.fetch(_TYPE_OWNERS_SQL, schemas)
+    ]
+
+    func_rows: list[dict] = []
+    for r in await conn.fetch(_FUNCTION_OWNERS_SQL, schemas):
+        func_rows.append({
+            "schema_name": r["schema_name"],
+            "object_name": f"{r['func_name']}({r['func_args']})",
+            "kind": "procedure" if r["prokind"] == "p" else "function",
+            "owner": r["owner"],
+            "func_name": r["func_name"],
+            "func_args": r["func_args"],
+        })
+
+    db_rows: list[dict] = []
+    if dbname:
+        db_row = await conn.fetchrow(
+            "SELECT r.rolname AS owner"
+            " FROM pg_database d"
+            " JOIN pg_roles r ON r.oid = d.datdba"
+            " WHERE d.datname = $1",
+            dbname,
+        )
+        if db_row:
+            db_rows.append({"schema_name": "", "object_name": dbname,
+                            "kind": "database", "owner": db_row["owner"]})
+
+    return schema_rows + rows + type_rows + func_rows + db_rows
+
+
+def make_owner_fix_ddl(rec: dict, owner: str) -> str:
+    """Generate the ALTER … OWNER TO statement for one owner record."""
+    schema = rec["schema_name"]
+    obj = rec["object_name"]
+    kind = rec["kind"]
+    if kind == "table":
+        return f"ALTER TABLE {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
+    if kind == "sequence":
+        return f"ALTER SEQUENCE {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
+    if kind == "view":
+        return f"ALTER VIEW {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
+    if kind == "materialized_view":
+        return f"ALTER MATERIALIZED VIEW {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
+    if kind in ("function", "procedure"):
+        return (
+            f"ALTER ROUTINE {qi(schema)}.{qi(rec['func_name'])}"
+            f"({rec['func_args']}) OWNER TO {qi(owner)};"
+        )
+    if kind == "type":
+        return f"ALTER TYPE {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
+    if kind == "schema":
+        return f"ALTER SCHEMA {qi(obj)} OWNER TO {qi(owner)};"
+    if kind == "database":
+        return f"ALTER DATABASE {qi(obj)} OWNER TO {qi(owner)};"
+    return ""
 
 
 async def sync_ownership(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
+    *,
+    dbname: str | None = None,
 ) -> int:
-    """Synchronize ownership of tables, sequences, and schemas from source to target.
+    """Synchronize ownership of all schema objects from source to target.
 
-    Emits ``ALTER TABLE/SEQUENCE/SCHEMA ... OWNER TO`` for every object whose
-    owner on the target differs from the source.  Roles that do not exist on the
-    target are skipped with a warning — create them manually beforehand if needed.
+    Covers tables, sequences, views, materialized views, schemas,
+    user-defined types (enums, domains), functions, procedures, and
+    (when *dbname* is supplied) the database itself.
+
+    Roles that do not exist on the target are skipped with a warning —
+    create them manually beforehand if needed.
 
     Returns the number of ownership changes applied.
     """
-    src_owners = {
-        (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-        for r in await get_object_owners(source_conn, schemas)
-    }
-    tgt_owners = {
-        (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
-        for r in await get_object_owners(target_conn, schemas)
-    }
+    src_list = await get_object_owners(source_conn, schemas, dbname=dbname)
+    tgt_list = await get_object_owners(target_conn, schemas, dbname=dbname)
 
-    # Pre-fetch roles that exist on target to avoid erroring on missing roles
+    src_owners = {(r["schema_name"], r["object_name"], r["kind"]): r for r in src_list}
+    tgt_owners = {(r["schema_name"], r["object_name"], r["kind"]): r["owner"] for r in tgt_list}
+
     existing_roles = {
         r["rolname"]
         for r in await target_conn.fetch("SELECT rolname FROM pg_roles")
     }
 
     applied = 0
-    for (schema, obj, kind), src_owner in src_owners.items():
+    for (schema, obj, kind), src_rec in src_owners.items():
+        src_owner = src_rec["owner"]
         tgt_owner = tgt_owners.get((schema, obj, kind))
         if tgt_owner == src_owner:
             continue
@@ -880,12 +1073,9 @@ async def sync_ownership(
                 kind, schema, obj, src_owner,
             )
             continue
-        if kind == "table":
-            stmt = f"ALTER TABLE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
-        elif kind == "sequence":
-            stmt = f"ALTER SEQUENCE {qi(schema)}.{qi(obj)} OWNER TO {qi(src_owner)};"
-        else:  # schema
-            stmt = f"ALTER SCHEMA {qi(obj)} OWNER TO {qi(src_owner)};"
+        stmt = make_owner_fix_ddl(src_rec, src_owner)
+        if not stmt:
+            continue
         try:
             await target_conn.execute(stmt)
             log.info("Set owner of %s %s.%s to %s", kind, schema, obj, src_owner)
