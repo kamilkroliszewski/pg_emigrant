@@ -49,14 +49,17 @@ The built-in status dashboard shows subscription state, replication slot activit
 | Auto-discovery of databases | ❌ | ❌ | ✅ |
 | Auto-discovery of schemas per database | ❌ | ❌ | ✅ |
 | Deferred index build (post-COPY) | ❌ | ❌ | ✅ |
-| Table/sequence/schema ownership sync | ❌ | ❌ | ✅ |
+| Full ownership sync (tables, seqs, views, funcs, types, DB) | ❌ | ❌ | ✅ |
 | Pydantic config + YAML | ❌ | ❌ | ✅ |
 | Patroni failover/switchover recovery | ❌ | ❌ | ✅ |
 | Tables without PK (REPLICA IDENTITY FULL) | ❌ | ✅ | ✅ |
 | Extension sync (btree_gin, pg_trgm, …) | ❌ | ❌ | ✅ |
-| User-defined function sync | ❌ | ❌ | ✅ |
+| User-defined function and procedure sync | ❌ | ❌ | ✅ |
+| Trigger sync | ❌ | ❌ | ✅ |
+| View and materialized view sync | ❌ | ❌ | ✅ |
 | Stored generated columns | ❌ | ❌ | ✅ |
 | Case-sensitive table/schema names | ✅ | ✅ | ✅ |
+| Multi-format CLI output (rich / simple / json) | ❌ | ❌ | ✅ |
 ---
 
 ## Architecture
@@ -256,13 +259,15 @@ Full automated initial migration:
 3. Per-database auto-discovery of user schemas (skips `pg_catalog`, `information_schema`, `pg_toast`, `pg_temp_*`)
 4. Schema synchronisation (tables, columns, PK/unique indexes, constraints, sequences); `SERIAL`/`BIGSERIAL` columns are reproduced with the original `DEFAULT nextval(...)` — the named sequence is created explicitly beforehand so PostgreSQL does not auto-generate a shadow `_seq1` sequence; **stored generated columns** (`GENERATED ALWAYS AS … STORED`) are reproduced correctly
 5. Extension synchronisation — extensions present on the source (e.g. `btree_gin`, `pg_trgm`) are installed on the target before any tables or indexes are created
-6. User-defined function synchronisation — functions and procedures in migrated schemas are applied to the target before tables, so that generated columns and DEFAULT expressions that call them work correctly
+6. User-defined function and procedure synchronisation — applied to the target before tables, so that generated columns and DEFAULT expressions that call them work correctly
 7. Tables without a PRIMARY KEY are automatically detected; `REPLICA IDENTITY FULL` is set on **both** source and target and the table is highlighted in yellow in the bootstrap output
-8. Parallel initial COPY (snapshot-consistent, CSV format for cross-version PG compatibility); correctly handles tables with mixed-case names (e.g. `__EFMigrationsHistory`)
-9. Non-unique index creation **after** COPY — faster than incremental updates during bulk insert
-10. Ownership synchronization for tables, sequences, and schemas (`ALTER ... OWNER TO`)
-11. Create publication on source
-12. Create subscription on target (without re-copying data)
+8. Trigger synchronisation — all non-internal triggers are recreated on the target after tables and functions exist; existing triggers with the same name are dropped first (triggers have no `CREATE OR REPLACE`)
+9. View and materialized view synchronisation — regular views use `CREATE OR REPLACE`; materialized views are dropped and recreated with `WITH NO DATA`; a 3-attempt retry loop resolves view-on-view dependency chains automatically
+10. Parallel initial COPY (snapshot-consistent, CSV format for cross-version PG compatibility); correctly handles tables with mixed-case names (e.g. `__EFMigrationsHistory`)
+11. Non-unique index creation **after** COPY — faster than incremental updates during bulk insert
+12. Full ownership synchronisation — tables, sequences, views, materialized views, user-defined types (enums, domains), functions, procedures, schemas, and the database itself (`ALTER ... OWNER TO`)
+13. Create publication on source
+14. Create subscription on target (without re-copying data)
 
 ```bash
 replicator bootstrap
@@ -304,7 +309,7 @@ replicator teardown --database mydb
 
 ### `replicator status`
 
-Displays a rich, **read-only** status dashboard for all databases. The command never writes anything to the target — it is safe to run at any point, including before `bootstrap`.
+Displays a **read-only** status dashboard for all databases. The command never writes anything to the target — it is safe to run at any point, including before `bootstrap`.
 
 - **Subscription status** — worker PID, Received LSN, Last Message timestamps
 - **Replication slots (source)** — slot state, WAL lag, Restart LSN
@@ -317,6 +322,53 @@ Displays a rich, **read-only** status dashboard for all databases. The command n
 replicator status
 replicator status --config /path/to/config.yaml
 replicator status --database mydb
+```
+
+#### Output format
+
+Use `--format` / `-f` to control the output style. The default is `rich` (coloured tables).
+
+```bash
+# Rich tables (default)
+replicator status --format rich
+
+# Grep-friendly key=value lines — one record per line
+replicator status --format simple
+
+# JSON array — one object per database
+replicator status --format json
+```
+
+Example `simple` output (suitable for pipelines across 100+ databases):
+
+```
+database=myapp section=lag write_lag=0.123 flush_lag=0.124 replay_lag=0.126
+database=myapp section=tables schema=public source=42 target=42
+database=analytics section=lag write_lag=5.412 flush_lag=5.413 replay_lag=5.418
+```
+
+#### Section filters
+
+When monitoring many databases, pass one or more section flags to limit the output to only that part of the dashboard. With no section flags all sections are shown.
+
+| Flag | Section shown |
+|---|---|
+| `--subscription` | Subscription worker status |
+| `--slots` | Replication slot details |
+| `--lag` | WAL replication lag |
+| `--tables` | Table counts per schema |
+| `--sequences` | Sequence value comparison |
+| `--drift` | DDL drift summary |
+
+```bash
+# Show only lag across all databases, grep for anything over 1 second
+replicator status --format simple --lag | grep write_lag
+
+# Drift only, structured JSON, piped to jq
+replicator status --format json --drift | jq '.[] | select(.drift != null)'
+
+# Tables and sequences only for one database
+replicator status --database mydb --tables --sequences
 ```
 
 ---
@@ -339,7 +391,28 @@ replicator sync-sequences --loop
 replicator sync-sequences --database mydb --loop
 ```
 
-One-off synchronisation output:
+#### Output format
+
+```bash
+# Rich table (default)
+replicator sync-sequences --format rich
+
+# Grep-friendly key=value lines — one record per line
+replicator sync-sequences --format simple
+
+# JSON array — one object per database
+replicator sync-sequences --format json
+```
+
+Example `simple` output — easy to pipe and grep across many databases:
+
+```
+database=myapp section=sequence schema=public sequence=users_id_seq source=10053 target=9821 status=updated
+database=myapp section=sequence schema=public sequence=orders_id_seq source=45210 target=45210 status=ok
+database=analytics section=sequence schema=public sequence=events_id_seq source=1200 target=1350 status=target_ahead
+```
+
+One-off `rich` synchronisation output:
 
 ```
 ┌───────────────────────────────────────────────────────────┐
@@ -381,18 +454,36 @@ replicator detect-ddl --database mydb --apply
 # Apply fixes + drop objects that exist on target but are missing on source
 replicator detect-ddl --apply --drop-extra
 
-# Detect and fix ownership drift (tables, sequences, schemas)
+# Detect and fix ownership drift
 replicator detect-ddl --fix-roles
 replicator detect-ddl --fix-roles --apply
 replicator detect-ddl --fix-roles --apply --database mydb
 ```
 
-Objects checked:
+#### Output format
+
+```bash
+# Rich tables (default)
+replicator detect-ddl --format rich
+
+# Grep-friendly key=value lines
+replicator detect-ddl --format simple
+
+# JSON — suitable for CI pipelines, archiving, jq
+replicator detect-ddl --format json > drift_$(date +%Y%m%d).json
+```
+
+#### Objects checked
+
 - **Tables** — missing on target or on source
 - **Columns** — missing, extra, type mismatches
 - **Indexes** — missing on target
 - **Constraints** — missing on target
-- **Ownership** (`--fix-roles`) — `ALTER TABLE/SEQUENCE/SCHEMA ... OWNER TO` for every object whose owner differs between source and target
+- **Functions and procedures** — missing on target or body differs
+- **Triggers** — missing on target or definition differs
+- **Views** — missing on target or definition differs
+- **Materialized views** — missing on target or definition differs
+- **Ownership** (`--fix-roles`) — `ALTER TABLE/SEQUENCE/VIEW/MATERIALIZED VIEW/ROUTINE/TYPE/SCHEMA/DATABASE … OWNER TO` for every object whose owner differs between source and target; covers tables, sequences, views, materialized views, user-defined types (enums, domains), functions, procedures, schemas, and the database itself
 
 > **Note:** ownership sync requires that the target roles already exist. pg_emigrant skips objects whose source owner is absent on the target and logs a warning — create the missing roles manually first.
 
@@ -400,15 +491,18 @@ Sample ownership drift report:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━ Ownership Drift — myapp ━━━━━━━━━━━━━━━━━━━━━━
-┌──────────────────┬────────┬───────────┬─────────────────────────────────────┬────────────────────────────────────────────────┐
-│ Kind             │ Schema │ Object    │ Detail                              │ Fix DDL                                        │
-├──────────────────┼────────┼───────────┼─────────────────────────────────────┼────────────────────────────────────────────────┤
-│ ownership(table) │ public │ orders    │ Owner mismatch: src=app, tgt=postgres│ ALTER TABLE "public"."orders" OWNER TO "app"; │
-│ ownership(schema)│ public │ public    │ Owner mismatch: src=app, tgt=postgres│ ALTER SCHEMA "public" OWNER TO "app";         │
-└──────────────────┴────────┴───────────┴─────────────────────────────────────┴────────────────────────────────────────────────┘
+┌──────────────────────────┬────────┬────────────────────────────────┬─────────────────────────────┬────────────────────────────────────────────────────────────────────────────────┐
+│ Kind                     │ Schema │ Object                         │ Detail                      │ Fix DDL                                                                        │
+├──────────────────────────┼────────┼────────────────────────────────┼─────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
+│ ownership(table)         │ public │ orders                         │ src=app tgt=postgres         │ ALTER TABLE "public"."orders" OWNER TO "app";                                  │
+│ ownership(view)          │ public │ orders_view                    │ src=app tgt=postgres         │ ALTER VIEW "public"."orders_view" OWNER TO "app";                              │
+│ ownership(function)      │ public │ calculate_total(integer)       │ src=app tgt=postgres         │ ALTER ROUTINE "public"."calculate_total"(integer) OWNER TO "app";              │
+│ ownership(schema)        │ public │ public                         │ src=app tgt=postgres         │ ALTER SCHEMA "public" OWNER TO "app";                                          │
+│ ownership(database)      │        │ myapp                          │ src=app tgt=postgres         │ ALTER DATABASE "myapp" OWNER TO "app";                                         │
+└──────────────────────────┴────────┴────────────────────────────────┴─────────────────────────────┴────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Sample report:
+Sample drift report:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━  Drift Report — myapp  ━━━━━━━━━━━━━━━━━━━━━
@@ -417,6 +511,9 @@ Sample report:
 ├────────────┼────────┼───────────┼─────────────────┼───────────────────┼──────────────────────────┼────────────────────────────────────────┤
 │ column     │ public │ users     │ phone_number    │ missing_on_target │ Column phone_number (...)│ ALTER TABLE "public"."users" ADD ...   │
 │ index      │ public │ orders    │ idx_orders_date │ missing_on_target │ CREATE INDEX ...         │ CREATE INDEX idx_orders_date ON ...    │
+│ function   │ public │           │ calc_vat        │ missing_on_target │ Function not on target   │ CREATE OR REPLACE FUNCTION …           │
+│ trigger    │ public │ orders    │ trg_audit       │ missing_on_target │ Trigger not on target    │ CREATE TRIGGER trg_audit …             │
+│ view       │ public │           │ orders_view     │ body_differs      │ View definition changed  │ CREATE OR REPLACE VIEW …               │
 └────────────┴────────┴───────────┴─────────────────┴───────────────────┴──────────────────────────┴────────────────────────────────────────┘
 ```
 
