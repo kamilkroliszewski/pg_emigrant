@@ -6,6 +6,7 @@ Provides start / stop / status operations.
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 import asyncpg
@@ -30,6 +31,65 @@ def pub_name(cfg: ReplicatorConfig, dbname: str) -> str:
 def sub_name(cfg: ReplicatorConfig, dbname: str) -> str:
     """Per-database subscription / slot name."""
     return f"{cfg.subscription_name}_{_safe_dbname(dbname)}"
+
+
+async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
+    """Warn about open transactions that will block CREATE_REPLICATION_SLOT.
+
+    CREATE_REPLICATION_SLOT must acquire a ShareLock on every active XID in the
+    entire cluster — including transactions in *other* databases.  Any long-running
+    or leaked 'idle in transaction' session will cause the slot creation to hang
+    indefinitely until that transaction ends.
+
+    Only transactions older than 30 seconds are reported to avoid noise from
+    short-lived in-flight transactions.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT pid,
+               usename,
+               datname,
+               application_name,
+               backend_type,
+               state,
+               backend_xid,
+               EXTRACT(EPOCH FROM (now() - xact_start))::bigint AS xact_age_seconds,
+               query
+        FROM   pg_stat_activity
+        WHERE  backend_xid IS NOT NULL
+          AND  xact_start IS NOT NULL
+          AND  pid <> pg_backend_pid()
+          AND  EXTRACT(EPOCH FROM (now() - xact_start)) > 30
+        ORDER  BY xact_start
+        """
+    )
+    if not rows:
+        return
+
+    log.warning(
+        "Found %d open transaction(s) on the source that will block CREATE_REPLICATION_SLOT. "
+        "The slot creation must acquire a ShareLock on every active XID across the *entire* "
+        "cluster — transactions in other databases also count. "
+        "If any of these are leaked / idle-in-transaction sessions, terminate them before retrying.",
+        len(rows),
+    )
+    for row in rows:
+        age_s = int(row["xact_age_seconds"])
+        age_str = f"{age_s // 3600:02d}:{(age_s % 3600) // 60:02d}:{age_s % 60:02d}"
+        last_query = (row["query"] or "").strip().replace("\n", " ")[:120]
+        log.warning(
+            "  Blocker  pid=%-7s  user=%-20s  db=%-30s  state=%-22s  age=%s  query=%s",
+            row["pid"],
+            row["usename"] or "",
+            row["datname"] or "",
+            row["state"] or "",
+            age_str,
+            last_query,
+        )
+        log.warning(
+            "  → To unblock run on source:  SELECT pg_terminate_backend(%s);",
+            row["pid"],
+        )
 
 
 async def create_publication(
@@ -121,8 +181,38 @@ async def create_subscription(
                         "SELECT pg_terminate_backend($1);", slot_row["active_pid"]
                     )
                     log.info("Terminated backend PID %s holding slot %s", slot_row["active_pid"], sub)
-                await src_conn.execute("SELECT pg_drop_replication_slot($1);", sub)
-                log.info("Dropped orphaned replication slot %s on source", sub)
+
+                # Wait for the slot to become inactive after terminating the backend.
+                # pg_terminate_backend is asynchronous — the slot may still show as
+                # active for a short period after the signal is sent.
+                for attempt in range(20):
+                    row = await src_conn.fetchrow(
+                        "SELECT active FROM pg_replication_slots WHERE slot_name = $1", sub
+                    )
+                    if row is None:
+                        # Slot disappeared on its own after backend was terminated.
+                        log.info("Slot %s vanished after backend termination — nothing to drop", sub)
+                        break
+                    if not row["active"]:
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    log.warning("Slot %s still active after waiting; attempting drop anyway", sub)
+
+                # Re-check existence before dropping — slot may have been cleaned up already.
+                still_exists = await src_conn.fetchval(
+                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1", sub
+                )
+                if still_exists:
+                    await src_conn.execute("SELECT pg_drop_replication_slot($1);", sub)
+                    log.info("Dropped orphaned replication slot %s on source", sub)
+
+        # Pre-flight: warn about open transactions that will block slot creation.
+        # CREATE_REPLICATION_SLOT acquires a ShareLock on every active XID in the
+        # entire cluster, so even a leaked 'idle in transaction' session in an
+        # unrelated database will cause this to hang indefinitely.
+        async with connect(cfg.source, dbname) as src_conn:
+            await _warn_replication_slot_blockers(src_conn)
 
         # create_slot and copy_data are intentionally set this way:
         # - copy_data = false: we already copied data
@@ -133,7 +223,40 @@ async def create_subscription(
             f"PUBLICATION {qi(pub)} "
             f"WITH (copy_data = false, create_slot = true);"
         )
-        await conn.execute(sql)
+        try:
+            # Timeout guards against CREATE SUBSCRIPTION hanging indefinitely when
+            # the WAL receiver cannot reach the source (e.g. pg_hba.conf replication
+            # entry missing for the target host, max_wal_senders exhausted, or network
+            # change).  PostgreSQL creates the replication slot on the source first,
+            # then opens the WAL receiver connection — if that second step hangs we
+            # must clean up the orphaned slot before surfacing the error.
+            await conn.execute(sql, timeout=60)
+        except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError) as exc:
+            log.error(
+                "CREATE SUBSCRIPTION %s timed out after 60 s — "
+                "check pg_hba.conf (replication entry for the target host) and "
+                "max_wal_senders on the source; cleaning up orphaned slot",
+                sub,
+            )
+            async with connect(cfg.source, dbname) as src_conn:
+                orphan = await src_conn.fetchrow(
+                    "SELECT active, active_pid "
+                    "FROM pg_replication_slots WHERE slot_name = $1",
+                    sub,
+                )
+                if orphan:
+                    if orphan["active"] and orphan["active_pid"]:
+                        await src_conn.execute(
+                            "SELECT pg_terminate_backend($1);", orphan["active_pid"]
+                        )
+                        await asyncio.sleep(1)
+                    await src_conn.execute("SELECT pg_drop_replication_slot($1);", sub)
+                    log.info("Dropped orphaned slot %s after subscription timeout", sub)
+            raise RuntimeError(
+                f"CREATE SUBSCRIPTION {sub} timed out — verify that the source "
+                f"pg_hba.conf has a 'replication' entry for the target host "
+                f"and that max_wal_senders is not exhausted"
+            ) from exc
         log.info("Created subscription %s in %s", sub, dbname)
 
 
