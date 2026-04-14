@@ -932,7 +932,7 @@ JOIN pg_namespace n ON n.oid = t.typnamespace
 JOIN pg_roles r     ON r.oid = t.typowner
 WHERE n.nspname = ANY($1::text[])
   AND t.typtype IN ('e', 'd')
-  AND t.typname NOT LIKE '\_%'
+  AND t.typname NOT LIKE '\\_%'
 ORDER BY n.nspname, t.typname;
 """
 
