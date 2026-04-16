@@ -462,8 +462,9 @@ async def sync_sequence(
     fqn = qt(schema, seq_name)
     exists = await target_conn.fetchval(
         "SELECT EXISTS ("
-        "  SELECT 1 FROM information_schema.sequences"
-        "  WHERE sequence_schema = $1 AND sequence_name = $2"
+        "  SELECT 1 FROM pg_class c"
+        "  JOIN pg_namespace n ON n.oid = c.relnamespace"
+        "  WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'S'"
         ")",
         schema,
         seq_name,
@@ -494,10 +495,17 @@ async def sync_sequence(
     # Copy current value
     src_val = await get_sequence_value(source_conn, schema, seq_name)
     if src_val["is_called"]:
-        await target_conn.execute(
-            f"SELECT setval('{schema}.{seq_name}', $1, true);",
-            src_val["last_value"],
-        )
+        try:
+            await target_conn.execute(
+                f"SELECT setval('{schema}.{seq_name}', $1, true);",
+                src_val["last_value"],
+            )
+        except Exception as exc:
+            log.warning(
+                "Could not set value for sequence %s: %s — sequence will start from its initial value",
+                fqn, exc,
+            )
+            return
     log.debug("Sequence %s synced to %s", fqn, src_val["last_value"])
 
 
