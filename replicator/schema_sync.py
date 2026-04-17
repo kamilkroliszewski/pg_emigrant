@@ -104,6 +104,12 @@ FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
 WHERE n.nspname = ANY($1::text[])
   AND p.prokind IN ('f', 'p')
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_proc'::regclass
+        AND d.objid = p.oid
+        AND d.deptype = 'e'
+  )
 ORDER BY n.nspname, p.proname;
 """
 
@@ -118,6 +124,12 @@ JOIN pg_class c ON c.oid = t.tgrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = ANY($1::text[])
   AND NOT t.tgisinternal
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_trigger'::regclass
+        AND d.objid = t.oid
+        AND d.deptype = 'e'
+  )
 ORDER BY n.nspname, c.relname, t.tgname;
 """
 
@@ -131,6 +143,12 @@ FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = ANY($1::text[])
   AND c.relkind IN ('v', 'm')
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_class'::regclass
+        AND d.objid = c.oid
+        AND d.deptype = 'e'
+  )
 ORDER BY n.nspname, c.relname;
 """
 
