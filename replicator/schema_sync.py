@@ -215,8 +215,26 @@ async def get_triggers(
 async def get_views(
     conn: asyncpg.Connection, schemas: list[str]
 ) -> list[dict]:
-    """Return views and materialized views in the given schemas."""
-    return [dict(r) for r in await conn.fetch(_VIEWS_SQL, schemas)]
+    """Return views and materialized views in the given schemas.
+
+    Timescaledb continuous aggregates are excluded — they are backed by
+    internal hypertables and cannot be re-created via standard DDL.
+    """
+    rows = [dict(r) for r in await conn.fetch(_VIEWS_SQL, schemas)]
+    try:
+        cagg_rows = await conn.fetch(
+            "SELECT user_view_schema, user_view_name"
+            " FROM _timescaledb_catalog.continuous_agg"
+        )
+        caggs = {(r["user_view_schema"], r["user_view_name"]) for r in cagg_rows}
+        if caggs:
+            rows = [
+                r for r in rows
+                if (r["schema_name"], r["view_name"]) not in caggs
+            ]
+    except asyncpg.PostgresError:
+        pass  # timescaledb not installed or catalog not accessible
+    return rows
 
 
 async def get_enum_types(
@@ -1065,10 +1083,10 @@ def make_owner_fix_ddl(rec: dict, owner: str) -> str:
         return f"ALTER TABLE {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
     if kind == "sequence":
         return f"ALTER SEQUENCE {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
-    if kind == "view":
-        return f"ALTER VIEW {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
-    if kind == "materialized_view":
-        return f"ALTER MATERIALIZED VIEW {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
+    if kind in ("view", "materialized_view"):
+        # ALTER TABLE works for both regular views and materialized views,
+        # avoiding DDL failures when source/target disagree on the relkind.
+        return f"ALTER TABLE {qi(schema)}.{qi(obj)} OWNER TO {qi(owner)};"
     if kind in ("function", "procedure"):
         return (
             f"ALTER ROUTINE {qi(schema)}.{qi(rec['func_name'])}"
