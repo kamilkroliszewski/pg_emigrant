@@ -130,6 +130,12 @@ WHERE n.nspname = ANY($1::text[])
         AND d.objid = t.oid
         AND d.deptype = 'e'
   )
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_proc'::regclass
+        AND d.objid = t.tgfoid
+        AND d.deptype = 'e'
+  )
 ORDER BY n.nspname, c.relname, t.tgname;
 """
 
@@ -635,7 +641,7 @@ async def sync_views(
                 try:
                     await target_conn.execute(f"DROP MATERIALIZED VIEW IF EXISTS {fqn};")
                     await target_conn.execute(
-                        f"CREATE MATERIALIZED VIEW {fqn} AS\n{view_def} WITH NO DATA;"
+                        f"CREATE MATERIALIZED VIEW {fqn} AS\n{view_def.rstrip().rstrip(';')} WITH NO DATA;"
                     )
                     log.debug("Synced materialized view %s.%s", schema, view_name)
                 except Exception as exc:
