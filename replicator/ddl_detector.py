@@ -372,7 +372,7 @@ async def detect_drift(
                 if relkind == "v":
                     fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
                 else:
-                    fix = f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def} WITH NO DATA;"
+                    fix = f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def.rstrip().rstrip(';')} WITH NO DATA;"
                 report.items.append(DriftItem(
                     object_type=obj_type,
                     schema=vschema,
@@ -388,7 +388,7 @@ async def detect_drift(
                 else:
                     fix = (
                         f"DROP MATERIALIZED VIEW IF EXISTS {fqn};\n"
-                        f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def} WITH NO DATA;"
+                        f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def.rstrip().rstrip(';')} WITH NO DATA;"
                     )
                 report.items.append(DriftItem(
                     object_type=obj_type,
