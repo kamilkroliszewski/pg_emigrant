@@ -767,12 +767,13 @@ async def sync_schemas(
     schemas: list[str],
 ) -> None:
     """Full schema synchronization: schemas → enums → sequences → tables → FKs."""
-    # Ensure target schemas exist
+    # Sync extensions FIRST — extensions like timescaledb create their own schemas
+    # on installation; creating those schemas beforehand causes the install to fail.
+    await sync_extensions(source_conn, target_conn)
+
+    # Ensure remaining target schemas exist (extension-owned ones were created above)
     for s in schemas:
         await ensure_schema_exists(target_conn, s)
-
-    # Sync extensions FIRST — functions, operator classes, and indexes may depend on them
-    await sync_extensions(source_conn, target_conn)
 
     # Sync enum types BEFORE tables so columns with enum types can be created
     await sync_enum_types(source_conn, target_conn, schemas)
@@ -918,6 +919,12 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_roles r     ON r.oid = c.relowner
 WHERE n.nspname = ANY($1::text[])
   AND c.relkind IN ('r', 'S', 'v', 'm')
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_class'::regclass
+        AND d.objid = c.oid
+        AND d.deptype = 'e'
+  )
 ORDER BY n.nspname, c.relkind, c.relname;
 """
 
@@ -941,6 +948,12 @@ JOIN pg_roles r     ON r.oid = t.typowner
 WHERE n.nspname = ANY($1::text[])
   AND t.typtype IN ('e', 'd')
   AND t.typname NOT LIKE '\\_%'
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_type'::regclass
+        AND d.objid = t.oid
+        AND d.deptype = 'e'
+  )
 ORDER BY n.nspname, t.typname;
 """
 
@@ -956,6 +969,12 @@ JOIN pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_roles r     ON r.oid = p.proowner
 WHERE n.nspname = ANY($1::text[])
   AND p.prokind IN ('f', 'p')
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_proc'::regclass
+        AND d.objid = p.oid
+        AND d.deptype = 'e'
+  )
 ORDER BY n.nspname, p.proname;
 """
 
@@ -1089,7 +1108,7 @@ async def sync_ownership(
             log.info("Set owner of %s %s.%s to %s", kind, schema, obj, src_owner)
             applied += 1
         except Exception as exc:
-            log.error("Failed to set owner of %s %s.%s — %s", kind, schema, obj, exc)
+            log.warning("Could not set owner of %s %s.%s — %s", kind, schema, obj, exc)
 
     return applied
 
