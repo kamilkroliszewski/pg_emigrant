@@ -855,9 +855,16 @@ async def sync_schemas(
             source_conn, target_conn, t["schema_name"], t["table_name"],
         )
 
-    # Second pass: foreign keys
-    for t in tables:
-        await _sync_foreign_keys(source_conn, target_conn, t["schema_name"], t["table_name"])
+    # Second pass: foreign keys.
+    # pg_get_constraintdef returns unqualified referenced-table names, so we
+    # must set search_path to all migrated schemas before executing FK DDL.
+    _sp = ", ".join(qi(s) for s in schemas) + ", public"
+    await target_conn.execute(f"SET search_path TO {_sp};")
+    try:
+        for t in tables:
+            await _sync_foreign_keys(source_conn, target_conn, t["schema_name"], t["table_name"])
+    finally:
+        await target_conn.execute("RESET search_path;")
 
     # Sync triggers AFTER tables and functions — triggers depend on both
     await sync_triggers(source_conn, target_conn, schemas)
@@ -1225,3 +1232,8 @@ async def _sync_foreign_keys(
                 await target_conn.execute(stmt)
             except (asyncpg.DuplicateObjectError, asyncpg.WrongObjectTypeError):
                 log.debug("Skipping FK %s on %s (duplicate or view)", c["constraint_name"], fqn)
+            except (asyncpg.UndefinedTableError, asyncpg.UndefinedObjectError) as exc:
+                log.warning(
+                    "Skipping FK %s on %s — referenced object not found on target: %s",
+                    c["constraint_name"], fqn, exc,
+                )
