@@ -554,8 +554,10 @@ async def sync_sequence(
     src_val = await get_sequence_value(source_conn, schema, seq_name)
     if src_val["is_called"]:
         try:
+            # Use fqn (already double-quoted) so mixed-case names like
+            # "Platforms_id_seq" are not silently folded to lowercase.
             await target_conn.execute(
-                f"SELECT setval('{schema}.{seq_name}', $1, true);",
+                f"SELECT setval('{fqn}', $1, true);",
                 src_val["last_value"],
             )
         except Exception as exc:
@@ -792,31 +794,76 @@ async def sync_replica_identity(
 async def sync_extensions(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
-) -> None:
+) -> set[str]:
     """Ensure all extensions present on the source are installed on the target.
 
     Extensions like btree_gin or pg_trgm provide operator classes required by
     indexes.  Without them, creating GIN indexes on types like UUID fails with
     'no default operator class'.  Failures are logged as warnings because some
     extensions (e.g. timescaledb) may not be available on the target system.
+
+    Returns the set of schema names that are owned by extensions on the source.
+    These schemas must NOT be pre-created via ensure_schema_exists — the extension
+    install is responsible for creating them.
     """
     rows = await source_conn.fetch(
         """
-        SELECT extname
-        FROM pg_extension
-        WHERE extname NOT IN ('plpgsql')
-        ORDER BY extname
+        SELECT e.extname, n.nspname AS extschema
+        FROM pg_extension e
+        LEFT JOIN pg_namespace n ON n.oid = e.extnamespace
+        WHERE e.extname NOT IN ('plpgsql')
+        ORDER BY e.extname
         """
     )
+    ext_schemas: set[str] = set()
     for row in rows:
         extname = row["extname"]
+        extschema: str | None = row["extschema"]
+        if extschema:
+            ext_schemas.add(extschema)
         try:
             await target_conn.execute(
                 f"CREATE EXTENSION IF NOT EXISTS {qi(extname)};"
             )
             log.debug("Ensured extension %s is installed", extname)
         except Exception as exc:
+            # Some extensions (e.g. anon with shared_preload_libraries) pre-create
+            # their schema via a _PG_init hook before CREATE EXTENSION is run.
+            # PostgreSQL then refuses to let the extension adopt the pre-existing
+            # schema.  Detect this case: if the schema exists on the target but is
+            # NOT owned by any extension, drop it (only if empty) and retry.
+            if extschema and "is not a member of extension" in str(exc):
+                schema_orphaned = await target_conn.fetchval(
+                    """
+                    SELECT n.oid IS NOT NULL
+                    FROM pg_namespace n
+                    LEFT JOIN pg_extension e ON e.extnamespace = n.oid
+                    WHERE n.nspname = $1 AND e.extname IS NULL
+                    """,
+                    extschema,
+                )
+                if schema_orphaned:
+                    try:
+                        await target_conn.execute(
+                            f"DROP SCHEMA IF EXISTS {qi(extschema)};"
+                        )
+                        await target_conn.execute(
+                            f"CREATE EXTENSION IF NOT EXISTS {qi(extname)};"
+                        )
+                        log.info(
+                            "Installed extension %s after dropping orphaned schema %s "
+                            "(pre-created by shared_preload_libraries)",
+                            extname, extschema,
+                        )
+                        continue
+                    except Exception as exc2:
+                        log.warning(
+                            "Could not install extension %s after dropping orphaned schema %s: %s",
+                            extname, extschema, exc2,
+                        )
+                        continue
             log.warning("Could not install extension %s: %s", extname, exc)
+    return ext_schemas
 
 
 async def sync_schemas(
@@ -825,12 +872,18 @@ async def sync_schemas(
     schemas: list[str],
 ) -> None:
     """Full schema synchronization: schemas → enums → sequences → tables → FKs."""
-    # Sync extensions FIRST — extensions like timescaledb create their own schemas
-    # on installation; creating those schemas beforehand causes the install to fail.
-    await sync_extensions(source_conn, target_conn)
+    # Sync extensions FIRST — extensions like timescaledb / anon create their own
+    # schemas on installation; creating those schemas beforehand causes the install
+    # to fail.  sync_extensions returns the set of extension-owned schema names so
+    # we can skip them in the ensure_schema_exists loop below.
+    ext_schemas = await sync_extensions(source_conn, target_conn)
 
-    # Ensure remaining target schemas exist (extension-owned ones were created above)
+    # Ensure remaining target schemas exist; skip extension-owned ones —
+    # they were (or should have been) created by the extension install above.
     for s in schemas:
+        if s in ext_schemas:
+            log.debug("Skipping ensure_schema_exists for %s (owned by extension on source)", s)
+            continue
         await ensure_schema_exists(target_conn, s)
 
     # Sync enum types BEFORE tables so columns with enum types can be created
