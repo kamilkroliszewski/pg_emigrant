@@ -30,6 +30,18 @@ from replicator.utils import get_logger, qi, qt
 log = get_logger(__name__)
 
 
+def _norm(text: str) -> str:
+    """Normalize whitespace in a SQL definition for comparison.
+
+    pg_get_viewdef() / pg_get_functiondef() may produce slightly different
+    whitespace (extra spaces, newline style) across PostgreSQL versions or
+    when different ``search_path`` settings are active.  Collapsing all
+    whitespace runs to a single space makes the comparison robust.
+    """
+    import re
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
 @dataclass
 class DriftItem:
     """A single schema difference."""
@@ -279,18 +291,28 @@ async def detect_drift(
                         ))
 
         # Functions
+        # Key on (schema_name, func_oid) so overloaded functions (same name,
+        # different argument signatures) are matched 1-to-1 and not accidentally
+        # compared against the wrong overload.
         src_funcs = await get_functions(src, schemas)
         tgt_funcs = await get_functions(tgt, schemas)
-        tgt_func_map = {
-            (f["schema_name"], f["func_name"]): f["func_def"] for f in tgt_funcs
-        }
+        # Build a map: find the target definition for a function by matching its
+        # definition signature (schema + full func_def without the body — the
+        # header line contains name + args).  We need this because the source
+        # OID will differ from the target OID for the same function.
+        tgt_func_by_header: dict[tuple[str, str], str] = {}
+        for f in tgt_funcs:
+            # Use the first line of func_def ("CREATE OR REPLACE FUNCTION …")
+            # as a stable identifier that includes the full argument list.
+            header = f["func_def"].split("\n")[0].strip()
+            tgt_func_by_header[(f["schema_name"], header)] = f["func_def"]
 
         for src_func in src_funcs:
             func_schema = src_func["schema_name"]
             func_name = src_func["func_name"]
-            key = (func_schema, func_name)
             src_def: str = src_func["func_def"]
-            tgt_def = tgt_func_map.get(key)
+            src_header = src_def.split("\n")[0].strip()
+            tgt_def = tgt_func_by_header.get((func_schema, src_header))
             if tgt_def is None:
                 report.items.append(DriftItem(
                     object_type="function",
@@ -301,7 +323,7 @@ async def detect_drift(
                     detail=f"Function {func_schema}.{func_name} missing on target",
                     fix_ddl=src_def + ";",
                 ))
-            elif src_def != tgt_def:
+            elif _norm(src_def) != _norm(tgt_def):
                 report.items.append(DriftItem(
                     object_type="function",
                     schema=func_schema,
@@ -382,7 +404,7 @@ async def detect_drift(
                     detail=f"{obj_type} {vschema}.{vname} missing on target",
                     fix_ddl=fix,
                 ))
-            elif src_def != tgt_view["view_def"]:
+            elif _norm(src_def) != _norm(tgt_view["view_def"]):
                 if relkind == "v":
                     fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
                 else:
