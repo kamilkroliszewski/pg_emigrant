@@ -440,6 +440,10 @@ async def detect_drift(
             tgt_owner = tgt_owners_map.get((own_schema, obj, kind))
             if tgt_owner == src_owner:
                 continue
+            # Object missing on target entirely — ownership can't be set;
+            # the missing object is already captured by the views/tables section.
+            if tgt_owner is None:
+                continue
             if src_owner not in existing_roles:
                 fix = ""
                 detail = (
@@ -493,6 +497,10 @@ async def detect_ownership_drift(
         src_owner = src_rec["owner"]
         tgt_owner = tgt_owners.get((schema, obj, kind))
         if tgt_owner == src_owner:
+            continue
+        # Object missing on target entirely — can't set ownership on something
+        # that doesn't exist yet.
+        if tgt_owner is None:
             continue
         if src_owner not in existing_roles:
             fix = ""
