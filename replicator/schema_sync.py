@@ -573,11 +573,19 @@ async def sync_functions(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
+    *,
+    silent: bool = False,
 ) -> None:
     """Create or replace user-defined functions/procedures on the target.
 
-    Uses CREATE OR REPLACE so it is idempotent.  Functions must be synced
-    before tables because generated columns or DEFAULT expressions may call them.
+    Uses CREATE OR REPLACE so it is idempotent.
+
+    Call with ``silent=True`` for a best-effort pre-pass before tables are
+    created (needed for generated columns / DEFAULT expressions that call
+    functions).  Failures in that pass are expected and logged at DEBUG level.
+    Call again after tables are created (``silent=False``, the default) so
+    that functions referencing tables succeed and any remaining failures are
+    logged as warnings.
     """
     rows = await source_conn.fetch(_FUNCTIONS_SQL, schemas)
     for row in rows:
@@ -587,10 +595,16 @@ async def sync_functions(
             await target_conn.execute(func_def)
             log.debug("Synced function %s.%s", row["schema_name"], row["func_name"])
         except Exception as exc:
-            log.warning(
-                "Could not sync function %s.%s: %s",
-                row["schema_name"], row["func_name"], exc,
-            )
+            if silent:
+                log.debug(
+                    "Pre-pass: could not sync function %s.%s (will retry after tables): %s",
+                    row["schema_name"], row["func_name"], exc,
+                )
+            else:
+                log.warning(
+                    "Could not sync function %s.%s: %s",
+                    row["schema_name"], row["func_name"], exc,
+                )
 
 
 async def sync_triggers(
@@ -897,8 +911,11 @@ async def sync_schemas(
             seq["schema_name"], seq["sequence_name"],
         )
 
-    # Sync functions BEFORE tables — generated columns / defaults may call them
-    await sync_functions(source_conn, target_conn, schemas)
+    # Silent pre-pass: try functions before tables so that generated columns
+    # or DEFAULT expressions that call functions can be created.  Most functions
+    # will fail here (they reference tables not yet created) — that's expected
+    # and logged only at DEBUG level.
+    await sync_functions(source_conn, target_conn, schemas, silent=True)
 
     # Sync tables (without foreign keys first to avoid dependency issues)
     tables = await get_tables(source_conn, schemas)
@@ -907,6 +924,11 @@ async def sync_schemas(
         await _sync_table_structure(
             source_conn, target_conn, t["schema_name"], t["table_name"],
         )
+
+    # Retry functions now that tables exist — most will succeed on this pass.
+    # Remaining failures (e.g. missing types or cross-schema objects) are
+    # logged as warnings.
+    await sync_functions(source_conn, target_conn, schemas)
 
     # Second pass: foreign keys.
     # pg_get_constraintdef returns unqualified referenced-table names, so we
