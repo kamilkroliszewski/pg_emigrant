@@ -685,6 +685,11 @@ async def sync_views(
         (r["schema_name"], r["view_name"]): r["view_def"] for r in tgt_rows
     }
 
+    import re as _re
+    def _nv(s: str) -> str:
+        """Normalize whitespace for view definition comparison."""
+        return _re.sub(r"\s+", " ", (s or "").strip())
+
     pending = list(rows)
     for _attempt in range(3):
         if not pending:
@@ -699,7 +704,7 @@ async def sync_views(
             tgt_def = tgt_view_map.get((schema, view_name))
 
             if relkind == "v":
-                if tgt_def == view_def:
+                if _nv(tgt_def) == _nv(view_def):
                     continue
                 ddl = f"CREATE OR REPLACE VIEW {fqn} AS\n{view_def}"
                 try:
@@ -709,7 +714,7 @@ async def sync_views(
                     log.debug("Failed to sync view %s.%s (will retry): %s", schema, view_name, exc)
                     failed.append(row)
             else:  # materialized view
-                if tgt_def == view_def:
+                if _nv(tgt_def) == _nv(view_def):
                     continue
                 try:
                     await target_conn.execute(f"DROP MATERIALIZED VIEW IF EXISTS {fqn};")
