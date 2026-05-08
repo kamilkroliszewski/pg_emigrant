@@ -95,6 +95,29 @@ GROUP BY n.nspname, t.typname
 ORDER BY n.nspname, t.typname;
 """
 
+_COMPOSITE_TYPES_SQL = """
+SELECT
+    n.nspname   AS schema_name,
+    t.typname   AS type_name,
+    a.attname   AS col_name,
+    pg_catalog.format_type(a.atttypid, a.atttypmod) AS col_type
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+JOIN pg_class c     ON c.oid = t.typrelid AND c.relkind = 'c'
+JOIN pg_attribute a ON a.attrelid = c.oid
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+WHERE n.nspname = ANY($1::text[])
+  AND t.typtype = 'c'
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_type'::regclass
+        AND d.objid = t.oid
+        AND d.deptype = 'e'
+  )
+ORDER BY n.nspname, t.typname, a.attnum;
+"""
+
 _FUNCTIONS_SQL = """
 SELECT
     n.nspname                        AS schema_name,
@@ -757,6 +780,65 @@ async def sync_enum_types(
                     await target_conn.execute(ddl)
 
 
+async def sync_composite_types(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> None:
+    """Create missing composite (row) types on the target.
+
+    Composite types may reference other composite types, so creation is
+    attempted up to three times to resolve ordering dependencies.
+    """
+    rows = await source_conn.fetch(_COMPOSITE_TYPES_SQL, schemas)
+
+    # Group columns by (schema_name, type_name) preserving attribute order
+    type_cols: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for row in rows:
+        key = (row["schema_name"], row["type_name"])
+        if key not in type_cols:
+            type_cols[key] = []
+        type_cols[key].append((row["col_name"], row["col_type"]))
+
+    if not type_cols:
+        return
+
+    pending = list(type_cols.items())
+    for _attempt in range(3):
+        if not pending:
+            break
+        failed = []
+        for (schema, type_name), cols in pending:
+            exists = await target_conn.fetchval(
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM pg_type t"
+                "  JOIN pg_namespace n ON n.oid = t.typnamespace"
+                "  WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'c'"
+                ")",
+                schema, type_name,
+            )
+            if exists:
+                continue
+            col_defs = ", ".join(f"{qi(cn)} {ct}" for cn, ct in cols)
+            ddl = f"CREATE TYPE {qi(schema)}.{qi(type_name)} AS ({col_defs});"
+            try:
+                await target_conn.execute(ddl)
+                log.info("Created composite type %s.%s", schema, type_name)
+            except Exception as exc:
+                log.debug(
+                    "Could not create composite type %s.%s (will retry): %s",
+                    schema, type_name, exc,
+                )
+                failed.append(((schema, type_name), cols))
+        pending = failed
+
+    for (schema, type_name), _ in pending:
+        log.warning(
+            "Could not sync composite type %s.%s — check for unresolvable type dependencies",
+            schema, type_name,
+        )
+
+
 async def sync_replica_identity(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
@@ -903,6 +985,9 @@ async def sync_schemas(
     # Sync enum types BEFORE tables so columns with enum types can be created
     await sync_enum_types(source_conn, target_conn, schemas)
 
+    # Sync composite types BEFORE tables — table columns may use them as their data type
+    await sync_composite_types(source_conn, target_conn, schemas)
+
     # Sync sequences FIRST so that table DDL with DEFAULT nextval(...) succeeds
     sequences = await get_sequences(source_conn, schemas)
     for seq in sequences:
@@ -925,10 +1010,10 @@ async def sync_schemas(
             source_conn, target_conn, t["schema_name"], t["table_name"],
         )
 
-    # Retry functions now that tables exist — most will succeed on this pass.
-    # Remaining failures (e.g. missing types or cross-schema objects) are
-    # logged as warnings.
-    await sync_functions(source_conn, target_conn, schemas)
+    # Retry functions now that tables exist.  Views are not yet created so
+    # functions that reference views will still fail here — they are retried
+    # in a final pass after sync_views below.
+    await sync_functions(source_conn, target_conn, schemas, silent=True)
 
     # Second pass: foreign keys.
     # pg_get_constraintdef returns unqualified referenced-table names, so we
@@ -946,6 +1031,11 @@ async def sync_schemas(
 
     # Sync views and materialized views AFTER tables (views may reference them)
     await sync_views(source_conn, target_conn, schemas)
+
+    # Final function pass after views — functions that reference views (or other
+    # objects only available after all prior sync steps) are created here.
+    # Any still-failing functions are logged as warnings.
+    await sync_functions(source_conn, target_conn, schemas)
 
     # Set REPLICA IDENTITY FULL on tables without PK on both sides so that
     # logical replication can handle UPDATE/DELETE without a unique row identifier.
