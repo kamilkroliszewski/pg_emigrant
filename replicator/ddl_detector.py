@@ -390,6 +390,11 @@ async def detect_drift(
             tgt_view = tgt_view_map.get((vschema, vname))
             obj_type = "view" if relkind == "v" else "materialized_view"
 
+            # TimescaleDB continuous aggregates are backed by an internal
+            # hypertable and cannot be managed with regular DDL.  Skip them.
+            if "_timescaledb_internal._materialized_hypertable_" in (src_def or ""):
+                continue
+
             if tgt_view is None:
                 if relkind == "v":
                     fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
