@@ -690,6 +690,15 @@ async def sync_views(
         """Normalize whitespace for view definition comparison."""
         return _re.sub(r"\s+", " ", (s or "").strip())
 
+    def _is_tsdb_cagg(view_def: str) -> bool:
+        """Return True if this view is a TimescaleDB continuous aggregate.
+
+        Continuous aggregates are backed by an internal hypertable
+        (_timescaledb_internal._materialized_hypertable_N) and cannot be
+        created with plain CREATE MATERIALIZED VIEW DDL.
+        """
+        return "_timescaledb_internal._materialized_hypertable_" in (view_def or "")
+
     pending = list(rows)
     for _attempt in range(3):
         if not pending:
@@ -702,6 +711,13 @@ async def sync_views(
             view_def: str = row["view_def"]
             fqn = f"{qi(schema)}.{qi(view_name)}"
             tgt_def = tgt_view_map.get((schema, view_name))
+
+            if _is_tsdb_cagg(view_def):
+                log.debug(
+                    "Skipping %s.%s — TimescaleDB continuous aggregate (managed by timescaledb)",
+                    schema, view_name,
+                )
+                continue
 
             if relkind == "v":
                 if _nv(tgt_def) == _nv(view_def):
