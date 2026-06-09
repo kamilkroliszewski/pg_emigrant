@@ -988,7 +988,18 @@ async def sync_schemas(
     target_conn: asyncpg.Connection,
     schemas: list[str],
 ) -> None:
-    """Full schema synchronization: schemas → enums → sequences → tables → FKs."""
+    """Pre-copy schema sync: extensions → types → sequences → tables (PK/UNIQUE/CHECK only).
+
+    Deliberately excludes FK constraints, triggers, and views — those are applied
+    after the initial data COPY by ``sync_post_copy_constraints``.  This mirrors
+    the pg_dump pre-data / data / post-data split:
+
+    * FK constraints created post-COPY let PostgreSQL validate referential
+      integrity across the whole dataset, turning silent copy failures into
+      hard errors.
+    * Triggers created post-COPY avoid side-effects during bulk insert
+      (triggers with ENABLE ALWAYS fire even under session_replication_role=replica).
+    """
     # Sync extensions FIRST — extensions like timescaledb / anon create their own
     # schemas on installation; creating those schemas beforehand causes the install
     # to fail.  sync_extensions returns the set of extension-owned schema names so
@@ -1023,22 +1034,36 @@ async def sync_schemas(
     # and logged only at DEBUG level.
     await sync_functions(source_conn, target_conn, schemas, silent=True)
 
-    # Sync tables (without foreign keys first to avoid dependency issues)
+    # Create tables with PK + UNIQUE + CHECK constraints.
+    # FK constraints are intentionally deferred to sync_post_copy_constraints.
     tables = await get_tables(source_conn, schemas)
     for t in tables:
-        # First pass: create table + columns + PKs + unique constraints
         await _sync_table_structure(
             source_conn, target_conn, t["schema_name"], t["table_name"],
         )
 
-    # Retry functions now that tables exist.  Views are not yet created so
-    # functions that reference views will still fail here — they are retried
-    # in a final pass after sync_views below.
+    # Second function pass now that tables exist.
     await sync_functions(source_conn, target_conn, schemas, silent=True)
 
-    # Second pass: foreign keys.
-    # pg_get_constraintdef returns unqualified referenced-table names, so we
-    # must set search_path to all migrated schemas before executing FK DDL.
+    log.info("Pre-copy schema sync complete for schemas: %s", schemas)
+
+
+async def sync_post_copy_constraints(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> None:
+    """Post-copy phase: FK constraints, triggers, views, and replica identity.
+
+    Called after the initial data COPY and non-unique index build.  Adding FK
+    constraints at this point causes PostgreSQL to validate referential integrity
+    across the entire copied dataset — a failed or partial table copy surfaces as
+    a hard error here rather than silently leaving corrupt data behind.
+    """
+    tables = await get_tables(source_conn, schemas)
+
+    # FK constraints — pg_get_constraintdef returns unqualified table names, so
+    # set search_path to all migrated schemas before executing FK DDL.
     _sp = ", ".join(qi(s) for s in schemas) + ", public"
     await target_conn.execute(f"SET search_path TO {_sp};")
     try:
@@ -1047,22 +1072,21 @@ async def sync_schemas(
     finally:
         await target_conn.execute("RESET search_path;")
 
-    # Sync triggers AFTER tables and functions — triggers depend on both
+    # Triggers — created after COPY to avoid side-effects during bulk insert.
+    # (Triggers with ENABLE ALWAYS fire even under session_replication_role=replica.)
     await sync_triggers(source_conn, target_conn, schemas)
 
-    # Sync views and materialized views AFTER tables (views may reference them)
+    # Views depend on tables and functions; create them after both exist.
     await sync_views(source_conn, target_conn, schemas)
 
-    # Final function pass after views — functions that reference views (or other
-    # objects only available after all prior sync steps) are created here.
-    # Any still-failing functions are logged as warnings.
+    # Final function pass — functions referencing views or other post-copy objects.
     await sync_functions(source_conn, target_conn, schemas)
 
-    # Set REPLICA IDENTITY FULL on tables without PK on both sides so that
-    # logical replication can handle UPDATE/DELETE without a unique row identifier.
+    # Set REPLICA IDENTITY FULL on tables without PK so that logical replication
+    # can handle UPDATE/DELETE.  Must run before publication is created.
     await sync_replica_identity(source_conn, target_conn, schemas)
 
-    log.info("Schema synchronization complete for schemas: %s", schemas)
+    log.info("Post-copy constraint sync complete for schemas: %s", schemas)
 
 
 async def _sync_table_structure(
@@ -1352,6 +1376,13 @@ async def sync_ownership(
         tgt_owner = tgt_owners.get((schema, obj, kind))
         if tgt_owner == src_owner:
             continue
+        if tgt_owner is None:
+            # Object exists on source but not on target (e.g. a TimescaleDB
+            # continuous aggregate filtered out by sync_views, or a view that
+            # failed to be created).  Ownership cannot be set on a non-existent
+            # object — skip silently.
+            log.debug("Skipping ownership of %s %s.%s — not present on target", kind, schema, obj)
+            continue
         if src_owner not in existing_roles:
             log.warning(
                 "Skipping ownership of %s %s.%s — role '%s' does not exist on target",
@@ -1421,5 +1452,13 @@ async def _sync_foreign_keys(
             except (asyncpg.UndefinedTableError, asyncpg.UndefinedObjectError) as exc:
                 log.warning(
                     "Skipping FK %s on %s — referenced object not found on target: %s",
+                    c["constraint_name"], fqn, exc,
+                )
+            except asyncpg.ForeignKeyViolationError as exc:
+                log.warning(
+                    "Skipping FK %s on %s — referential integrity violation detected; "
+                    "the initial data copy for the referenced table likely failed. "
+                    "Run 'detect-ddl --apply' after replication has caught up to add "
+                    "this constraint. Detail: %s",
                     c["constraint_name"], fqn, exc,
                 )
