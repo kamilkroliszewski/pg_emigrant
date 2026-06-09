@@ -18,7 +18,13 @@ from replicator.config import ReplicatorConfig
 from replicator.data_copy import copy_all_tables
 from replicator.db import connect, discover_databases, discover_schemas
 from replicator.replication import create_publication, create_subscription
-from replicator.schema_sync import get_tables, sync_deferred_indexes, sync_ownership, sync_schemas
+from replicator.schema_sync import (
+    get_tables,
+    sync_deferred_indexes,
+    sync_ownership,
+    sync_post_copy_constraints,
+    sync_schemas,
+)
 from replicator.utils import console, get_logger
 
 log = get_logger(__name__)
@@ -118,7 +124,13 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                 await sync_deferred_indexes(src, tgt, schemas)
 
-            # Step 4c: synchronize ownership (tables, sequences, views, functions, types, database)
+            # Step 4c: FK constraints, triggers, views, replica identity — post-COPY so that
+            # PostgreSQL validates referential integrity across the fully-loaded dataset.
+            progress.update(task, description=f"[{dbname}] Applying constraints…")
+            async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                await sync_post_copy_constraints(src, tgt, schemas)
+
+            # Step 4d: synchronize ownership (tables, sequences, views, functions, types, database)
             progress.update(task, description=f"[{dbname}] Syncing ownership…")
             async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                 own_count = await sync_ownership(src, tgt, schemas, dbname=dbname)
