@@ -67,6 +67,9 @@ _SYSTEM_SCHEMAS = {
     "timescaledb_information",
     "timescaledb_experimental",
     "toolkit_experimental",
+    # pg_anonymizer-managed internal schemas
+    "pg_anonymizer",
+    "anon"
 }
 
 
