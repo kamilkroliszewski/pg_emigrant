@@ -124,14 +124,24 @@ async def copy_table_data_pipe(
     cols_select = ", ".join(qi(c) for c in common_columns)
 
     async def _stream_query(src_conn, tgt_conn, query: str) -> None:
-        """Pipe SELECT query to target COPY via asyncio.Queue — zero RAM accumulation."""
+        """Pipe SELECT query to target COPY via asyncio.Queue — zero RAM accumulation.
+
+        When the producer fails mid-stream the consumer raises the same exception
+        inside the COPY source generator.  asyncpg forwards it as a CopyFail to
+        PostgreSQL, which rolls back the entire COPY — no partial data is committed.
+        """
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
+        _produce_exc: BaseException | None = None
 
         async def _produce() -> None:
+            nonlocal _produce_exc
             async def _cb(data: bytes) -> None:
                 await queue.put(data)
             try:
                 await src_conn.copy_from_query(query, output=_cb, format="csv")
+            except BaseException as exc:
+                _produce_exc = exc
+                raise
             finally:
                 await queue.put(None)  # sentinel — always sent, even on error
 
@@ -140,6 +150,8 @@ async def copy_table_data_pipe(
                 while True:
                     chunk = await queue.get()
                     if chunk is None:
+                        if _produce_exc is not None:
+                            raise _produce_exc  # abort COPY — rolls back partial data
                         return
                     yield chunk
             await tgt_conn.copy_to_table(
@@ -290,7 +302,16 @@ async def copy_all_tables(
     await holder_conn.execute("COMMIT;")
     await holder_conn.close()
 
+    failed = [key for key, count in results.items() if count < 0]
     total = sum(c for c in results.values() if c >= 0)
+    if failed:
+        log.error(
+            "Data copy INCOMPLETE for %s — %d table(s) failed to copy: %s. "
+            "FK constraints referencing these tables will be skipped. "
+            "Re-run bootstrap or wait for replication to sync the missing data, "
+            "then run 'detect-ddl --apply' to add the missing FK constraints.",
+            dbname, len(failed), ", ".join(sorted(failed)),
+        )
     log.info(
         "Data copy complete for %s: %d tables, %d total rows",
         dbname, len(results), total,
