@@ -1,745 +1,716 @@
 # pg_emigrant
 
-**PostgreSQL migration & replication orchestrator** — native logical replication with sequence sync, DDL drift detection, parallel initial copy, and automatic recovery from Patroni failover/switchover events.
+**A PostgreSQL migration & logical-replication orchestrator.**
+
+pg_emigrant performs a complete, low-downtime migration of one or many PostgreSQL
+databases from a *source* server to a *target* server. It builds on PostgreSQL's
+native **logical replication** and fills in everything that native replication
+leaves out: a fast parallel initial data copy, full schema reproduction (types,
+functions, triggers, views, ownership, …), continuous **sequence synchronisation**,
+**DDL drift** detection/repair, and automatic recovery after a **Patroni
+switchover/failover**.
+
+Everything is driven from a single `replicator` CLI and one YAML config file.
 
 ---
 
-## What is pg_emigrant?
+## Table of contents
 
-Migrating a PostgreSQL database between servers is usually a headache: taking the application offline, a lengthy dump/restore, manual sequence synchronisation, and ultimately — the fear of the final cutover. **pg_emigrant** eliminates that pain.
-
-The tool is built on top of PostgreSQL's native logical replication, but goes a step further — it resolves its well-known limitations and delivers a set of capabilities you won't find in any other open-source solution of this kind.
-
-### Why pg_emigrant?
-
-**Full failover and switchover support for Patroni clusters**
-Patroni clusters can promote a new primary at any moment. Typical replication solutions lose track after such an event — pg_emigrant deliberately manages connections and subscriptions to minimise the risk of data loss when cutting traffic over to a new target server.
-
-**Sequence synchronisation without the risk of primary key conflicts**
-Native PostgreSQL logical replication does not replicate sequence advances. This means that after the cutover, `SERIAL` / `BIGSERIAL` columns may generate primary keys that collide with existing records. pg_emigrant tracks sequences on the source and periodically updates them on the target — always moving forward, never backward.
-
-**Schema drift detection and automatic repair (DDL drift)**
-DDL changes applied on the source server (new tables, columns, indexes, constraints) are not replicated by PostgreSQL. pg_emigrant compares schemas on both servers and can automatically generate and apply corrective DDL — with no downtime and no manual work.
-
-**Lightning-fast initial copy using parallel workers**
-Instead of a serial `pg_dump | pg_restore`, pg_emigrant exports data using multiple parallel workers leveraging the COPY protocol and a consistent transaction snapshot. Many tables are copied simultaneously — reducing migration time by an order of magnitude on large databases.
-
-**Automatic database and schema discovery**
-You don't need to enumerate every database or schema to migrate. pg_emigrant automatically discovers databases on the source server (skipping system ones), and for each database independently discovers all user-defined schemas — skipping PostgreSQL internals (`pg_catalog`, `information_schema`, `pg_toast`, `pg_temp_*`). Everything starts replicating immediately — zero per-database, zero per-schema configuration.
-
-**Index creation after data copy for maximum throughput**
-pg_emigrant creates non-unique indexes **after** the initial data COPY, not before. PostgreSQL can then build each index in a single sequential scan instead of updating it row-by-row during the bulk insert — significantly reducing migration time for large, heavily-indexed databases. Primary keys and unique indexes are always created first (required by the replication engine).
-
-**Clean YAML configuration with Pydantic validation**
-The entire configuration fits in a single YAML file. Pydantic enforces correctness and reports errors before anything runs. No hidden parameters, no magic defaults.
-
-**Real-time monitoring**
-The built-in status dashboard shows subscription state, replication slot activity, WAL lag, and sequence drift for every database — all in one place, without having to dig through `pg_stat_replication`.
+- [Concepts & how it works](#concepts--how-it-works)
+- [What gets migrated](#what-gets-migrated)
+- [The bootstrap pipeline (step by step)](#the-bootstrap-pipeline-step-by-step)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [CLI reference](#cli-reference)
+  - [`bootstrap`](#replicator-bootstrap)
+  - [`start` / `stop`](#replicator-start--replicator-stop)
+  - [`teardown`](#replicator-teardown)
+  - [`status`](#replicator-status)
+  - [`sync-sequences`](#replicator-sync-sequences)
+  - [`detect-ddl`](#replicator-detect-ddl)
+  - [`reinit-sync`](#replicator-reinit-sync)
+- [Output formats](#output-formats)
+- [Special handling & edge cases](#special-handling--edge-cases)
+- [Typical migration workflow](#typical-migration-workflow)
+- [Limitations](#limitations)
+- [Project layout](#project-layout)
+- [Module reference](#module-reference)
+- [Security](#security)
+- [License](#license)
 
 ---
 
-**pg_emigrant** combines both approaches:
+## Concepts & how it works
 
-| Feature | Native replication | Bucardo | pg_emigrant |
-|---|---|---|---|
-| WAL (logical) replication | ✅ | ❌ | ✅ |
-| Automatic sequence synchronisation | ❌ | ✅ | ✅ |
-| Schema drift detection (DDL drift) | ❌ | ❌ | ✅ |
-| Parallel initial copy (COPY protocol) | ❌ | ❌ | ✅ |
-| Auto-discovery of databases | ❌ | ❌ | ✅ |
-| Auto-discovery of schemas per database | ❌ | ❌ | ✅ |
-| Deferred index build (post-COPY) | ❌ | ❌ | ✅ |
-| Full ownership sync (tables, seqs, views, funcs, types, DB) | ❌ | ❌ | ✅ |
-| Pydantic config + YAML | ❌ | ❌ | ✅ |
-| Patroni failover/switchover recovery | ❌ | ❌ | ✅ |
-| Tables without PK (REPLICA IDENTITY FULL) | ❌ | ✅ | ✅ |
-| Extension sync (btree_gin, pg_trgm, …) | ❌ | ❌ | ✅ |
-| User-defined function and procedure sync | ❌ | ❌ | ✅ |
-| Trigger sync | ❌ | ❌ | ✅ |
-| View and materialized view sync | ❌ | ❌ | ✅ |
-| Stored generated columns | ❌ | ❌ | ✅ |
-| Case-sensitive table/schema names | ✅ | ✅ | ✅ |
-| Multi-format CLI output (rich / simple / json) | ❌ | ❌ | ✅ |
+A migration with pg_emigrant has two phases.
+
+**1. Bootstrap (one-shot).** `replicator bootstrap` reproduces the schema on the
+target, copies all existing rows with parallel `COPY`, then creates a PostgreSQL
+**publication** on the source and a **subscription** on the target. From that
+moment on, all new `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE` on the source flow
+to the target over the WAL stream automatically.
+
+**2. Steady state (until cutover).** While the application keeps writing to the
+source, you run `replicator sync-sequences --loop` to keep sequence values in
+step (logical replication does **not** replicate sequence advances), use
+`replicator status` to watch lag, and optionally `replicator detect-ddl` to catch
+and repair schema changes made on the source after bootstrap. If the source is a
+Patroni cluster and a failover/switchover happens, `replicator reinit-sync`
+repairs the broken slot/subscription without re-copying data.
+
+At cutover you stop replication, run a final sequence sync, point the application
+at the target, and (optionally) tear the replication objects down.
+
+Each database is handled **independently** and gets its own publication,
+subscription and replication slot (PostgreSQL logical replication is scoped to a
+single database — there is no way around that).
+
 ---
 
-## Architecture
+## What gets migrated
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         pg_emigrant CLI                         │
-│  bootstrap │ start │ stop │ teardown │ status │ sync-sequences  │
-│                  detect-ddl │ reinit-sync                       │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-         ┌─────────────────▼────────────────────┐
-         │           bootstrap.py               │
-         │  1. discover databases               │
-         │  2. create DBs on target             │
-         │  3. discover schemas (per DB)        │
-         │  4. sync schemas (no plain indexes)  │
-         │  5. parallel COPY (snapshot safe)    │
-         │  6. create plain indexes (post-COPY  │
-         │  7. sync ownership (tables/seq/sch)  │
-         │  8. create publication               │
-         │  9. create subscription              │
-         └─────────────────┬────────────────────┘
-                           │
-    ┌──────────────────────┼──────────────────────┐
-    │                      │                      │
-┌───▼───┐            ┌─────▼──────┐        ┌──────▼──────┐
-│schema │            │replication │        │sequence_sync│
-│_sync  │            │    .py     │        │    .py      │
-│       │            │            │        │             │
-│tables │            │publication │        │ periodic    │
-│columns│            │subscription│        │ setval()    │
-│indexes│            │  slots     │        │ source→tgt  │
-│constr.│            └────────────┘        └─────────────┘
-│seq.   │
-└───────┘
-    │
-┌───▼──────────┐    ┌──────────────┐
-│ddl_detector  │    │  monitor.py  │
-│              │    │              │
-│ detect drift │    │ sub status   │
-│ apply fixes  │    │ slot lag     │
-│              │    │ seq drift    │
-└──────────────┘    └──────────────┘
-```
+During bootstrap (and re-checked by `detect-ddl`) pg_emigrant reproduces, in
+dependency order:
 
-### Bootstrap flow (full migration)
+| Object | How it is handled |
+|---|---|
+| **Schemas** | `CREATE SCHEMA IF NOT EXISTS` for every non-system schema (extension-owned schemas are left to the extension installer). |
+| **Extensions** | Every extension on the source except `plpgsql` is installed on the target with `CREATE EXTENSION IF NOT EXISTS` **before** tables/indexes (so operator classes like `pg_trgm`, `btree_gin` exist when indexes are built). |
+| **Enum types** | Created with their labels in source order; if the type already exists, missing labels are appended with `ALTER TYPE … ADD VALUE IF NOT EXISTS`. |
+| **Composite (row) types** | Created with all attributes; retried up to 3× to resolve type-on-type dependencies. |
+| **Sequences** | Re-created with the source's `INCREMENT / MINVALUE / MAXVALUE / START / CACHE / CYCLE`, then `setval()` to the source's current value. |
+| **Tables & columns** | `CREATE TABLE` reproducing every column's type, `NOT NULL`, and `DEFAULT`. Existing tables get any missing columns added. |
+| **Identity columns** | `GENERATED ALWAYS AS IDENTITY` / `GENERATED BY DEFAULT AS IDENTITY` preserved exactly. |
+| **Serial / `nextval()` defaults** | Kept as the original `DEFAULT nextval('…')` against the explicitly pre-created named sequence — deliberately **not** converted to identity, which would make PostgreSQL spawn a phantom `…_seq1` sequence that sequence-sync would never update. |
+| **Stored generated columns** | `GENERATED ALWAYS AS (expr) STORED` reproduced faithfully. |
+| **Primary keys, UNIQUE & CHECK constraints** | Created during the schema phase (before data copy). |
+| **Foreign keys** | Created **after** the data copy so PostgreSQL validates referential integrity across the fully-loaded dataset. |
+| **Indexes** | PK/UNIQUE indexes created before copy; all other (non-unique) indexes created **after** copy (one sequential build instead of row-by-row maintenance). |
+| **Functions & procedures** | `CREATE OR REPLACE` from `pg_get_functiondef`; attempted before tables (for generated-column/DEFAULT expressions), again after tables, and a final pass after views. |
+| **Triggers** | All non-internal triggers re-created after tables + functions exist (`DROP TRIGGER IF EXISTS` first, since triggers have no `CREATE OR REPLACE`). |
+| **Views & materialized views** | Regular views via `CREATE OR REPLACE VIEW`; materialized views dropped and re-created `WITH NO DATA`; retried up to 3× to resolve view-on-view chains. |
+| **`REPLICA IDENTITY FULL`** | Set on **both** source and target for tables that have no primary key, so logical replication can replicate their `UPDATE`/`DELETE`. |
+| **Ownership** | `ALTER … OWNER TO` for tables, sequences, views, materialized views, user-defined types (enums + domains), functions, procedures, schemas, and the database itself. |
+| **Row data** | Streamed with parallel, snapshot-consistent `COPY` (see below). |
 
-```
-Source DB ──────────────────────────────────────────► Target DB
-    │                                                     │
-    │  1. pg_export_snapshot()                            │
-    │  2. COPY TO (CSV format, parallel workers) ────────►│
-    │                                                     │
-    │  CREATE PUBLICATION pg_emigrant_pub                 │
-    │         FOR TABLES IN SCHEMA public     ◄───────────┤
-    │                                                     │ CREATE SUBSCRIPTION pg_emigrant_sub
-    │  WAL stream (logical replication) ─────────────────►│   copy_data = false
-    │                                                     │   create_slot = true
-    │                                                     │
-    │  sequence values (polled every N sec.) ────────────►│ setval(seq, src_val)
-```
+Objects that PostgreSQL/extensions manage internally are deliberately skipped:
+extension-owned objects (`pg_depend deptype = 'e'`), and **TimescaleDB continuous
+aggregates** (backed by internal hypertables and not re-creatable with plain DDL).
+
+---
+
+## The bootstrap pipeline (step by step)
+
+For every database, `bootstrap` runs the following ordered pipeline (this mirrors
+pg_dump's *pre-data → data → post-data* split):
+
+1. **Create the database on the target** if it does not already exist
+   (`CREATE DATABASE`).
+2. **Discover the schemas** to migrate (or use the explicit `schemas:` list).
+3. **Pre-copy schema sync** (`sync_schemas`):
+   extensions → ensure schemas exist → enum types → composite types → sequences →
+   functions (best-effort pre-pass) → tables with **PK / UNIQUE / CHECK** constraints
+   and **UNIQUE** indexes → functions (second best-effort pass).
+   *Foreign keys, triggers, views and non-unique indexes are intentionally
+   deferred.*
+4. **Parallel initial data copy** (`copy_all_tables`): all target tables are
+   `TRUNCATE … CASCADE`d, a single source snapshot is exported, and tables are
+   streamed concurrently via CSV `COPY` (details below).
+5. **Deferred index build**: every non-unique index is created now, after the data
+   is in place.
+6. **Post-copy constraints** (`sync_post_copy_constraints`):
+   foreign keys (with `search_path` set so unqualified names resolve) → triggers →
+   views & materialized views → a final function pass → `REPLICA IDENTITY FULL`
+   for PK-less tables.
+7. **Ownership sync**: `ALTER … OWNER TO` for every object whose owner differs.
+8. **Create the publication** on the source
+   (`CREATE PUBLICATION … FOR TABLES IN SCHEMA …`).
+9. **Create the subscription** on the target
+   (`copy_data = false`, `create_slot = true`).
+
+Progress is shown live with a Rich spinner; each table reports its copied row
+count, and PK-less tables are flagged in yellow.
+
+### How the parallel copy works
+
+- **One consistent snapshot.** A single `REPEATABLE READ` transaction calls
+  `pg_export_snapshot()`; every worker does `SET TRANSACTION SNAPSHOT` so all
+  tables are copied at the same point in time. The snapshot-holder connection
+  stays open until every table finishes.
+- **Table-level parallelism.** Up to `parallel_workers` tables are copied at once
+  (an `asyncio.Semaphore` bounds concurrency).
+- **Intra-table parallelism.** For a large table, when `table_parallel_workers > 1`
+  and the table has at least that many pages, it is split into **`ctid`
+  page-range slices** that stream concurrently. The last slice is left unbounded
+  so rows added since the last `ANALYZE` are not skipped.
+- **Streaming, flat memory.** Data is piped source→target through a bounded
+  `asyncio.Queue` (CSV format, for cross-version compatibility) — no table is ever
+  buffered in RAM. If the producer fails mid-stream, the error is re-raised inside
+  the consumer so PostgreSQL rolls the whole `COPY` back (no partial data).
+- **Only matching columns.** Each table copies the **intersection** of source and
+  target columns (preserving target order); generated columns are excluded.
+- **Bulk-load mode.** `session_replication_role = 'replica'` is set on the target
+  during copy so triggers and FK checks don't fire on the bulk insert.
+- **Failure isolation.** A failed table is recorded (row count `-1`) and logged;
+  FK constraints that reference it are skipped with guidance to re-run
+  `detect-ddl --apply` once replication catches up.
 
 ---
 
 ## Requirements
 
-- Python **3.11+**
-- PostgreSQL **14+** on both servers (source and target)
-- A database user with logical replication privileges:
-  - `REPLICATION` on source (for creating publications and slots)
-  - Superuser or `CREATE SUBSCRIPTION` on target
-- `wal_level = logical` on the source server
-
-### PostgreSQL — minimum source configuration
-
-```ini
-wal_level = logical
-max_replication_slots = 10   # at least 1 per database
-max_wal_senders = 10
-```
-
-### PostgreSQL — minimum target configuration
-
-```ini
-max_active_replication_origins = 10  # min. one per source database)
-max_logical_replication_workers = 10 # min. one per source database)
-max_replication_slots = 10   # at least 1 per database
-```
+- **Python 3.11+**
+- **PostgreSQL 15+ on both servers.** The publication uses
+  `CREATE PUBLICATION … FOR TABLES IN SCHEMA`, which requires PostgreSQL 15 or
+  newer. (Schema-level publications are the only mode used.)
+- A migration role on each server with sufficient privileges:
+  - **Source:** `REPLICATION` privilege (to create the publication and let the
+    target open a replication slot); read access to all migrated objects.
+  - **Target:** ability to `CREATE DATABASE`, create schema objects, and
+    `CREATE SUBSCRIPTION` (superuser, or the relevant privileges).
+- **Source** `postgresql.conf`:
+  ```ini
+  wal_level = logical
+  max_wal_senders     = 10   # ≥ number of databases replicated concurrently
+  max_replication_slots = 10 # ≥ number of databases replicated concurrently
+  ```
+- **Target** `postgresql.conf`:
+  ```ini
+  max_logical_replication_workers = 10  # ≥ one apply worker per database
+  max_worker_processes            = 10  # must cover the apply workers
+  max_replication_slots           = 10  # ≥ one per subscription
+  ```
+- The source `pg_hba.conf` must allow a **replication** connection from the
+  target host (otherwise `CREATE SUBSCRIPTION` hangs — see
+  [subscription timeout](#robust-subscription-creation)).
 
 ---
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourorg/pg_emigrant.git
+git clone https://github.com/kamilkroliszewski/pg_emigrant.git
 cd pg_emigrant
 
-# Install (preferably inside a venv)
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-After installation the `replicator` command is available:
+This installs the `replicator` console command:
 
 ```bash
 replicator --help
 ```
 
+Dependencies (from `pyproject.toml`): `asyncpg>=0.29`, `pydantic>=2.0`,
+`pyyaml>=6.0`, `typer>=0.9`, `rich>=13.0`.
+
 ---
 
 ## Configuration
 
-Create a `config.yaml` file (the default location) or point to a custom one with `--config`:
+Configuration is a single YAML file, validated by Pydantic. By default the CLI
+looks for `config.yaml` in the current directory; override it on any command with
+`--config / -c`.
 
 ```yaml
 # Source server
 source:
-  host: localhost
-  port: 5433
+  host: db-source.internal
+  port: 5432
   user: migrator
   password: secret
-  dbname: postgres        # admin DB — used for auto-discovery
+  dbname: postgres        # admin DB used for database auto-discovery
   sslmode: prefer
 
 # Target server
 target:
-  host: localhost
-  port: 5434
+  host: db-target.internal
+  port: 5432
   user: migrator
   password: secret
   dbname: postgres
   sslmode: prefer
 
-# Schemas to replicate — empty = auto-discover all non-system schemas per database
-# (excludes pg_catalog, information_schema, pg_toast, pg_temp_*).
-# Explicit list example: [public, analytics, reporting]
+# Schemas to replicate. Empty list = auto-discover every non-system schema,
+# independently per database.
 schemas: []
 
-# Databases to migrate — empty = auto-discovery (all except excluded)
+# Databases to migrate. Empty list = auto-discover all non-template databases
+# (minus exclude_databases).
 databases: []
 
-# System databases to skip during auto-discovery
+# Databases skipped during auto-discovery.
 exclude_databases:
   - template0
   - template1
   - postgres
 
-# Tables to skip (format: schema.table)
-exclude_tables: []
-
-# Prefix for replication object names (the database name is appended to each).
-# E.g. for database "myapp": publication = pg_emigrant_pub_myapp, subscription = pg_emigrant_sub_myapp.
-# The replication slot is created automatically by PostgreSQL with the same name as the subscription.
+# Object-name prefixes. The (sanitised) database name is appended to each, so
+# database "myapp" → publication "pg_emigrant_pub_myapp",
+# subscription/slot "pg_emigrant_sub_myapp".
 publication_name: pg_emigrant_pub
 subscription_name: pg_emigrant_sub
 
-# Number of parallel workers for data copy (how many tables are copied simultaneously)
-parallel_workers: 4
+# Parallelism.
+parallel_workers: 4        # how many tables are copied at the same time
+table_parallel_workers: 4  # ctid slices streamed concurrently per large table
 
-# Number of parallel workers per table — each worker streams an independent ctid page-range slice.
-# Increase this for very large tables to speed up their initial COPY.
-table_parallel_workers: 4
-
-# Sequence synchronisation interval (seconds)
+# Sequence sync loop interval, in seconds.
 sequence_sync_interval: 10
 ```
 
-### Configuration parameters
+### Full parameter reference
 
-| Parameter | Type | Default | Description |
+| Key | Type | Default | Meaning |
 |---|---|---|---|
-| `source.*` | `DatabaseConfig` | — | Source connection details |
-| `target.*` | `DatabaseConfig` | — | Target connection details |
-| `schemas` | `list[str]` | `[]` | Schemas to replicate per database; empty = auto-discover all non-system schemas (`pg_catalog`, `information_schema`, `pg_toast`, `pg_temp_*` are always excluded) |
-| `databases` | `list[str]` | `[]` | Databases to migrate; empty = auto-discover |
-| `exclude_databases` | `list[str]` | `[template0,template1,postgres]` | Databases skipped during discovery |
-| `exclude_tables` | `list[str]` | `[]` | Tables to skip |
-| `publication_name` | `str` | `pg_emigrant_pub` | Publication name prefix; `_{dbname}` is appended per database |
-| `subscription_name` | `str` | `pg_emigrant_sub` | Subscription name prefix; the replication slot gets the same name as the subscription |
-| `parallel_workers` | `int` | `4` | Parallel workers for COPY — how many tables are copied simultaneously |
-| `table_parallel_workers` | `int` | `4` | Parallel workers **per table** — each worker streams an independent ctid page-range slice; increase this for very large tables |
-| `sequence_sync_interval` | `int` | `10` | Sequence synchronisation interval [s] |
+| `source` | object | — | Source connection (`host`, `port`, `user`, `password`, `dbname`, `sslmode`). |
+| `target` | object | — | Target connection (same fields). |
+| `source/target.host` | str | `localhost` | Server host. |
+| `source/target.port` | int | `5432` | Server port. |
+| `source/target.user` | str | `postgres` | Login role. |
+| `source/target.password` | str | `""` | Password (kept in memory only; never logged). |
+| `source/target.dbname` | str | `postgres` | Admin/maintenance DB used for discovery and `CREATE DATABASE`. |
+| `source/target.sslmode` | str | `prefer` | libpq SSL mode. |
+| `schemas` | list[str] | `[]` | Schemas to replicate; empty = auto-discover per database. An explicit list is applied to **all** databases, and any source schema not in the list is logged as a skipped-schema **warning**. |
+| `databases` | list[str] | `[]` | Databases to migrate; empty = auto-discover. |
+| `exclude_databases` | list[str] | `[template0, template1, postgres]` | Skipped during database auto-discovery. |
+| `publication_name` | str | `pg_emigrant_pub` | Publication name prefix; `_<dbname>` appended. |
+| `subscription_name` | str | `pg_emigrant_sub` | Subscription **and** replication-slot name prefix; `_<dbname>` appended. |
+| `parallel_workers` | int | `4` | Number of tables copied simultaneously. |
+| `table_parallel_workers` | int | `4` | `ctid` page-range slices streamed concurrently for a single large table. |
+| `sequence_sync_interval` | int | `10` | Seconds between iterations of `sync-sequences --loop`. |
+| `exclude_tables` | list[str] | `[]` | **Accepted but currently has no effect** — table-level exclusion is not yet wired into the copy/publication path. |
+| `replication_slot_name` | str | `pg_emigrant_slot` | **Accepted but unused** — the slot is named after the subscription (`subscription_name`_`<dbname>`), created automatically by PostgreSQL. |
+
+> The last two keys are present in the config model (and in
+> `config.yaml.example`) for forward-compatibility but are **not** consulted by
+> the current code. They are documented here for completeness so their presence
+> isn't mistaken for active behaviour.
+
+### Auto-discovery rules
+
+- **Databases:** every row in `pg_database` where `datistemplate = false`, minus
+  `exclude_databases`. Provide an explicit `databases:` list to override.
+- **Schemas:** every schema **except** the always-excluded set below. With an
+  explicit `schemas:` list, that list wins (and uncovered source schemas are
+  warned about).
+
+Always-excluded schemas:
+
+| Pattern | Why |
+|---|---|
+| `pg_catalog`, `information_schema`, `pg_toast` | PostgreSQL internals |
+| `pg_temp_*`, `pg_toast_temp_*` | session-local temp objects |
+| `_timescaledb_catalog`, `_timescaledb_config`, `_timescaledb_internal`, `_timescaledb_cache`, `timescaledb_information`, `timescaledb_experimental`, `toolkit_experimental` | TimescaleDB-managed, must not be hand-reproduced |
+| `pg_anonymizer`, `anon` | PostgreSQL Anonymizer-managed |
 
 ---
 
-## CLI Commands
+## CLI reference
+
+Global option (place **before** the command):
+
+```
+-v, --verbose    Enable DEBUG logging (default is INFO).
+```
+
+Every command accepts:
+
+```
+-c, --config PATH       Path to the config file (default: config.yaml).
+-d, --database NAME      Operate on a single database instead of all discovered.
+```
 
 ### `replicator bootstrap`
 
-Full automated initial migration:
-
-1. Auto-discovery of databases on source
-2. Create databases on target (if they do not exist)
-3. Per-database auto-discovery of user schemas (skips `pg_catalog`, `information_schema`, `pg_toast`, `pg_temp_*`)
-4. Schema synchronisation (tables, columns, PK/unique indexes, constraints, sequences); `SERIAL`/`BIGSERIAL` columns are reproduced with the original `DEFAULT nextval(...)` — the named sequence is created explicitly beforehand so PostgreSQL does not auto-generate a shadow `_seq1` sequence; **stored generated columns** (`GENERATED ALWAYS AS … STORED`) are reproduced correctly
-5. Extension synchronisation — extensions present on the source (e.g. `btree_gin`, `pg_trgm`) are installed on the target before any tables or indexes are created
-6. User-defined function and procedure synchronisation — applied to the target before tables, so that generated columns and DEFAULT expressions that call them work correctly
-7. Tables without a PRIMARY KEY are automatically detected; `REPLICA IDENTITY FULL` is set on **both** source and target and the table is highlighted in yellow in the bootstrap output
-8. Trigger synchronisation — all non-internal triggers are recreated on the target after tables and functions exist; existing triggers with the same name are dropped first (triggers have no `CREATE OR REPLACE`)
-9. View and materialized view synchronisation — regular views use `CREATE OR REPLACE`; materialized views are dropped and recreated with `WITH NO DATA`; a 3-attempt retry loop resolves view-on-view dependency chains automatically
-10. Parallel initial COPY (snapshot-consistent, CSV format for cross-version PG compatibility); correctly handles tables with mixed-case names (e.g. `__EFMigrationsHistory`)
-11. Non-unique index creation **after** COPY — faster than incremental updates during bulk insert
-12. Full ownership synchronisation — tables, sequences, views, materialized views, user-defined types (enums, domains), functions, procedures, schemas, and the database itself (`ALTER ... OWNER TO`)
-13. Create publication on source
-14. Create subscription on target (without re-copying data)
+Runs the full one-shot migration pipeline described
+[above](#the-bootstrap-pipeline-step-by-step) for every discovered database (or
+just `--database`).
 
 ```bash
 replicator bootstrap
-replicator bootstrap --config /path/to/config.yaml
-replicator bootstrap --database mydb
+replicator bootstrap --config /etc/pg_emigrant/prod.yaml
+replicator bootstrap --database myapp
 replicator --verbose bootstrap
 ```
 
----
-
 ### `replicator start` / `replicator stop`
 
-Enable and disable (pause) replication subscriptions:
+Enable or disable (pause) the subscription apply workers. `stop` keeps the slot
+and subscription intact — replication simply pauses; `start` resumes it.
 
 ```bash
-# All databases
-replicator start
-replicator stop
-
-# A specific database
-replicator start --database mydb
-replicator stop  --database mydb
+replicator start                 # all databases
+replicator stop                  # all databases
+replicator start --database myapp
+replicator stop  --database myapp
 ```
-
----
 
 ### `replicator teardown`
 
-Removes the subscription, publication, and replication slot:
+Drops the subscription on the target, the publication on the source, and the
+replication slot on the source (terminating the slot's backend if necessary).
 
 ```bash
 replicator teardown
-replicator teardown --database mydb
+replicator teardown --database myapp
 ```
 
-> **Warning:** this operation is irreversible. After teardown you must run `bootstrap` again to resume replication.
-
----
+> **Destructive & irreversible.** After teardown, resuming replication requires a
+> fresh `bootstrap`.
 
 ### `replicator status`
 
-Displays a **read-only** status dashboard for all databases. The command never writes anything to the target — it is safe to run at any point, including before `bootstrap`.
+A **read-only** dashboard for every database. It never writes to either server
+(sequence comparison is read-only), so it is safe to run at any time — even
+before bootstrap. Each section is collected independently; if one query fails
+(e.g. the database isn't bootstrapped yet) the error is shown for that section
+and the rest still render.
 
-- **Subscription status** — worker PID, Received LSN, Last Message timestamps
-- **Replication slots (source)** — slot state, WAL lag, Restart LSN
-- **Replication lag** — WAL delay between source and target
-- **Tables per schema** — source vs target table count broken down by schema; rows with a mismatch are highlighted in yellow
-- **Sequence sync status** — read-only comparison of sequence values on source and target (no `setval()` calls)
-- **Schema drift summary** — indication of detected DDL drift
+Sections:
+
+| Section | Source of data | Shows |
+|---|---|---|
+| **Subscription** | `pg_stat_subscription` (target) | subscription name, worker PID, received/latest-end LSN, byte lag, last-message timestamps |
+| **Slots** | `pg_replication_slots` (source) | slot name/type, active flag, active PID, restart LSN, confirmed-flush LSN, `wal_status` — warns loudly if no slot exists |
+| **Lag** | `pg_stat_replication` (source) | application, state, sent LSN, write/flush/replay lag |
+| **Tables** | `pg_class` both sides | per-schema table counts source vs target; mismatched rows highlighted yellow |
+| **Sequences** | `pg_sequences` both sides | read-only value comparison (`ok` / `behind` / `target_ahead` / `missing_on_target`) |
+| **Drift** | full drift scan | a one-line schema-drift summary |
+
+With no section flags, **all** sections are shown. Pass one or more flags to
+limit output (handy across many databases):
+
+```
+--subscription   --slots   --lag   --tables   --sequences   --drift
+```
 
 ```bash
 replicator status
-replicator status --config /path/to/config.yaml
-replicator status --database mydb
-```
-
-#### Output format
-
-Use `--format` / `-f` to control the output style. The default is `rich` (coloured tables).
-
-```bash
-# Rich tables (default)
-replicator status --format rich
-
-# Grep-friendly key=value lines — one record per line
-replicator status --format simple
-
-# JSON array — one object per database
-replicator status --format json
-```
-
-Example `simple` output (suitable for pipelines across 100+ databases):
-
-```
-database=myapp section=lag write_lag=0.123 flush_lag=0.124 replay_lag=0.126
-database=myapp section=tables schema=public source=42 target=42
-database=analytics section=lag write_lag=5.412 flush_lag=5.413 replay_lag=5.418
-```
-
-#### Section filters
-
-When monitoring many databases, pass one or more section flags to limit the output to only that part of the dashboard. With no section flags all sections are shown.
-
-| Flag | Section shown |
-|---|---|
-| `--subscription` | Subscription worker status |
-| `--slots` | Replication slot details |
-| `--lag` | WAL replication lag |
-| `--tables` | Table counts per schema |
-| `--sequences` | Sequence value comparison |
-| `--drift` | DDL drift summary |
-
-```bash
-# Show only lag across all databases, grep for anything over 1 second
+replicator status --database myapp
 replicator status --format simple --lag | grep write_lag
-
-# Drift only, structured JSON, piped to jq
-replicator status --format json --drift | jq '.[] | select(.drift != null)'
-
-# Tables and sequences only for one database
-replicator status --database mydb --tables --sequences
+replicator status --format json --drift | jq '.[] | select(.drift.has_drift)'
+replicator status --database myapp --tables --sequences
 ```
-
----
 
 ### `replicator sync-sequences`
 
-Sequence synchronisation — the key feature that sets pg_emigrant apart from native logical replication.
-
-Sequences are propagated one-way (source → target), and the value on target is **never decreased** (guard against rollback).
-
-```bash
-# One-off synchronisation (displays a results table)
-replicator sync-sequences
-
-# A specific database
-replicator sync-sequences --database mydb
-
-# Continuous loop (recommended during a live migration)
-replicator sync-sequences --loop
-replicator sync-sequences --database mydb --loop
-```
-
-#### Output format
+Pushes sequence values **source → target**. This is the feature that prevents
+primary-key collisions after cutover, because native logical replication never
+replicates sequence advances. Values **only ever move forward** — the target is
+never decreased.
 
 ```bash
-# Rich table (default)
-replicator sync-sequences --format rich
-
-# Grep-friendly key=value lines — one record per line
-replicator sync-sequences --format simple
-
-# JSON array — one object per database
-replicator sync-sequences --format json
+replicator sync-sequences                       # one pass, all databases
+replicator sync-sequences --database myapp       # one pass, one database
+replicator sync-sequences --loop                 # run forever, every interval
+replicator sync-sequences --database myapp --loop
 ```
 
-Example `simple` output — easy to pipe and grep across many databases:
+- **One-pass mode** prints a results table (rich/simple/json) and exits.
+- **`--loop`** runs `sync_sequences_once` for every database concurrently, each on
+  its own `sequence_sync_interval` cycle, forever (recommended during a live
+  migration). Errors are logged and the loop continues.
 
-```
-database=myapp section=sequence schema=public sequence=users_id_seq source=10053 target=9821 status=updated
-database=myapp section=sequence schema=public sequence=orders_id_seq source=45210 target=45210 status=ok
-database=analytics section=sequence schema=public sequence=events_id_seq source=1200 target=1350 status=target_ahead
-```
-
-One-off `rich` synchronisation output:
-
-```
-┌───────────────────────────────────────────────────────────┐
-│                 Sequence Sync — myapp                     │
-├────────┬────────────────┬────────┬────────┬───────────────┤
-│ Schema │ Sequence       │ Source │ Target │ Status        │
-├────────┼────────────────┼────────┼────────┼───────────────┤
-│ public │ users_id_seq   │ 10053  │ 9821   │ updated       │
-│ public │ orders_id_seq  │ 45210  │ 45210  │ ok            │
-│ public │ items_id_seq   │ 1200   │ 1350   │ target_ahead  │
-└────────┴────────────────┴────────┴────────┴───────────────┘
-```
+Per-sequence status values:
 
 | Status | Meaning |
 |---|---|
-| `ok` | Values are equal |
-| `updated` | Target updated to the source value |
-| `target_ahead` | Target is ahead of source — no change made (safe) |
-| `orphaned_fixed` | Sequence exists only on target; reset to `MAX(id)+1` from its owning table |
-| `orphaned_unknown` | Sequence exists only on target but no owning table could be found — manual action required |
+| `ok` | source and target already equal |
+| `updated` | target advanced up to the source value |
+| `target_ahead` | target already higher than source — left untouched (safe) |
+| `orphaned_fixed` | sequence exists only on target; reset to `MAX(owning column) + 1` |
+| `orphaned_unknown` | target-only sequence whose owning table couldn't be found — needs manual attention |
+| `orphaned_error` | an error occurred while resolving a target-only sequence |
 
-> **Guard against premature sync:** `sync-sequences` checks whether the target has any sequences in the relevant schemas before writing. If none are found (database exists but has not been bootstrapped yet), the command exits without making any changes. This prevents phantom sequences from being created on a bare database before `bootstrap` runs.
-
----
+> **Guard against premature sync.** If the target has *no* sequences in the
+> relevant schemas (the database exists but hasn't been bootstrapped), the
+> command exits without writing — so it never creates phantom sequences on a bare
+> database.
 
 ### `replicator detect-ddl`
 
-Detects schema drift (DDL drift) between source and target — useful when the source schema evolves during an ongoing replication.
+Compares the source and target schemas object-by-object and reports the drift.
+Useful when the source schema keeps evolving during a long replication window
+(DDL is never carried by the WAL stream).
 
 ```bash
-# Detection only (report)
-replicator detect-ddl
-replicator detect-ddl --database mydb
+replicator detect-ddl                       # report only
+replicator detect-ddl --database myapp
 
-# Detection + automatic application of fixes (missing objects)
-replicator detect-ddl --apply
-replicator detect-ddl --database mydb --apply
+replicator detect-ddl --apply               # apply fixes for fixable drift
+replicator detect-ddl --apply --drop-extra  # also DROP target-only tables (destructive!)
 
-# Apply fixes + drop objects that exist on target but are missing on source
-replicator detect-ddl --apply --drop-extra
-
-# Detect and fix ownership drift
-replicator detect-ddl --fix-roles
-replicator detect-ddl --fix-roles --apply
-replicator detect-ddl --fix-roles --apply --database mydb
-```
-
-#### Output format
-
-```bash
-# Rich tables (default)
-replicator detect-ddl --format rich
-
-# Grep-friendly key=value lines
-replicator detect-ddl --format simple
-
-# JSON — suitable for CI pipelines, archiving, jq
 replicator detect-ddl --format json > drift_$(date +%Y%m%d).json
 ```
 
-#### Objects checked
+Flags:
 
-- **Tables** — missing on target or on source
-- **Columns** — missing, extra, type mismatches
-- **Indexes** — missing on target
-- **Constraints** — missing on target
-- **Functions and procedures** — missing on target or body differs
-- **Triggers** — missing on target or definition differs
-- **Views** — missing on target or definition differs
-- **Materialized views** — missing on target or definition differs
-- **Ownership** (`--fix-roles`) — `ALTER TABLE/SEQUENCE/VIEW/MATERIALIZED VIEW/ROUTINE/TYPE/SCHEMA/DATABASE … OWNER TO` for every object whose owner differs between source and target; covers tables, sequences, views, materialized views, user-defined types (enums, domains), functions, procedures, schemas, and the database itself
+| Flag | Effect |
+|---|---|
+| `--apply` | Apply the generated fix DDL for `missing_on_target` and `different` items (including ownership). |
+| `--drop-extra` | **Additionally** drop objects that exist on the target but not the source (`missing_on_source`). Destructive — prints a warning. |
 
-> **Note:** ownership sync requires that the target roles already exist. pg_emigrant skips objects whose source owner is absent on the target and logs a warning — create the missing roles manually first.
+What it checks (and the fix it proposes):
 
-Sample ownership drift report:
+- **Schemas** missing on target → `CREATE SCHEMA`.
+- **Tables** missing on target → full `CREATE TABLE` (+ constraints + indexes;
+  schema creation prepended if needed). Missing on source → `DROP TABLE` (only
+  applied with `--drop-extra`).
+- **Columns** missing on target → `ADD COLUMN`; missing on source → reported;
+  **type mismatches** → reported.
+- **Indexes** (non-PK) missing on target → `CREATE INDEX`.
+- **Constraints** missing on target → `ADD CONSTRAINT`.
+- **Enum types** missing → `CREATE TYPE … AS ENUM`; missing labels →
+  `ALTER TYPE … ADD VALUE`.
+- **Functions / procedures** missing or body-different (matched per overload by
+  signature) → `CREATE OR REPLACE`.
+- **Triggers** missing or different → `DROP` + re-create.
+- **Views / materialized views** missing or different → `CREATE OR REPLACE` /
+  drop-and-recreate `WITH NO DATA`.
+- **Ownership** mismatches for tables, sequences, views, materialized views,
+  user-defined types, functions, procedures, schemas, and the database →
+  `ALTER … OWNER TO`. If the source owner role does not exist on the target, the
+  item is reported with an explanatory detail and an empty fix (create the role
+  first).
 
-```
-━━━━━━━━━━━━━━━━━━━━━━ Ownership Drift — myapp ━━━━━━━━━━━━━━━━━━━━━━
-┌──────────────────────────┬────────┬────────────────────────────────┬─────────────────────────────┬────────────────────────────────────────────────────────────────────────────────┐
-│ Kind                     │ Schema │ Object                         │ Detail                      │ Fix DDL                                                                        │
-├──────────────────────────┼────────┼────────────────────────────────┼─────────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
-│ ownership(table)         │ public │ orders                         │ src=app tgt=postgres         │ ALTER TABLE "public"."orders" OWNER TO "app";                                  │
-│ ownership(view)          │ public │ orders_view                    │ src=app tgt=postgres         │ ALTER VIEW "public"."orders_view" OWNER TO "app";                              │
-│ ownership(function)      │ public │ calculate_total(integer)       │ src=app tgt=postgres         │ ALTER ROUTINE "public"."calculate_total"(integer) OWNER TO "app";              │
-│ ownership(schema)        │ public │ public                         │ src=app tgt=postgres         │ ALTER SCHEMA "public" OWNER TO "app";                                          │
-│ ownership(database)      │        │ myapp                          │ src=app tgt=postgres         │ ALTER DATABASE "myapp" OWNER TO "app";                                         │
-└──────────────────────────┴────────┴────────────────────────────────┴─────────────────────────────┴────────────────────────────────────────────────────────────────────────────────┘
-```
+When `--apply` creates new tables, the subscription is refreshed with
+`copy_data = true` so PostgreSQL's built-in **tablesync** worker performs the
+initial copy of the new table — avoiding the duplicate-key/WAL conflict a manual
+copy would cause.
 
-Sample drift report:
-
-```
-━━━━━━━━━━━━━━━━━━━━━  Drift Report — myapp  ━━━━━━━━━━━━━━━━━━━━━
-┌────────────┬────────┬───────────┬─────────────────┬───────────────────┬──────────────────────────┬────────────────────────────────────────┐
-│ Type       │ Schema │ Table     │ Name            │ Drift             │ Detail                   │ Fix DDL                                │
-├────────────┼────────┼───────────┼─────────────────┼───────────────────┼──────────────────────────┼────────────────────────────────────────┤
-│ column     │ public │ users     │ phone_number    │ missing_on_target │ Column phone_number (...)│ ALTER TABLE "public"."users" ADD ...   │
-│ index      │ public │ orders    │ idx_orders_date │ missing_on_target │ CREATE INDEX ...         │ CREATE INDEX idx_orders_date ON ...    │
-│ function   │ public │           │ calc_vat        │ missing_on_target │ Function not on target   │ CREATE OR REPLACE FUNCTION …           │
-│ trigger    │ public │ orders    │ trg_audit       │ missing_on_target │ Trigger not on target    │ CREATE TRIGGER trg_audit …             │
-│ view       │ public │           │ orders_view     │ body_differs      │ View definition changed  │ CREATE OR REPLACE VIEW …               │
-└────────────┴────────┴───────────┴─────────────────┴───────────────────┴──────────────────────────┴────────────────────────────────────────┘
-```
-
----
+> TimescaleDB continuous aggregates are skipped (managed by the extension).
 
 ### `replicator reinit-sync`
 
-Re-initializes replication after a **Patroni switchover or failover** — the command that makes pg_emigrant production-safe in HA environments.
+Repairs replication after a **Patroni switchover/failover**, when the old slot or
+subscription may have become stale or broken — **without re-copying data**. Safe
+to run any time; it only touches what's missing or unhealthy.
 
-When Patroni promotes a new primary, the old replication slot and subscription can become broken or stale. `reinit-sync` performs a full health check and repairs whatever is needed — **without re-copying any data**.
+Checks, in order:
 
-Checks performed (in order):
-1. **Publication** exists on source → recreates it if missing.
-2. **Replication slot** exists on source and has a healthy `wal_status` (not `lost`).
-3. **Subscription** on target matches the slot state:
-   - Slot healthy, subscription disabled → re-enables the subscription.
-   - Slot healthy, subscription enabled but apply worker not running → refreshes publication list.
-   - Slot missing/unhealthy or subscription missing → drops broken subscription and orphaned slot, then creates a fresh subscription with a new slot.
-
-Safe to run at any time — it only touches components that are missing or broken.
+1. **Publication** present on source → re-create if missing.
+2. **Replication slot** present and healthy on source (`wal_status != 'lost'`).
+3. **Subscription** state on target:
+   - slot healthy + subscription **disabled** → re-enable it;
+   - slot healthy + enabled but **apply worker not running** → `REFRESH PUBLICATION`;
+   - slot missing/`lost` **or** subscription missing → drop the broken subscription
+     and any orphaned slot, then create a fresh subscription (which creates a new
+     slot).
 
 ```bash
-# Check and repair all databases
 replicator reinit-sync
-
-# Repair a specific database only
-replicator reinit-sync --database mydb
-
-# With a custom config
-replicator reinit-sync --config /path/to/config.yaml
+replicator reinit-sync --database myapp
+replicator reinit-sync --config /etc/pg_emigrant/prod.yaml
 ```
 
-Sample output after a Patroni switchover:
-
-```
-──────────────────── Reinit Sync — myapp ────────────────────
-  ⚠  Replication slot 'pg_emigrant_sub_myapp' not found on source
-  ⚠  Subscription 'pg_emigrant_sub_myapp' not found on target
-  ✓  Recreated subscription 'pg_emigrant_sub_myapp' with a fresh replication slot
-──────────────────── Reinit complete — issues were detected and repaired ────────────────────
-```
-
-Sample output when everything is healthy:
-
-```
-──────────────────── Reinit Sync — myapp ────────────────────
-  Replication for 'myapp' is healthy — nothing to do
-──────────────────────── All databases are healthy ──────────────────────────
-```
+It reports, per database, the issues found (`⚠`), the actions taken (`✓`), or a
+"healthy — nothing to do" line, and a final summary rule.
 
 ---
 
-## Typical Migration Scenario
+## Output formats
 
-### 1. Preparation
+`status`, `sync-sequences`, and `detect-ddl` all accept `-f / --format`:
 
-```bash
-# Configure config.yaml with source and target details
-cp config.yaml.example config.yaml
-# Edit config.yaml...
-```
-
-### 2. Bootstrap (one-time run)
-
-```bash
-replicator bootstrap --config config.yaml --verbose
-```
-
-Progress is displayed live with a Rich spinner.
-
-### 3. Monitoring and ongoing sequence synchronisation
-
-Run sequence synchronisation in the background in continuous mode:
-
-```bash
-# In a separate terminal / as a service
-replicator sync-sequences --loop --config config.yaml
-```
-
-### 4. Verify status
-
-```bash
-replicator status --config config.yaml
-```
-
-### 5. Check for DDL drift (optional)
-
-```bash
-replicator detect-ddl --config config.yaml
-replicator detect-ddl --config config.yaml --apply   # automatically applies fixes
-```
-
-### 6. Cutover
-
-```bash
-# Stop replication
-replicator stop --config config.yaml
-
-# Run one final sequence synchronisation
-replicator sync-sequences --config config.yaml
-
-# Redirect the application to the target
-# ...
-
-# Optionally: remove replication objects
-replicator teardown --config config.yaml
-```
-
----
-
-## Multiple Databases
-
-pg_emigrant can automatically discover and migrate all databases on the source server at once:
-
-```yaml
-# config.yaml
-databases: []   # auto-discover all databases (except exclude_databases)
-exclude_databases:
-  - template0
-  - template1
-  - postgres
-```
-
-Or explicitly specify which databases to use:
-
-```yaml
-databases:
-  - app_production
-  - analytics
-  - reporting
-```
-
----
-
-## Multiple Schemas
-
-By default (`schemas: []`) pg_emigrant discovers all user-defined schemas **independently for each database**. This means that `myapp` can have `[public, analytics]` while `legacy` has only `[public]` — without any manual configuration.
-
-The following schemas are always excluded:
-
-| Schema pattern | Reason |
+| Format | Description |
 |---|---|
-| `pg_catalog` | PostgreSQL system catalog |
-| `information_schema` | SQL standard metadata views |
-| `pg_toast` | TOAST storage (internal) |
-| `pg_temp_*` | Temporary tables (session-scoped, not persistent) |
-| `pg_toast_temp_*` | TOAST for temporary tables |
+| `rich` *(default)* | Coloured, bordered tables for humans. |
+| `simple` | One `key=value` record per line — easy to `grep`/`awk` across hundreds of databases. Values containing spaces/`=` are quoted. |
+| `json` | A single JSON array (one object per database) printed to stdout — ideal for `jq`, CI artifacts, archiving. |
 
-To replicate only specific schemas, list them explicitly:
+Example `simple` lines:
 
-```yaml
-schemas:
-  - public
-  - analytics
 ```
-
-The same list applies to all databases in that case. For per-database schema control, leave `schemas: []` and use `databases:` to migrate them in separate runs with different configs.
+db=myapp section=lag application=pg_emigrant_sub_myapp state=streaming write_lag=0.0001 flush_lag=0.0002 replay_lag=0.0003
+db=myapp section=table schema=public source=42 target=42 match=true
+db=myapp section=sequence schema=public sequence=users_id_seq source=10053 target=9821 status=updated
+db=myapp section=drift type=column schema=public table=users name=phone drift=missing_on_target detail="Column phone (text)"
+```
 
 ---
 
-## Project Structure
+## Special handling & edge cases
+
+pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
+
+- **Tables without a primary key.** Logical replication can't identify rows for
+  `UPDATE`/`DELETE` without a key. pg_emigrant sets `REPLICA IDENTITY FULL` on
+  **both** source and target for such tables (and flags them yellow). Note this
+  produces more WAL than a key-based identity — adding a real PK is still
+  preferable.
+- **Mixed-case / quoted identifiers.** All identifiers are safely double-quoted
+  (`qi`/`qt` helpers), so names like `__EFMigrationsHistory` or
+  `"Platforms_id_seq"` are preserved rather than silently lower-cased.
+- **`SERIAL` vs identity sequences.** `nextval()` defaults are preserved against an
+  explicitly pre-created named sequence — preventing the phantom `…_seq1`
+  sequence that would otherwise drift after cutover.
+- **Orphaned target-only sequences.** `sync-sequences` finds the owning table via
+  `pg_get_serial_sequence`, and advances the sequence to `MAX(column) + 1`; if no
+  owner is found it reports it for manual handling.
+- **Extension-managed schemas.** When an extension pre-creates its schema via
+  `shared_preload_libraries` (e.g. the `anon` extension), `CREATE EXTENSION` can
+  fail with *"… is not a member of extension"*. pg_emigrant detects that, drops
+  the orphaned empty schema, and retries the install.
+- **TimescaleDB.** Internal TimescaleDB schemas are never reproduced, and
+  continuous aggregates (backed by internal hypertables) are excluded from view
+  sync and drift detection.
+- **Foreign keys after data.** FKs are added post-copy so PostgreSQL validates
+  them against the whole dataset; a partial/failed table copy surfaces as a hard
+  error here instead of silently corrupt data. Unresolvable FKs are skipped with
+  remediation guidance.
+- **Replication-slot blockers.** Before creating a subscription, pg_emigrant warns
+  about transactions older than 30s anywhere in the **whole cluster**
+  (`CREATE_REPLICATION_SLOT` must take a `ShareLock` on every active XID), printing
+  the exact `pg_terminate_backend(pid)` to unblock them.
+- <a id="robust-subscription-creation"></a>**Robust subscription creation.**
+  `CREATE SUBSCRIPTION` is given a 60s timeout. If the WAL receiver can't reach
+  the source (missing `pg_hba.conf` replication entry, exhausted
+  `max_wal_senders`, etc.), the resulting orphaned slot is cleaned up and a clear
+  error is raised. Orphaned slots left by a previous interrupted run are also
+  dropped (terminating the holding backend and waiting for the slot to go
+  inactive) before a new subscription is created.
+
+---
+
+## Typical migration workflow
+
+```bash
+# 1. Configure
+cp config.yaml.example config.yaml
+$EDITOR config.yaml            # fill in source/target, schemas, etc.
+
+# 2. Bootstrap (schema + data + replication), with live progress
+replicator bootstrap --config config.yaml --verbose
+
+# 3. Keep sequences in step continuously (separate terminal / service)
+replicator sync-sequences --loop --config config.yaml
+
+# 4. Watch the migration
+replicator status --config config.yaml
+
+# 5. (Optional) catch & repair schema changes made on the source since bootstrap
+replicator detect-ddl --config config.yaml
+replicator detect-ddl --config config.yaml --apply
+
+# 6. (If source is Patroni and a failover happens) repair without re-copying
+replicator reinit-sync --config config.yaml
+
+# 7. Cutover
+replicator stop --config config.yaml          # pause replication
+replicator sync-sequences --config config.yaml # final, authoritative sequence sync
+#   … repoint the application at the target …
+replicator teardown --config config.yaml      # optional: remove replication objects
+```
+
+### Many databases / many schemas
+
+Leave `databases: []` to migrate **every** non-template database in one run; each
+gets its own publication/subscription/slot and its own WAL sender on the source
+(so size `max_wal_senders`/`max_replication_slots` to the database count).
+
+Leave `schemas: []` to discover schemas **independently per database** — `myapp`
+might migrate `[public, analytics]` while `legacy` migrates only `[public]`, with
+no manual configuration. An explicit `schemas:` list applies uniformly to every
+database; for differing per-database schema sets, run separate configs with
+`databases:` set.
+
+---
+
+## Limitations
+
+### Inherent to PostgreSQL logical replication
+
+- **One slot/sender per database.** Logical replication is per-database; multiple
+  databases cannot share a WAL sender. `max_wal_senders` on the source must be ≥
+  the number of databases replicated at once.
+- **No DDL in the WAL stream.** Only `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` are
+  streamed; schema changes are not. Use `detect-ddl` to find and apply them.
+- **No real-time sequence advances.** Sequence values aren't in the WAL; they're
+  polled and `setval()`-ed periodically, so the target can briefly trail the
+  source. (Run a final `sync-sequences` at cutover.)
+- **`UNLOGGED` and `TEMPORARY` tables** are never replicated.
+- **Server-side Large Objects (`pg_largeobject`)** are not replicated — migrate
+  them separately if used.
+- **PK-less tables** rely on `REPLICA IDENTITY FULL` (heavier WAL) — a real PK is
+  preferable where possible.
+
+### Not yet implemented in pg_emigrant
+
+- **`exclude_tables` / `replication_slot_name`** config keys are accepted but have
+  no effect (see [configuration](#full-parameter-reference)).
+- **Partitioned tables**: declarative partition hierarchies aren't handled
+  specially.
+- **Tablespaces**: objects are created in the target's default tablespace; source
+  tablespace placement is ignored.
+- **Row-level filtering**: no per-table `WHERE` filter for copy or publication —
+  whole tables are replicated.
+- **Resumable bootstrap**: an interrupted bootstrap restarts the affected database
+  from scratch (no checkpointing).
+- **Built-in observability**: no Prometheus/Grafana exporter; monitoring is via
+  the `status` command.
+- **Automated cutover**: redirecting application traffic (DNS, pooler config, …)
+  is manual; pg_emigrant stops at `stop` + final `sync-sequences`.
+
+---
+
+## Project layout
 
 ```
 pg_emigrant/
-├── pyproject.toml              # package metadata and dependencies
-├── fix_identity_sequences.sh   # one-off remediation for _seq1 sequences
-├── replicator/
-│   ├── __init__.py             # package version
-│   ├── cli.py                  # CLI (Typer) — entry point
-│   ├── config.py               # Pydantic models + YAML loader
-│   ├── bootstrap.py            # full migration orchestrator
-│   ├── db.py                   # asyncpg — connection pools, DB auto-discovery
-│   ├── schema_sync.py          # introspection + schema synchronisation
-│   ├── data_copy.py            # parallel COPY with snapshot isolation
-│   ├── replication.py          # publication and subscription management
-│   ├── sequence_sync.py        # sequence synchronisation source → target
-│   ├── ddl_detector.py         # DDL drift detection and repair
-│   ├── monitor.py              # replication status dashboard (read-only)
-│   └── utils.py                # logging (Rich), SQL identifier quoting
+├── pyproject.toml          # package metadata, deps, `replicator` entry point
+├── config.yaml.example     # sample configuration
+├── LICENSE                 # MIT
+├── README.md
+└── replicator/
+    ├── __init__.py         # package version (0.1.0)
+    ├── cli.py              # Typer CLI — all commands & flags
+    ├── config.py           # Pydantic config models + YAML loader
+    ├── db.py               # asyncpg connections; database & schema discovery
+    ├── bootstrap.py        # full migration orchestrator
+    ├── schema_sync.py      # introspection + schema/type/function/view/ownership sync
+    ├── data_copy.py        # parallel, snapshot-consistent COPY
+    ├── replication.py      # publications, subscriptions, slots, reinit-sync
+    ├── sequence_sync.py    # source→target sequence synchronisation
+    ├── ddl_detector.py     # schema drift detection & repair
+    ├── monitor.py          # read-only status dashboard (rich/simple/json)
+    └── utils.py            # logging + SQL identifier quoting
 ```
 
 ---
 
-## Dependencies
+## Module reference
 
-| Package | Version | Role |
-|---|---|---|
-| `asyncpg` | ≥0.29 | Async PostgreSQL driver (COPY, replication) |
-| `pydantic` | ≥2.0 | Configuration validation and typing |
-| `pyyaml` | ≥6.0 | Configuration file parsing |
-| `typer` | ≥0.9 | CLI framework |
-| `rich` | ≥13.0 | Coloured tables, progress bar, logging |
-
----
-
-## Known Limitations
-
-### Not yet implemented (planned or possible)
-
-- **Batch migration** — when migrating many databases at once every database gets its own WAL sender process on the source (~1.3% CPU each). There is no built-in `batch_size` setting yet; the recommended workaround is to specify explicit `databases:` lists and run `bootstrap` in multiple rounds.
-- **Partitioned tables** — logical replication of declaratively partitioned tables has quirks in PostgreSQL (child partitions must be replicated individually). pg_emigrant does not yet handle partition hierarchies automatically.
-- **Tablespaces** — tables and indexes are always created in the default tablespace on the target; non-default tablespace definitions from the source are ignored.
-- **Row-level filtering** — there is no per-table `WHERE` filter for the initial COPY or for publications; entire tables are always replicated.
-- **Resumable bootstrap** — if `bootstrap` is interrupted mid-copy, it restarts from scratch for the affected databases. Progress is not checkpointed.
-- **Observability integrations** — there is no built-in Prometheus exporter, Grafana dashboard, or external alerting. Monitoring relies on the `replicator status` CLI command.
-- **Automated cutover** — switching application traffic to the target (DNS change, connection pooler reconfiguration, etc.) must be done manually. pg_emigrant stops at `replicator stop` + `sync-sequences`.
-
-### Will never be possible (PostgreSQL architectural constraints)
-
-- **One WAL sender per database** — PostgreSQL logical replication is scoped to a single database. There is no way to multiplex multiple databases over a single WAL sender connection. This is a hard limit of the PostgreSQL replication protocol; `max_wal_senders` on the source must be ≥ the number of concurrently replicated databases.
-- **Real-time DDL replication** — PostgreSQL logical replication transmits DML events only (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`). DDL statements (`ALTER TABLE`, `CREATE INDEX`, etc.) are never included in the WAL stream. pg_emigrant detects and repairs drift via `detect-ddl`, but changes must be applied explicitly — they cannot be streamed automatically.
-- **Unlogged and temporary tables** — PostgreSQL intentionally excludes `UNLOGGED` and `TEMPORARY` tables from logical replication. They will not be replicated.
-- **Large Objects (`pg_largeobject`)** — the `lo` subsystem is not replicated via logical replication. Applications relying on server-side large objects must migrate them separately (e.g. with `pg_dump -Fc --section=data`).
-- **Tables without PRIMARY KEY or REPLICA IDENTITY** — for tables without a primary key, pg_emigrant automatically sets `REPLICA IDENTITY FULL` on **both** source and target during bootstrap. This allows `UPDATE` and `DELETE` to be replicated correctly by including all column values in the WAL record. Such tables are highlighted in yellow in the bootstrap output. Note: `REPLICA IDENTITY FULL` generates more WAL than a PK-based identity; adding a PK to the table remains the preferred solution where possible.
-- **Sequence values in real time** — the WAL stream does not contain sequence advances. pg_emigrant works around this by polling `last_value` on the source and calling `setval()` on the target periodically (configurable via `sequence_sync_interval`), but there is always a small window where target sequences may lag behind the source. This is unavoidable with native logical replication.
+| Module | Responsibility |
+|---|---|
+| `cli.py` | Defines the `replicator` Typer app and its commands: `bootstrap`, `start`, `stop`, `teardown`, `status`, `sync-sequences`, `detect-ddl`, `reinit-sync`. Handles output formatting for the reporting commands. |
+| `config.py` | `DatabaseConfig` and `ReplicatorConfig` Pydantic models and `load_config()` (YAML → validated config; defaults to `config.yaml`, raises if missing). |
+| `db.py` | DSN building and async `connect()` context manager; `discover_databases()` and `discover_schemas()` with the system-schema exclusion set. |
+| `bootstrap.py` | `bootstrap()` — drives the entire per-database pipeline and the live progress display; `ensure_database_exists()`. |
+| `schema_sync.py` | All schema introspection queries and the sync routines: tables/columns, constraints, indexes (with deferred non-unique build), sequences, enum & composite types, functions/procedures, triggers, views/matviews, extensions, `REPLICA IDENTITY FULL`, and ownership (`sync_ownership`, `make_owner_fix_ddl`). |
+| `data_copy.py` | `copy_all_tables()` (snapshot export, truncation, parallel orchestration) and `copy_table_data_pipe()` (streaming CSV copy with optional `ctid` chunking). |
+| `replication.py` | Publication/subscription/slot lifecycle (`create_*`, `drop_*`, `enable_*`, `disable_*`, `refresh_subscription`), status queries, the slot-blocker pre-flight warning, and `reinit_sync()`. |
+| `sequence_sync.py` | `sync_sequences_once()` (forward-only writes, orphan handling), `get_sequence_status()` (read-only), `run_sequence_sync_loop()`. |
+| `ddl_detector.py` | `detect_drift()` (full object comparison → `DriftReport`/`DriftItem`) and `apply_drift_fixes()` (applies fixes, schedules tablesync for new tables). |
+| `monitor.py` | `build_status()` and the rich/simple/json renderers for the status dashboard. |
+| `utils.py` | Rich `console`, logging setup, and `qi()` / `qt()` SQL-identifier quoting. |
 
 ---
 
 ## Security
 
-- Database passwords are stored exclusively in the local `config.yaml` file — ensure appropriate file permissions (`chmod 600 config.yaml`).
-- The DSN containing the password is built in process memory only and is never logged.
-- The database user should have **the minimum necessary privileges** (see the Requirements section).
+- Database passwords live only in your local `config.yaml`
+  (which is git-ignored). Restrict it: `chmod 600 config.yaml`.
+- The connection DSN (with the password) is assembled in process memory only and
+  is never logged.
+- Grant the migration roles the **least privilege** necessary (see
+  [Requirements](#requirements)).
 
 ---
 
 ## License
 
-MIT License — see the `LICENSE` file for details.
+MIT — see the [`LICENSE`](LICENSE) file.
