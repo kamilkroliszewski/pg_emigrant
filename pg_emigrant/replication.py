@@ -11,9 +11,9 @@ import re
 
 import asyncpg
 
-from replicator.config import ReplicatorConfig
-from replicator.db import connect
-from replicator.utils import get_logger, qi
+from pg_emigrant.config import ReplicatorConfig
+from pg_emigrant.db import connect
+from pg_emigrant.utils import get_logger, qi
 
 log = get_logger(__name__)
 

@@ -7,8 +7,8 @@ from typing import AsyncIterator
 
 import asyncpg
 
-from replicator.config import DatabaseConfig, ReplicatorConfig
-from replicator.utils import get_logger
+from pg_emigrant.config import DatabaseConfig, ReplicatorConfig
+from pg_emigrant.utils import get_logger
 
 log = get_logger(__name__)
 

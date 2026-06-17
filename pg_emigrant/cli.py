@@ -8,11 +8,11 @@ from typing import Optional
 import typer
 from rich.table import Table
 
-from replicator.config import load_config
-from replicator.utils import console, setup_logging
+from pg_emigrant.config import load_config
+from pg_emigrant.utils import console, setup_logging
 
 app = typer.Typer(
-    name="replicator",
+    name="pg_emigrant",
     help="pg_emigrant — PostgreSQL migration & replication orchestrator",
     add_completion=False,
 )
@@ -35,7 +35,7 @@ def bootstrap(
     database: Optional[str] = typer.Option(None, "--database", "-d", help="Bootstrap only this database (default: all discovered)"),
 ):
     """Run full bootstrap migration: discover → schema sync → data copy → replication setup."""
-    from replicator.bootstrap import bootstrap as do_bootstrap
+    from pg_emigrant.bootstrap import bootstrap as do_bootstrap
 
     cfg = load_config(config)
     _run(do_bootstrap(cfg, database=database))
@@ -47,8 +47,8 @@ def start(
     database: Optional[str] = typer.Option(None, "--database", "-d", help="Specific database"),
 ):
     """Start (enable) logical replication subscriptions."""
-    from replicator.db import discover_databases
-    from replicator.replication import enable_subscription
+    from pg_emigrant.db import discover_databases
+    from pg_emigrant.replication import enable_subscription
 
     cfg = load_config(config)
 
@@ -67,8 +67,8 @@ def stop(
     database: Optional[str] = typer.Option(None, "--database", "-d"),
 ):
     """Stop (disable) logical replication subscriptions."""
-    from replicator.db import discover_databases
-    from replicator.replication import disable_subscription
+    from pg_emigrant.db import discover_databases
+    from pg_emigrant.replication import disable_subscription
 
     cfg = load_config(config)
 
@@ -87,8 +87,8 @@ def teardown(
     database: Optional[str] = typer.Option(None, "--database", "-d"),
 ):
     """Remove subscriptions, publications, and replication slots."""
-    from replicator.db import discover_databases
-    from replicator.replication import drop_publication, drop_subscription
+    from pg_emigrant.db import discover_databases
+    from pg_emigrant.replication import drop_publication, drop_subscription
 
     cfg = load_config(config)
 
@@ -115,7 +115,7 @@ def status(
     show_drift: bool = typer.Option(False, "--drift", help="Show schema drift summary"),
 ):
     """Display replication status, lag, sequence sync, and drift for all databases."""
-    from replicator.monitor import _ALL_SECTIONS, build_status
+    from pg_emigrant.monitor import _ALL_SECTIONS, build_status
 
     cfg = load_config(config)
 
@@ -147,8 +147,8 @@ def sync_sequences(
     """Synchronize sequences from source to target."""
     import json as _json
 
-    from replicator.db import discover_databases
-    from replicator.sequence_sync import run_sequence_sync_loop, sync_sequences_once
+    from pg_emigrant.db import discover_databases
+    from pg_emigrant.sequence_sync import run_sequence_sync_loop, sync_sequences_once
 
     cfg = load_config(config)
 
@@ -224,8 +224,8 @@ def detect_ddl(
     """Detect schema drift between source and target (including ownership)."""
     import json as _json
 
-    from replicator.db import discover_databases
-    from replicator.ddl_detector import apply_drift_fixes, detect_drift
+    from pg_emigrant.db import discover_databases
+    from pg_emigrant.ddl_detector import apply_drift_fixes, detect_drift
 
     cfg = load_config(config)
 
@@ -348,8 +348,8 @@ def reinit_sync(
     Safe to run at any time — it only creates/enables/refreshes components
     that are missing or not working.
     """
-    from replicator.db import discover_databases
-    from replicator.replication import reinit_sync as do_reinit
+    from pg_emigrant.db import discover_databases
+    from pg_emigrant.replication import reinit_sync as do_reinit
 
     cfg = load_config(config)
 

@@ -11,9 +11,9 @@ from typing import Callable, Sequence
 
 import asyncpg
 
-from replicator.config import ReplicatorConfig
-from replicator.db import connect
-from replicator.utils import get_logger, qi, qt
+from pg_emigrant.config import ReplicatorConfig
+from pg_emigrant.db import connect
+from pg_emigrant.utils import get_logger, qi, qt
 
 log = get_logger(__name__)
 
@@ -226,7 +226,7 @@ async def export_snapshot(source_cfg, dbname: str) -> tuple[asyncpg.Connection, 
     The caller must keep the returned connection open until all workers
     have finished using the snapshot, then COMMIT and close it.
     """
-    from replicator.db import _dsn
+    from pg_emigrant.db import _dsn
 
     conn = await asyncpg.connect(_dsn(source_cfg, dbname))
     await conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;")

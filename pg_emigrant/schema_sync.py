@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncpg
 
-from replicator.utils import console, get_logger, qi, qt
+from pg_emigrant.utils import console, get_logger, qi, qt
 
 log = get_logger(__name__)
 

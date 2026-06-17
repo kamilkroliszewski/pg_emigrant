@@ -10,9 +10,9 @@ from dataclasses import dataclass, field
 
 import asyncpg
 
-from replicator.config import ReplicatorConfig
-from replicator.db import connect, discover_schemas
-from replicator.schema_sync import (
+from pg_emigrant.config import ReplicatorConfig
+from pg_emigrant.db import connect, discover_schemas
+from pg_emigrant.schema_sync import (
     generate_full_table_ddl,
     get_columns,
     get_constraints,
@@ -25,7 +25,7 @@ from replicator.schema_sync import (
     get_views,
     make_owner_fix_ddl,
 )
-from replicator.utils import get_logger, qi, qt
+from pg_emigrant.utils import get_logger, qi, qt
 
 log = get_logger(__name__)
 
@@ -545,7 +545,7 @@ async def apply_drift_fixes(
     Args:
         drop_extra: When True, also DROP tables that exist on target but not on source.
     """
-    from replicator.replication import refresh_subscription
+    from pg_emigrant.replication import refresh_subscription
 
     applied = 0
     new_tables: list[tuple[str, str]] = []  # (schema, table) of tables we just created

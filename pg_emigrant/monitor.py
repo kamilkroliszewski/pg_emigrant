@@ -7,13 +7,13 @@ from typing import Any
 
 from rich.table import Table
 
-from replicator.config import ReplicatorConfig
-from replicator.db import connect, discover_databases, discover_schemas
-from replicator.ddl_detector import detect_drift
-from replicator.replication import get_replication_slots, get_subscription_status, sub_name
-from replicator.schema_sync import get_tables
-from replicator.sequence_sync import get_sequence_status
-from replicator.utils import console, get_logger
+from pg_emigrant.config import ReplicatorConfig
+from pg_emigrant.db import connect, discover_databases, discover_schemas
+from pg_emigrant.ddl_detector import detect_drift
+from pg_emigrant.replication import get_replication_slots, get_subscription_status, sub_name
+from pg_emigrant.schema_sync import get_tables
+from pg_emigrant.sequence_sync import get_sequence_status
+from pg_emigrant.utils import console, get_logger
 
 log = get_logger(__name__)
 

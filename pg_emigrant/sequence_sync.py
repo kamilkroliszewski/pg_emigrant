@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import asyncio
 
-from replicator.config import ReplicatorConfig
-from replicator.db import connect, discover_schemas
-from replicator.schema_sync import get_sequences
-from replicator.utils import get_logger, qt
+from pg_emigrant.config import ReplicatorConfig
+from pg_emigrant.db import connect, discover_schemas
+from pg_emigrant.schema_sync import get_sequences
+from pg_emigrant.utils import get_logger, qt
 
 log = get_logger(__name__)
 

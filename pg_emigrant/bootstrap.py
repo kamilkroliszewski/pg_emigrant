@@ -14,18 +14,18 @@ from __future__ import annotations
 
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from replicator.config import ReplicatorConfig
-from replicator.data_copy import copy_all_tables
-from replicator.db import connect, discover_databases, discover_schemas
-from replicator.replication import create_publication, create_subscription
-from replicator.schema_sync import (
+from pg_emigrant.config import ReplicatorConfig
+from pg_emigrant.data_copy import copy_all_tables
+from pg_emigrant.db import connect, discover_databases, discover_schemas
+from pg_emigrant.replication import create_publication, create_subscription
+from pg_emigrant.schema_sync import (
     get_tables,
     sync_deferred_indexes,
     sync_ownership,
     sync_post_copy_constraints,
     sync_schemas,
 )
-from replicator.utils import console, get_logger
+from pg_emigrant.utils import console, get_logger
 
 log = get_logger(__name__)
 

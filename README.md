@@ -10,7 +10,7 @@ functions, triggers, views, ownership, …), continuous **sequence synchronisati
 **DDL drift** detection/repair, and automatic recovery after a **Patroni
 switchover/failover**.
 
-Everything is driven from a single `replicator` CLI and one YAML config file.
+Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
 
 ---
 
@@ -23,13 +23,13 @@ Everything is driven from a single `replicator` CLI and one YAML config file.
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [CLI reference](#cli-reference)
-  - [`bootstrap`](#replicator-bootstrap)
-  - [`start` / `stop`](#replicator-start--replicator-stop)
-  - [`teardown`](#replicator-teardown)
-  - [`status`](#replicator-status)
-  - [`sync-sequences`](#replicator-sync-sequences)
-  - [`detect-ddl`](#replicator-detect-ddl)
-  - [`reinit-sync`](#replicator-reinit-sync)
+  - [`bootstrap`](#pg_emigrant-bootstrap)
+  - [`start` / `stop`](#pg_emigrant-start--pg_emigrant-stop)
+  - [`teardown`](#pg_emigrant-teardown)
+  - [`status`](#pg_emigrant-status)
+  - [`sync-sequences`](#pg_emigrant-sync-sequences)
+  - [`detect-ddl`](#pg_emigrant-detect-ddl)
+  - [`reinit-sync`](#pg_emigrant-reinit-sync)
 - [Output formats](#output-formats)
 - [Special handling & edge cases](#special-handling--edge-cases)
 - [Typical migration workflow](#typical-migration-workflow)
@@ -45,18 +45,18 @@ Everything is driven from a single `replicator` CLI and one YAML config file.
 
 A migration with pg_emigrant has two phases.
 
-**1. Bootstrap (one-shot).** `replicator bootstrap` reproduces the schema on the
+**1. Bootstrap (one-shot).** `pg_emigrant bootstrap` reproduces the schema on the
 target, copies all existing rows with parallel `COPY`, then creates a PostgreSQL
 **publication** on the source and a **subscription** on the target. From that
 moment on, all new `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE` on the source flow
 to the target over the WAL stream automatically.
 
 **2. Steady state (until cutover).** While the application keeps writing to the
-source, you run `replicator sync-sequences --loop` to keep sequence values in
+source, you run `pg_emigrant sync-sequences --loop` to keep sequence values in
 step (logical replication does **not** replicate sequence advances), use
-`replicator status` to watch lag, and optionally `replicator detect-ddl` to catch
+`pg_emigrant status` to watch lag, and optionally `pg_emigrant detect-ddl` to catch
 and repair schema changes made on the source after bootstrap. If the source is a
-Patroni cluster and a failover/switchover happens, `replicator reinit-sync`
+Patroni cluster and a failover/switchover happens, `pg_emigrant reinit-sync`
 repairs the broken slot/subscription without re-copying data.
 
 At cutover you stop replication, run a final sequence sync, point the application
@@ -198,10 +198,10 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-This installs the `replicator` console command:
+This installs the `pg_emigrant` console command:
 
 ```bash
-replicator --help
+pg_emigrant --help
 ```
 
 Dependencies (from `pyproject.toml`): `asyncpg>=0.29`, `pydantic>=2.0`,
@@ -324,45 +324,45 @@ Every command accepts:
 -d, --database NAME      Operate on a single database instead of all discovered.
 ```
 
-### `replicator bootstrap`
+### `pg_emigrant bootstrap`
 
 Runs the full one-shot migration pipeline described
 [above](#the-bootstrap-pipeline-step-by-step) for every discovered database (or
 just `--database`).
 
 ```bash
-replicator bootstrap
-replicator bootstrap --config /etc/pg_emigrant/prod.yaml
-replicator bootstrap --database myapp
-replicator --verbose bootstrap
+pg_emigrant bootstrap
+pg_emigrant bootstrap --config /etc/pg_emigrant/prod.yaml
+pg_emigrant bootstrap --database myapp
+pg_emigrant --verbose bootstrap
 ```
 
-### `replicator start` / `replicator stop`
+### `pg_emigrant start` / `pg_emigrant stop`
 
 Enable or disable (pause) the subscription apply workers. `stop` keeps the slot
 and subscription intact — replication simply pauses; `start` resumes it.
 
 ```bash
-replicator start                 # all databases
-replicator stop                  # all databases
-replicator start --database myapp
-replicator stop  --database myapp
+pg_emigrant start                 # all databases
+pg_emigrant stop                  # all databases
+pg_emigrant start --database myapp
+pg_emigrant stop  --database myapp
 ```
 
-### `replicator teardown`
+### `pg_emigrant teardown`
 
 Drops the subscription on the target, the publication on the source, and the
 replication slot on the source (terminating the slot's backend if necessary).
 
 ```bash
-replicator teardown
-replicator teardown --database myapp
+pg_emigrant teardown
+pg_emigrant teardown --database myapp
 ```
 
 > **Destructive & irreversible.** After teardown, resuming replication requires a
 > fresh `bootstrap`.
 
-### `replicator status`
+### `pg_emigrant status`
 
 A **read-only** dashboard for every database. It never writes to either server
 (sequence comparison is read-only), so it is safe to run at any time — even
@@ -389,14 +389,14 @@ limit output (handy across many databases):
 ```
 
 ```bash
-replicator status
-replicator status --database myapp
-replicator status --format simple --lag | grep write_lag
-replicator status --format json --drift | jq '.[] | select(.drift.has_drift)'
-replicator status --database myapp --tables --sequences
+pg_emigrant status
+pg_emigrant status --database myapp
+pg_emigrant status --format simple --lag | grep write_lag
+pg_emigrant status --format json --drift | jq '.[] | select(.drift.has_drift)'
+pg_emigrant status --database myapp --tables --sequences
 ```
 
-### `replicator sync-sequences`
+### `pg_emigrant sync-sequences`
 
 Pushes sequence values **source → target**. This is the feature that prevents
 primary-key collisions after cutover, because native logical replication never
@@ -404,10 +404,10 @@ replicates sequence advances. Values **only ever move forward** — the target i
 never decreased.
 
 ```bash
-replicator sync-sequences                       # one pass, all databases
-replicator sync-sequences --database myapp       # one pass, one database
-replicator sync-sequences --loop                 # run forever, every interval
-replicator sync-sequences --database myapp --loop
+pg_emigrant sync-sequences                       # one pass, all databases
+pg_emigrant sync-sequences --database myapp       # one pass, one database
+pg_emigrant sync-sequences --loop                 # run forever, every interval
+pg_emigrant sync-sequences --database myapp --loop
 ```
 
 - **One-pass mode** prints a results table (rich/simple/json) and exits.
@@ -431,20 +431,20 @@ Per-sequence status values:
 > command exits without writing — so it never creates phantom sequences on a bare
 > database.
 
-### `replicator detect-ddl`
+### `pg_emigrant detect-ddl`
 
 Compares the source and target schemas object-by-object and reports the drift.
 Useful when the source schema keeps evolving during a long replication window
 (DDL is never carried by the WAL stream).
 
 ```bash
-replicator detect-ddl                       # report only
-replicator detect-ddl --database myapp
+pg_emigrant detect-ddl                       # report only
+pg_emigrant detect-ddl --database myapp
 
-replicator detect-ddl --apply               # apply fixes for fixable drift
-replicator detect-ddl --apply --drop-extra  # also DROP target-only tables (destructive!)
+pg_emigrant detect-ddl --apply               # apply fixes for fixable drift
+pg_emigrant detect-ddl --apply --drop-extra  # also DROP target-only tables (destructive!)
 
-replicator detect-ddl --format json > drift_$(date +%Y%m%d).json
+pg_emigrant detect-ddl --format json > drift_$(date +%Y%m%d).json
 ```
 
 Flags:
@@ -484,7 +484,7 @@ copy would cause.
 
 > TimescaleDB continuous aggregates are skipped (managed by the extension).
 
-### `replicator reinit-sync`
+### `pg_emigrant reinit-sync`
 
 Repairs replication after a **Patroni switchover/failover**, when the old slot or
 subscription may have become stale or broken — **without re-copying data**. Safe
@@ -502,9 +502,9 @@ Checks, in order:
      slot).
 
 ```bash
-replicator reinit-sync
-replicator reinit-sync --database myapp
-replicator reinit-sync --config /etc/pg_emigrant/prod.yaml
+pg_emigrant reinit-sync
+pg_emigrant reinit-sync --database myapp
+pg_emigrant reinit-sync --config /etc/pg_emigrant/prod.yaml
 ```
 
 It reports, per database, the issues found (`⚠`), the actions taken (`✓`), or a
@@ -584,26 +584,26 @@ cp config.yaml.example config.yaml
 $EDITOR config.yaml            # fill in source/target, schemas, etc.
 
 # 2. Bootstrap (schema + data + replication), with live progress
-replicator bootstrap --config config.yaml --verbose
+pg_emigrant bootstrap --config config.yaml --verbose
 
 # 3. Keep sequences in step continuously (separate terminal / service)
-replicator sync-sequences --loop --config config.yaml
+pg_emigrant sync-sequences --loop --config config.yaml
 
 # 4. Watch the migration
-replicator status --config config.yaml
+pg_emigrant status --config config.yaml
 
 # 5. (Optional) catch & repair schema changes made on the source since bootstrap
-replicator detect-ddl --config config.yaml
-replicator detect-ddl --config config.yaml --apply
+pg_emigrant detect-ddl --config config.yaml
+pg_emigrant detect-ddl --config config.yaml --apply
 
 # 6. (If source is Patroni and a failover happens) repair without re-copying
-replicator reinit-sync --config config.yaml
+pg_emigrant reinit-sync --config config.yaml
 
 # 7. Cutover
-replicator stop --config config.yaml          # pause replication
-replicator sync-sequences --config config.yaml # final, authoritative sequence sync
+pg_emigrant stop --config config.yaml          # pause replication
+pg_emigrant sync-sequences --config config.yaml # final, authoritative sequence sync
 #   … repoint the application at the target …
-replicator teardown --config config.yaml      # optional: remove replication objects
+pg_emigrant teardown --config config.yaml      # optional: remove replication objects
 ```
 
 ### Many databases / many schemas
@@ -661,11 +661,11 @@ database; for differing per-database schema sets, run separate configs with
 
 ```
 pg_emigrant/
-├── pyproject.toml          # package metadata, deps, `replicator` entry point
+├── pyproject.toml          # package metadata, deps, `pg_emigrant` entry point
 ├── config.yaml.example     # sample configuration
 ├── LICENSE                 # MIT
 ├── README.md
-└── replicator/
+└── pg_emigrant/
     ├── __init__.py         # package version (0.1.0)
     ├── cli.py              # Typer CLI — all commands & flags
     ├── config.py           # Pydantic config models + YAML loader
@@ -686,7 +686,7 @@ pg_emigrant/
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | Defines the `replicator` Typer app and its commands: `bootstrap`, `start`, `stop`, `teardown`, `status`, `sync-sequences`, `detect-ddl`, `reinit-sync`. Handles output formatting for the reporting commands. |
+| `cli.py` | Defines the `pg_emigrant` Typer app and its commands: `bootstrap`, `start`, `stop`, `teardown`, `status`, `sync-sequences`, `detect-ddl`, `reinit-sync`. Handles output formatting for the reporting commands. |
 | `config.py` | `DatabaseConfig` and `ReplicatorConfig` Pydantic models and `load_config()` (YAML → validated config; defaults to `config.yaml`, raises if missing). |
 | `db.py` | DSN building and async `connect()` context manager; `discover_databases()` and `discover_schemas()` with the system-schema exclusion set. |
 | `bootstrap.py` | `bootstrap()` — drives the entire per-database pipeline and the live progress display; `ensure_database_exists()`. |

@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-replicator = "replicator.cli:app"
+pg_emigrant = "pg_emigrant.cli:app"
 
 [tool.setuptools.packages.find]
-include = ["replicator*"]
+include = ["pg_emigrant*"]
