@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Jobs — pg_emigrant{% endblock %}
+{% block heading %}Background jobs{% endblock %}
+
+{% block content %}
+<div class="page-toolbar">
+  <div class="muted">Long-running and destructive operations launched from the GUI</div>
+  <div class="toolbar-right">
+    <label class="switch-inline" title="Job list is in-memory and cheap to refresh">
+      <input type="checkbox" id="autorefresh" checked>
+      <span class="lever"></span>
+      Auto-refresh <span id="autorefresh-state" class="autorefresh-state on">On</span>
+    </label>
+    <a class="btn-small waves-effect blue darken-2" id="refresh-jobs">
+      <i class="material-icons left">refresh</i>Refresh
+    </a>
+  </div>
+</div>
+
+<div class="jobs-layout">
+  <div class="card jobs-list-card">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left">work_history</i>Job list</span>
+      <table class="striped jobs-table">
+        <thead>
+          <tr><th>State</th><th>Operation</th><th>Database</th><th>Started</th><th>Finished</th></tr>
+        </thead>
+        <tbody id="jobs-body">
+          <tr><td colspan="5" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+      <div id="jobs-empty" class="empty-state hidden">
+        <i class="material-icons">inbox</i>
+        <p>No jobs yet. Trigger an action from a database page.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="card job-detail-card">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left">terminal</i><span id="job-detail-title">Select a job</span></span>
+      <div id="job-detail-meta" class="muted small"></div>
+      <pre id="job-detail-log" class="job-log">—</pre>
+      <div id="job-detail-error" class="hidden">
+        <span class="red-text">Error:</span>
+        <pre class="job-log error-log" id="job-detail-traceback"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    initJobs();
+  });
+</script>
+{% endblock %}

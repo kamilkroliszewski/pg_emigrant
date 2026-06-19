@@ -37,6 +37,28 @@ async def connect(
 
 
 @asynccontextmanager
+async def src_tgt_conns(
+    cfg: ReplicatorConfig,
+    dbname: str,
+    src: asyncpg.Connection | None = None,
+    tgt: asyncpg.Connection | None = None,
+) -> AsyncIterator[tuple[asyncpg.Connection, asyncpg.Connection]]:
+    """Yield a (source, target) connection pair for *dbname*.
+
+    When the caller already holds open connections (``src`` and ``tgt`` both
+    provided) they are reused as-is and left open on exit — this lets a single
+    pair be shared across several read operations on the same database instead
+    of each opening (and tearing down) its own.  Otherwise a fresh pair is
+    opened and closed around the ``with`` block.
+    """
+    if src is not None and tgt is not None:
+        yield src, tgt
+        return
+    async with connect(cfg.source, dbname) as s, connect(cfg.target, dbname) as t:
+        yield s, t
+
+
+@asynccontextmanager
 async def create_pool(
     cfg: DatabaseConfig,
     dbname: str | None = None,

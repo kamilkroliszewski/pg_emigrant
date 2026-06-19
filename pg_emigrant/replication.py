@@ -355,6 +355,36 @@ async def get_subscription_status(
         return [dict(r) for r in rows]
 
 
+async def get_all_subscription_status(cfg: ReplicatorConfig) -> list[dict]:
+    """Query pg_stat_subscription for *every* subscription in one round-trip.
+
+    ``pg_stat_subscription`` is a cluster-wide view, so a single connection to
+    the target (any database) returns the status of all per-database
+    subscriptions at once — no need to connect to each database separately.
+    Callers match rows back to a database via ``sub_name(cfg, dbname)``.
+    """
+    async with connect(cfg.target) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                subname,
+                pid,
+                leader_pid,
+                relid,
+                received_lsn,
+                last_msg_send_time,
+                last_msg_receipt_time,
+                latest_end_lsn,
+                latest_end_time,
+                pg_size_pretty(
+                    pg_wal_lsn_diff(latest_end_lsn, received_lsn)
+                ) AS lag
+            FROM pg_stat_subscription;
+            """
+        )
+        return [dict(r) for r in rows]
+
+
 async def refresh_subscription(
     cfg: ReplicatorConfig,
     dbname: str,
@@ -412,6 +442,30 @@ async def get_replication_slots(
             WHERE slot_name = $1;
             """,
             slot,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_all_replication_slots(cfg: ReplicatorConfig) -> list[dict]:
+    """Query pg_replication_slots for *every* slot in one round-trip.
+
+    ``pg_replication_slots`` is cluster-wide, so a single source connection
+    returns all per-database slots at once.  Callers match a slot to its
+    database via ``sub_name(cfg, dbname)`` (the slot name).
+    """
+    async with connect(cfg.source) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                slot_name,
+                slot_type,
+                active,
+                active_pid,
+                restart_lsn,
+                confirmed_flush_lsn,
+                wal_status
+            FROM pg_replication_slots;
+            """
         )
         return [dict(r) for r in rows]
 

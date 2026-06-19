@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}pg_emigrant{% endblock %}</title>
+
+  <!-- Apply the saved theme before paint to avoid a flash of the wrong theme. -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('pg_emigrant_theme');
+        if (t) document.documentElement.setAttribute('data-theme', t);
+      } catch (e) { /* ignore */ }
+    })();
+  </script>
+
+  <!-- Material Design: Materialize CSS + Material Icons (CDN) -->
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+  <!-- Sidebar / navigation -->
+  <ul id="slide-out" class="sidenav sidenav-fixed">
+    <li class="brand">
+      <div class="brand-logo">
+        <img class="logo" src="{{ url_for('static', filename='img/logo.jpg') }}" alt="pg_emigrant logo">
+        <span>pg_emigrant</span>
+      </div>
+      <div class="brand-sub">PostgreSQL migration GUI</div>
+    </li>
+    <li class="divider"></li>
+    <li{% if active == 'dashboard' %} class="active"{% endif %}>
+      <a href="{{ url_for('dashboard') }}"><i class="material-icons">dashboard</i>Dashboard</a>
+    </li>
+    <li{% if active == 'config' %} class="active"{% endif %}>
+      <a href="{{ url_for('config_page') }}"><i class="material-icons">settings</i>Configuration</a>
+    </li>
+    <li{% if active == 'jobs' %} class="active"{% endif %}>
+      <a href="{{ url_for('jobs_page') }}"><i class="material-icons">work_history</i>Jobs</a>
+    </li>
+    <li class="divider"></li>
+    <li class="sidenav-footer">
+      <span>Logical replication orchestrator</span>
+    </li>
+  </ul>
+
+  <div class="main-wrap">
+    <nav class="top-nav">
+      <div class="nav-wrapper">
+        <a href="#" data-target="slide-out" class="sidenav-trigger">
+          <i class="material-icons">menu</i>
+        </a>
+        <span class="nav-title">{% block heading %}{% endblock %}</span>
+        <a id="theme-toggle" class="theme-toggle" title="Toggle dark / light mode">
+          <i class="material-icons" id="theme-icon">dark_mode</i>
+          <span id="theme-label">Dark</span>
+        </a>
+      </div>
+    </nav>
+
+    <main class="content">
+      {% if cfg_error %}
+      <div class="card-panel red lighten-4 red-text text-darken-4">
+        <i class="material-icons left">error_outline</i>
+        <strong>Failed to load configuration:</strong> {{ cfg_error }}
+      </div>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

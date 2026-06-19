@@ -15,8 +15,15 @@ dependencies = [
     "rich>=13.0",
 ]
 
+[project.optional-dependencies]
+# Web GUI (pg_emigrant web). Install with: pip install -e ".[web]"
+web = ["flask>=3.0"]
+
 [project.scripts]
 pg_emigrant = "pg_emigrant.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["pg_emigrant*"]
+
+[tool.setuptools.package-data]
+"pg_emigrant.web" = ["templates/*.html", "static/css/*.css", "static/js/*.js", "static/img/*"]

@@ -2,22 +2,43 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
-from typing import Any
+from typing import Any, Awaitable, Callable, TypeVar
 
 from rich.table import Table
 
 from pg_emigrant.config import ReplicatorConfig
 from pg_emigrant.db import connect, discover_databases, discover_schemas
 from pg_emigrant.ddl_detector import detect_drift
-from pg_emigrant.replication import get_replication_slots, get_subscription_status, sub_name
+from pg_emigrant.replication import (
+    get_all_replication_slots,
+    get_all_subscription_status,
+    get_replication_slots,
+    get_subscription_status,
+    sub_name,
+)
 from pg_emigrant.schema_sync import get_tables
 from pg_emigrant.sequence_sync import get_sequence_status
 from pg_emigrant.utils import console, get_logger
 
 log = get_logger(__name__)
 
+T = TypeVar("T")
+
 _ALL_SECTIONS = frozenset({"subscription", "slots", "lag", "tables", "sequences", "drift"})
+
+# Sections backed by cluster-wide catalogs/views — one query returns every
+# database's data at once (no per-database connection needed).
+_GLOBAL_SECTIONS = frozenset({"subscription", "slots", "lag"})
+# Sections whose data lives inside each database and therefore require a
+# connection to that specific database.
+_LOCAL_SECTIONS = frozenset({"tables", "sequences", "drift"})
+
+# How many databases to inspect concurrently when gathering the per-database
+# sections.  Bounded so a large cluster doesn't open an unbounded number of
+# simultaneous connections (which would risk hitting max_connections).
+_STATUS_CONCURRENCY = 8
 
 _LAG_SQL = """
 SELECT
@@ -32,6 +53,22 @@ SELECT
     replay_lag
 FROM pg_stat_replication
 WHERE application_name = $1;
+"""
+
+# Same projection as _LAG_SQL but unfiltered — pg_stat_replication is
+# cluster-wide, so this returns the lag rows for every subscription in one shot.
+_ALL_LAG_SQL = """
+SELECT
+    application_name,
+    state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    write_lag,
+    flush_lag,
+    replay_lag
+FROM pg_stat_replication;
 """
 
 
@@ -130,6 +167,175 @@ async def _collect_db_status(
             data["errors"]["drift"] = str(exc)
 
     return data
+
+
+def _group_by(rows: list[dict], key: str) -> dict[Any, list[dict]]:
+    """Index *rows* by *key* into a dict of key → list of rows."""
+    out: dict[Any, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r.get(key), []).append(dict(r))
+    return out
+
+
+async def _safe_global(
+    want: bool, fetch: Callable[[], Awaitable[list[dict]]]
+) -> tuple[list[dict], str | None]:
+    """Run a cluster-wide fetch, returning (rows, error_message)."""
+    if not want:
+        return [], None
+    try:
+        return await fetch(), None
+    except Exception as exc:
+        return [], str(exc)
+
+
+async def _collect_db_local(
+    cfg: ReplicatorConfig,
+    dbname: str,
+    sections: frozenset[str],
+) -> dict[str, Any]:
+    """Gather the per-database sections (tables/sequences/drift) for *dbname*.
+
+    Opens a single source + target connection pair and reuses it across all
+    requested local sections, instead of each section opening its own.
+    Per-section failures are recorded in ``errors`` rather than raised.
+    """
+    data: dict[str, Any] = {"errors": {}}
+    wanted = sections & _LOCAL_SECTIONS
+    if not wanted:
+        return data
+
+    def _empty(section: str) -> Any:
+        return {"has_drift": False, "summary": "", "items": []} if section == "drift" else []
+
+    try:
+        async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+            schemas = await discover_schemas(src, cfg)
+
+            if "tables" in sections:
+                try:
+                    src_tables = await get_tables(src, schemas)
+                    tgt_tables = await get_tables(tgt, schemas)
+                    src_by: dict[str, int] = {}
+                    for t in src_tables:
+                        src_by[t["schema_name"]] = src_by.get(t["schema_name"], 0) + 1
+                    tgt_by: dict[str, int] = {}
+                    for t in tgt_tables:
+                        tgt_by[t["schema_name"]] = tgt_by.get(t["schema_name"], 0) + 1
+                    data["tables"] = [
+                        {"schema": s, "source": src_by.get(s, 0), "target": tgt_by.get(s, 0)}
+                        for s in sorted(set(list(src_by) + list(tgt_by)))
+                    ]
+                except Exception as exc:
+                    data["tables"] = []
+                    data["errors"]["tables"] = str(exc)
+
+            if "sequences" in sections:
+                try:
+                    data["sequences"] = await get_sequence_status(cfg, dbname, src=src, tgt=tgt)
+                except Exception as exc:
+                    data["sequences"] = []
+                    data["errors"]["sequences"] = str(exc)
+
+            if "drift" in sections:
+                try:
+                    drift = await detect_drift(cfg, dbname, src=src, tgt=tgt)
+                    data["drift"] = {
+                        "has_drift": drift.has_drift,
+                        "summary": drift.summary,
+                        "items": [
+                            {
+                                "object_type": item.object_type,
+                                "schema": item.schema,
+                                "table": item.table,
+                                "name": item.name,
+                                "drift_type": item.drift_type,
+                                "detail": item.detail,
+                                "fix_ddl": item.fix_ddl,
+                            }
+                            for item in drift.items
+                        ],
+                    }
+                except Exception as exc:
+                    data["drift"] = _empty("drift")
+                    data["errors"]["drift"] = str(exc)
+    except Exception as exc:
+        # Could not open the connection pair at all — surface the failure on
+        # every requested local section so the dashboard shows it clearly.
+        for section in wanted:
+            data.setdefault(section, _empty(section))
+            data["errors"][section] = str(exc)
+
+    return data
+
+
+async def collect_all_status(
+    cfg: ReplicatorConfig,
+    databases: list[str],
+    sections: frozenset[str],
+    *,
+    concurrency: int = _STATUS_CONCURRENCY,
+) -> list[dict[str, Any]]:
+    """Gather status for *all* databases efficiently.
+
+    Cluster-wide sections (subscription, slots, lag) are fetched with a single
+    query each — independent of the number of databases.  Per-database sections
+    (tables, sequences, drift) are gathered concurrently with a bounded number
+    of simultaneous connections.  Returns one dict per database, in the same
+    order as *databases*, shaped identically to :func:`_collect_db_status`.
+    """
+    want_sub = "subscription" in sections
+    want_slot = "slots" in sections
+    want_lag = "lag" in sections
+
+    # --- cluster-wide sections: three queries total, for every database ------
+    (sub_rows, sub_err), (slot_rows, slot_err), (lag_rows, lag_err) = await asyncio.gather(
+        _safe_global(want_sub, lambda: get_all_subscription_status(cfg)),
+        _safe_global(want_slot, lambda: get_all_replication_slots(cfg)),
+        _safe_global(want_lag, lambda: _fetch_all_lag(cfg)),
+    )
+    sub_by = _group_by(sub_rows, "subname")
+    slot_by = _group_by(slot_rows, "slot_name")
+    lag_by = _group_by(lag_rows, "application_name")
+
+    # --- per-database sections: bounded concurrency --------------------------
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(db: str) -> dict[str, Any]:
+        async with sem:
+            return await _collect_db_local(cfg, db, sections)
+
+    locals_list = await asyncio.gather(*[_one(db) for db in databases])
+
+    # --- merge global slices with per-database sections ----------------------
+    out: list[dict[str, Any]] = []
+    for db, local in zip(databases, locals_list):
+        key = sub_name(cfg, db)
+        data: dict[str, Any] = {"database": db, "errors": dict(local.get("errors", {}))}
+        if want_sub:
+            data["subscription"] = sub_by.get(key, [])
+            if sub_err:
+                data["errors"]["subscription"] = sub_err
+        if want_slot:
+            data["slots"] = slot_by.get(key, [])
+            if slot_err:
+                data["errors"]["slots"] = slot_err
+        if want_lag:
+            data["lag"] = lag_by.get(key, [])
+            if lag_err:
+                data["errors"]["lag"] = lag_err
+        for section in _LOCAL_SECTIONS:
+            if section in sections and section in local:
+                data[section] = local[section]
+        out.append(data)
+    return out
+
+
+async def _fetch_all_lag(cfg: ReplicatorConfig) -> list[dict]:
+    """Fetch pg_stat_replication for every subscription in one source query."""
+    async with connect(cfg.source) as src:
+        rows = await src.fetch(_ALL_LAG_SQL)
+    return [dict(r) for r in rows]
 
 
 def _render_rich(data: dict[str, Any], sections: frozenset[str]) -> None:
@@ -353,11 +559,13 @@ async def build_status(
         sections = _ALL_SECTIONS
 
     databases = [database] if database else await discover_databases(cfg)
-    all_data: list[dict[str, Any]] = []
 
-    for dbname in databases:
-        data = await _collect_db_status(cfg, dbname, sections)
-        all_data.append(data)
+    # Gather every database concurrently (cluster-wide sections batched into one
+    # query each, per-database sections fanned out with bounded concurrency),
+    # then render in the original database order.
+    all_data = await collect_all_status(cfg, databases, sections)
+
+    for data in all_data:
         if fmt == "rich":
             _render_rich(data, sections)
         elif fmt == "simple":

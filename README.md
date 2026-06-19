@@ -12,6 +12,15 @@ switchover/failover**.
 
 Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
 
+> **Prefer a browser?** pg_emigrant also ships an optional **web GUI** — a Material
+> Design dashboard to configure-view and monitor your migrations without leaving the
+> browser. It's a thin layer over the very same orchestration the CLI uses. See
+> [Web GUI](#web-gui) to get started.
+
+<p align="left">
+  <img src="pg_emigrant_gui.png" alt="pg_emigrant web GUI" width="900">
+</p>
+
 ---
 
 ## Table of contents
@@ -31,6 +40,7 @@ Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
   - [`detect-ddl`](#pg_emigrant-detect-ddl)
   - [`reinit-sync`](#pg_emigrant-reinit-sync)
 - [Output formats](#output-formats)
+- [Web GUI](#web-gui)
 - [Special handling & edge cases](#special-handling--edge-cases)
 - [Typical migration workflow](#typical-migration-workflow)
 - [Limitations](#limitations)
@@ -206,6 +216,13 @@ pg_emigrant --help
 
 Dependencies (from `pyproject.toml`): `asyncpg>=0.29`, `pydantic>=2.0`,
 `pyyaml>=6.0`, `typer>=0.9`, `rich>=13.0`.
+
+To also use the optional [web GUI](#web-gui), install the `web` extra (adds
+`flask`):
+
+```bash
+pip install -e ".[web]"
+```
 
 ---
 
@@ -533,6 +550,84 @@ db=myapp section=drift type=column schema=public table=users name=phone drift=mi
 
 ---
 
+## Web GUI
+
+Besides the CLI, pg_emigrant ships an optional **web GUI** — a Material Design
+dashboard (Flask + [Materialize CSS](https://materializecss.com/)) for people who
+prefer to **configure-view and monitor** migrations from a browser. It is a thin
+presentation layer: every page and action delegates to the **same async
+orchestration functions the CLI uses** — no migration logic is duplicated.
+
+Install the extra and launch it:
+
+```bash
+pip install -e ".[web]"
+pg_emigrant web                       # http://127.0.0.1:8000, uses ./config.yaml
+pg_emigrant web -c /etc/pg_emigrant/prod.yaml --port 9000
+pg_emigrant web --host 0.0.0.0 --port 8000   # bind all interfaces (see security note)
+```
+
+Options: `-c/--config` (config file), `--host` (default `127.0.0.1`),
+`-p/--port` (default `8000`), `--debug` (Flask reloader).
+
+### What the GUI offers
+
+| Page | What it does |
+|---|---|
+| **Dashboard** (`/`) | One auto-refreshing card per discovered database with a health pill (ok / warning / error) computed from subscription, slot activity, lag, table counts and drift. Quick `start` / `stop` / `sync-sequences` buttons per card. |
+| **Database** (`/database/<db>`) | Full status sections — subscription, replication slots, lag, tables per schema, sequence sync, and a schema-drift table with proposed fix DDL — plus an **Actions** panel. |
+| **Configuration** (`/config`) | **Read-only** view of the loaded `config.yaml`. Passwords are masked and never sent to the browser. Editing stays in the file / CLI. |
+| **Jobs** (`/jobs`) | List of background jobs with live, per-job captured logs and tracebacks. |
+
+### Actions & background jobs
+
+Long-running or mutating operations (`bootstrap`, `teardown`, `start`, `stop`,
+`sync-sequences`, `reinit-sync`, and `detect-ddl --apply` / `--drop-extra`) run as
+**background jobs** off the request thread, so the browser stays responsive and
+the UI streams progress. Destructive/long actions (bootstrap, teardown, apply)
+require a confirmation in which you re-type the database name. Each job captures
+the `pg_emigrant` log output produced by its own worker thread (concurrent jobs
+don't mix), polled live into the **Jobs** page and a floating log panel.
+
+> **Known limitation.** Decorative Rich progress output from `bootstrap` (the
+> spinner and per-table row counts) goes to the **server's stdout**, not into a
+> job's log buffer. The substantive orchestration messages use the standard
+> `logging` module and *are* captured in the GUI.
+
+### Styling is loaded from a CDN (internet access required)
+
+> **Heads-up for offline / air-gapped environments.** The GUI's look &amp; feel —
+> **Materialize CSS** and the **Material Icons** font — is pulled from a public CDN
+> over HTTP(S) **by your browser** at page load (via the `<link>` / `<script>` tags
+> in `pg_emigrant/web/templates/base.html`). The browser therefore needs outbound
+> internet access for the page to render with styling.
+
+What this does and does **not** affect:
+
+- **No internet in the browser →** the GUI still *works* (all data, actions and
+  jobs function normally — they go through the Flask app), but it renders
+  **unstyled** (plain HTML, no Material Design layout or icons).
+- **The application itself needs no internet.** pg_emigrant only talks to your
+  source/target **PostgreSQL** servers; the CDN is purely cosmetic and is fetched
+  by the browser, not by the server.
+
+**To run fully offline,** vendor the assets locally: download
+`materialize.min.css`, `materialize.min.js` and a Material Icons font into
+`pg_emigrant/web/static/`, then point the three CDN tags in `base.html` at those
+local files with `url_for('static', filename=…)`. No other code changes are
+needed.
+
+### Security
+
+The GUI exposes the configuration and can trigger **destructive** database
+operations. It therefore **binds to `127.0.0.1` by default and ships without
+authentication**. Do **not** expose it on a public interface without putting a
+reverse proxy with authentication (and ideally TLS) in front of it. Passwords
+from `config.yaml` are masked in the UI and never transmitted to the browser, but
+the GUI can still act on the configured servers.
+
+---
+
 ## Special handling & edge cases
 
 pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
@@ -677,7 +772,13 @@ pg_emigrant/
     ├── sequence_sync.py    # source→target sequence synchronisation
     ├── ddl_detector.py     # schema drift detection & repair
     ├── monitor.py          # read-only status dashboard (rich/simple/json)
-    └── utils.py            # logging + SQL identifier quoting
+    ├── utils.py            # logging + SQL identifier quoting
+    └── web/                # optional Flask + Material Design GUI (pg_emigrant web)
+        ├── app.py          # Flask app factory + routes (delegates to the modules above)
+        ├── services.py     # sync↔async bridges over config/db/monitor/replication/…
+        ├── jobs.py         # in-memory background JobManager (threads + log capture)
+        ├── templates/      # base.html + dashboard / database / config / jobs pages
+        └── static/         # style.css + app.js (Materialize loaded from CDN)
 ```
 
 ---
@@ -695,8 +796,9 @@ pg_emigrant/
 | `replication.py` | Publication/subscription/slot lifecycle (`create_*`, `drop_*`, `enable_*`, `disable_*`, `refresh_subscription`), status queries, the slot-blocker pre-flight warning, and `reinit_sync()`. |
 | `sequence_sync.py` | `sync_sequences_once()` (forward-only writes, orphan handling), `get_sequence_status()` (read-only), `run_sequence_sync_loop()`. |
 | `ddl_detector.py` | `detect_drift()` (full object comparison → `DriftReport`/`DriftItem`) and `apply_drift_fixes()` (applies fixes, schedules tablesync for new tables). |
-| `monitor.py` | `build_status()` and the rich/simple/json renderers for the status dashboard. |
+| `monitor.py` | `build_status()` and the rich/simple/json renderers for the status dashboard. `_collect_db_status()` returns the raw per-database status dict reused by the web GUI. |
 | `utils.py` | Rich `console`, logging setup, and `qi()` / `qt()` SQL-identifier quoting. |
+| `web/` | Optional Flask GUI (`pg_emigrant web`). `app.py` (routes), `services.py` (sync↔async bridges + action registry), `jobs.py` (threaded background `JobManager` with per-thread log capture), `templates/`, `static/`. Reuses the orchestration modules; never duplicates migration logic. |
 
 ---
 
@@ -708,6 +810,9 @@ pg_emigrant/
   is never logged.
 - Grant the migration roles the **least privilege** necessary (see
   [Requirements](#requirements)).
+- The optional [web GUI](#web-gui) exposes the configuration and can run
+  destructive operations; it binds to `127.0.0.1` and has no authentication — see
+  the GUI's [Security](#security) note before exposing it beyond localhost.
 
 ---
 

@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}{{ database }} — pg_emigrant{% endblock %}
+{% block heading %}Database: {{ database }}{% endblock %}
+
+{% set icons = {
+  'bootstrap': 'rocket_launch', 'teardown': 'delete_forever', 'start': 'play_arrow',
+  'stop': 'pause', 'sync-sequences': 'tag', 'reinit-sync': 'healing',
+  'detect-ddl-apply': 'build'
+} %}
+
+{% block content %}
+<div class="page-toolbar">
+  <a href="{{ url_for('dashboard') }}" class="btn-flat waves-effect">
+    <i class="material-icons left">arrow_back</i>Dashboard
+  </a>
+  <div class="toolbar-right">
+    <label class="switch-inline" title="Auto-refresh re-queries the database — off by default">
+      <input type="checkbox" id="autorefresh">
+      <span class="lever"></span>
+      Auto-refresh <span id="autorefresh-state" class="autorefresh-state off">Off</span>
+    </label>
+    <a class="btn-small waves-effect blue darken-2" id="refresh-db">
+      <i class="material-icons left">refresh</i>Refresh
+    </a>
+  </div>
+</div>
+
+<!-- Actions -->
+<div class="card actions-card">
+  <div class="card-content">
+    <span class="card-title"><i class="material-icons left">bolt</i>Actions</span>
+    <div class="action-buttons">
+      {% for key, spec in actions.items() %}
+      <a class="btn waves-effect btn-action {{ 'red darken-1' if spec.destructive else 'blue-grey darken-1' }}"
+         data-action="{{ key }}"
+         data-db="{{ database }}"
+         data-label="{{ spec.label }}"
+         data-destructive="{{ 'true' if spec.destructive else 'false' }}"
+         {% if key == 'detect-ddl-apply' %}data-dropextra="true"{% endif %}>
+        <i class="material-icons left">{{ icons.get(key, 'play_circle') }}</i>{{ spec.label }}
+      </a>
+      {% endfor %}
+    </div>
+    <p class="muted small">Destructive or long-running operations require confirmation and run in the background (see <a href="{{ url_for('jobs_page') }}">Jobs</a>).</p>
+  </div>
+</div>
+
+<!-- Status sections (filled by JS) -->
+<div id="status-errors"></div>
+
+<div class="status-grid">
+  <div class="card status-section" data-section="subscription">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left tiny">sync_alt</i>Subscription</span>
+      <div class="section-body"><div class="placeholder">Loading…</div></div>
+    </div>
+  </div>
+  <div class="card status-section" data-section="slots">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left tiny">power</i>Replication slots (source)</span>
+      <div class="section-body"><div class="placeholder">Loading…</div></div>
+    </div>
+  </div>
+  <div class="card status-section" data-section="lag">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left tiny">speed</i>Replication lag</span>
+      <div class="section-body"><div class="placeholder">Loading…</div></div>
+    </div>
+  </div>
+  <div class="card status-section" data-section="tables">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left tiny">table_chart</i>Tables per schema</span>
+      <div class="section-body"><div class="placeholder">Loading…</div></div>
+    </div>
+  </div>
+  <div class="card status-section" data-section="sequences">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left tiny">tag</i>Sequence sync</span>
+      <div class="section-body"><div class="placeholder">Loading…</div></div>
+    </div>
+  </div>
+  <div class="card status-section wide" data-section="drift">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left tiny">rule</i>Schema drift (DDL)</span>
+      <div class="section-body"><div class="placeholder">Loading…</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm modal for destructive / long actions -->
+<div id="confirm-modal" class="modal">
+  <div class="modal-content">
+    <h5><i class="material-icons left red-text">warning</i><span id="confirm-title">Confirm</span></h5>
+    <p id="confirm-text"></p>
+    <div id="confirm-dropextra" class="hidden">
+      <label>
+        <input type="checkbox" id="opt-dropextra" class="filled-in" />
+        <span><code>--drop-extra</code> — also drop objects that exist only on the target (destructive!)</span>
+      </label>
+    </div>
+    <div id="confirm-typebox" class="hidden">
+      <p class="muted small">To confirm, type the database name: <code id="confirm-dbname"></code></p>
+      <div class="input-field">
+        <input type="text" id="confirm-input" autocomplete="off">
+        <label for="confirm-input">Database name</label>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <a class="modal-close btn-flat waves-effect">Cancel</a>
+    <a id="confirm-go" class="btn red darken-1 waves-effect disabled">Run</a>
+  </div>
+</div>
+
+<!-- Live job panel -->
+<div id="job-panel" class="job-panel hidden">
+  <div class="job-panel-head">
+    <span><i class="material-icons left tiny">terminal</i><span id="job-panel-title">Job</span></span>
+    <a id="job-panel-close" class="btn-flat btn-small"><i class="material-icons">close</i></a>
+  </div>
+  <pre id="job-panel-log" class="job-log"></pre>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    initDatabaseDetail({{ database | tojson }});
+  });
+</script>
+{% endblock %}

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 
+import asyncpg
+
 from pg_emigrant.config import ReplicatorConfig
-from pg_emigrant.db import connect, discover_schemas
+from pg_emigrant.db import connect, discover_schemas, src_tgt_conns
 from pg_emigrant.schema_sync import get_sequences
 from pg_emigrant.utils import get_logger, qt
 
@@ -222,9 +224,16 @@ async def sync_sequences_once(
 async def get_sequence_status(
     cfg: ReplicatorConfig,
     dbname: str,
+    *,
+    src: asyncpg.Connection | None = None,
+    tgt: asyncpg.Connection | None = None,
 ) -> list[dict]:
-    """Read-only comparison of source vs target sequences.  Never writes to target."""
-    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+    """Read-only comparison of source vs target sequences.  Never writes to target.
+
+    ``src``/``tgt`` may be passed to reuse connections the caller already holds
+    for *dbname* (the status dashboard shares one pair across sections).
+    """
+    async with src_tgt_conns(cfg, dbname, src, tgt) as (src, tgt):
         schemas = await discover_schemas(src, cfg)
         sequences = await get_sequences(src, schemas)
         if not sequences:

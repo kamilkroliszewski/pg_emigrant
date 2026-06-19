@@ -379,5 +379,36 @@ def reinit_sync(
     _run(_reinit())
 
 
+@app.command()
+def web(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file"),
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind (default: localhost)"),
+    port: int = typer.Option(8000, "--port", "-p", help="Port to listen on"),
+    debug: bool = typer.Option(False, "--debug", help="Enable Flask debug/reloader"),
+):
+    """Launch the pg_emigrant web GUI (Flask).
+
+    Serves a Material Design dashboard to configure-view and monitor migrations,
+    plus background-job execution of bootstrap/teardown/start/stop/sync-sequences/
+    reinit-sync/detect-ddl. Reuses the same orchestration functions as the CLI.
+
+    Binds to 127.0.0.1 by default and ships without authentication — do not
+    expose it publicly without a reverse proxy + auth (it can run destructive
+    operations and displays the configuration).
+    """
+    try:
+        from pg_emigrant.web.app import create_app
+    except ImportError:
+        console.print(
+            '[red]Flask is not installed.[/red] Install the web extra:\n'
+            '  [bold]pip install -e ".[web]"[/bold]'
+        )
+        raise typer.Exit(1)
+
+    app_ = create_app(config_path=config)
+    console.print(f"[green]pg_emigrant GUI →[/green] http://{host}:{port}")
+    app_.run(host=host, port=port, threaded=True, debug=debug)
+
+
 if __name__ == "__main__":
     app()

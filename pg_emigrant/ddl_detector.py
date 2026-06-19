@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import asyncpg
 
 from pg_emigrant.config import ReplicatorConfig
-from pg_emigrant.db import connect, discover_schemas
+from pg_emigrant.db import connect, discover_schemas, src_tgt_conns
 from pg_emigrant.schema_sync import (
     generate_full_table_ddl,
     get_columns,
@@ -80,11 +80,19 @@ class DriftReport:
 async def detect_drift(
     cfg: ReplicatorConfig,
     dbname: str,
+    *,
+    src: asyncpg.Connection | None = None,
+    tgt: asyncpg.Connection | None = None,
 ) -> DriftReport:
-    """Compare schema objects between source and target for one database."""
+    """Compare schema objects between source and target for one database.
+
+    ``src``/``tgt`` may be passed when the caller already holds open
+    connections for *dbname* (e.g. the status dashboard sharing one pair across
+    several sections), avoiding a redundant connect/teardown.
+    """
     report = DriftReport(database=dbname)
 
-    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+    async with src_tgt_conns(cfg, dbname, src, tgt) as (src, tgt):
         schemas = await discover_schemas(src, cfg)
 
         # Detect schemas missing on target (must run before table comparison so
@@ -112,9 +120,16 @@ async def detect_drift(
 
         src_table_set = {(t["schema_name"], t["table_name"]) for t in src_tables}
         tgt_table_set = {(t["schema_name"], t["table_name"]) for t in tgt_tables}
+        src_table_meta = {(t["schema_name"], t["table_name"]): t for t in src_tables}
 
-        # Tables missing on target
-        for schema, table in sorted(src_table_set - tgt_table_set):
+        # Tables missing on target — order by partition depth so a partitioned
+        # parent is created before its children (a child's PARTITION OF DDL
+        # requires the parent to already exist).
+        missing_tables = sorted(
+            src_table_set - tgt_table_set,
+            key=lambda st: (src_table_meta[st]["part_depth"], st[0], st[1]),
+        )
+        for schema, table in missing_tables:
             table_ddl = await generate_full_table_ddl(src, schema, table)
             # Prepend schema creation when the schema itself is also missing so
             # the fix_ddl is self-contained and can be applied as-is.
@@ -149,6 +164,13 @@ async def detect_drift(
         common = src_table_set & tgt_table_set
         for schema, table in sorted(common):
             fqn = qt(schema, table)
+
+            # Partition children inherit their columns, constraints, PK and
+            # indexes from the parent — they are reconciled through the parent,
+            # so comparing (and trying to ALTER) them directly is both
+            # redundant and would emit DDL PostgreSQL rejects on a partition.
+            if src_table_meta[(schema, table)].get("is_partition"):
+                continue
 
             # Columns
             src_cols = await get_columns(src, fqn)
@@ -550,8 +572,20 @@ async def apply_drift_fixes(
     applied = 0
     new_tables: list[tuple[str, str]] = []  # (schema, table) of tables we just created
 
+    # Apply foreign-key constraints last, after every table (including
+    # partitioned parents and their children) physically exists.  Otherwise a
+    # FK whose referenced table is created later in the same run fails with
+    # "relation … does not exist".  Order within each group is preserved.
+    def _is_fk(item: DriftItem) -> bool:
+        return item.object_type == "constraint" and "FOREIGN KEY" in (item.fix_ddl or "")
+
+    ordered_items = (
+        [i for i in report.items if not _is_fk(i)]
+        + [i for i in report.items if _is_fk(i)]
+    )
+
     async with connect(cfg.target, dbname) as tgt:
-        for item in report.items:
+        for item in ordered_items:
             if not item.fix_ddl:
                 continue
             if item.drift_type == "missing_on_target":

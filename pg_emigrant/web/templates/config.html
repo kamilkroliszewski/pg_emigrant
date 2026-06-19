@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Configuration — pg_emigrant{% endblock %}
+{% block heading %}Configuration{% endblock %}
+
+{% macro endpoint_card(title, icon, ep) %}
+<div class="card config-card">
+  <div class="card-content">
+    <span class="card-title"><i class="material-icons left">{{ icon }}</i>{{ title }}</span>
+    <table class="kv-table">
+      <tr><th>Host</th><td>{{ ep.host }}</td></tr>
+      <tr><th>Port</th><td>{{ ep.port }}</td></tr>
+      <tr><th>User</th><td>{{ ep.user }}</td></tr>
+      <tr><th>Password</th><td class="masked">{{ ep.password }}</td></tr>
+      <tr><th>Admin DB</th><td>{{ ep.dbname }}</td></tr>
+      <tr><th>SSL mode</th><td>{{ ep.sslmode }}</td></tr>
+    </table>
+  </div>
+</div>
+{% endmacro %}
+
+{% block content %}
+<div class="page-toolbar">
+  <div class="muted">File: <code>{{ config_path }}</code></div>
+  <div class="toolbar-right">
+    <span class="chip"><i class="material-icons left tiny">lock</i>Read-only</span>
+  </div>
+</div>
+
+{% if config_data %}
+<div class="config-grid">
+  {{ endpoint_card('Source', 'cloud_upload', config_data.source) }}
+  {{ endpoint_card('Target', 'cloud_download', config_data.target) }}
+
+  <div class="card config-card">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left">schema</i>Migration scope</span>
+      <table class="kv-table">
+        <tr><th>Schemas</th><td>{{ config_data.schemas if config_data.schemas else 'auto-discover' }}</td></tr>
+        <tr><th>Databases</th><td>{{ config_data.databases if config_data.databases else 'auto-discover' }}</td></tr>
+        <tr><th>Exclude DBs</th><td>{{ config_data.exclude_databases }}</td></tr>
+        <tr><th>Exclude tables</th><td>{{ config_data.exclude_tables if config_data.exclude_tables else '—' }} <span class="muted small">(inactive)</span></td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="card config-card">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left">tune</i>Replication &amp; parallelism</span>
+      <table class="kv-table">
+        <tr><th>Publication</th><td><code>{{ config_data.publication_name }}</code></td></tr>
+        <tr><th>Subscription</th><td><code>{{ config_data.subscription_name }}</code></td></tr>
+        <tr><th>Slot name</th><td><code>{{ config_data.replication_slot_name }}</code> <span class="muted small">(inactive)</span></td></tr>
+        <tr><th>parallel_workers</th><td>{{ config_data.parallel_workers }}</td></tr>
+        <tr><th>table_parallel_workers</th><td>{{ config_data.table_parallel_workers }}</td></tr>
+        <tr><th>sequence_sync_interval</th><td>{{ config_data.sequence_sync_interval }} s</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card-panel blue lighten-5 blue-text text-darken-3">
+  <i class="material-icons left">info_outline</i>
+  Edit the configuration via the <code>{{ config_path }}</code> file or the CLI — the GUI shows it in read-only mode (passwords are masked).
+</div>
+{% elif not cfg_error %}
+<div class="empty-state">
+  <i class="material-icons">settings</i>
+  <p>No configuration data.</p>
+</div>
+{% endif %}
+{% endblock %}

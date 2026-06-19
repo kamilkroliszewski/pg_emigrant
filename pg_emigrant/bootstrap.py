@@ -77,7 +77,11 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             # Step 4: copy initial data
             progress.update(task, description=f"[{dbname}] Copying data…")
             async with connect(cfg.source, dbname) as src:
-                tables = await get_tables(src, schemas)
+                all_tables = await get_tables(src, schemas)
+            # Partitioned parents (relkind 'p') hold no rows of their own — the
+            # data physically lives in the leaf partitions, which are copied
+            # individually.  Copying the parent too would duplicate every row.
+            tables = [t for t in all_tables if t["relkind"] != "p"]
 
             if tables:
                 n_total = len(tables)
