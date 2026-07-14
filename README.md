@@ -190,6 +190,7 @@ count, and PK-less tables are flagged in yellow.
   max_logical_replication_workers = 10  # ≥ one apply worker per database
   max_worker_processes            = 10  # must cover the apply workers
   max_replication_slots           = 10  # ≥ one per subscription
+  max_active_replication_origins  = 10  # ≥ one per database
   ```
 - The source `pg_hba.conf` must allow a **replication** connection from the
   target host (otherwise `CREATE SUBSCRIPTION` hangs — see
