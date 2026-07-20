@@ -38,7 +38,11 @@ def bootstrap(
     from pg_emigrant.bootstrap import bootstrap as do_bootstrap
 
     cfg = load_config(config)
-    _run(do_bootstrap(cfg, database=database))
+    try:
+        _run(do_bootstrap(cfg, database=database))
+    except RuntimeError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -142,9 +146,28 @@ def sync_sequences(
     config: str = typer.Option("config.yaml", "--config", "-c"),
     database: Optional[str] = typer.Option(None, "--database", "-d"),
     loop: bool = typer.Option(False, "--loop", help="Run continuously"),
+    margin: int = typer.Option(
+        0, "--margin",
+        help=(
+            "Advance sequences to source_value + MARGIN instead of exactly "
+            "source_value. Use a small positive value (e.g. 1000) on the "
+            "LAST sync-sequences run at cutover, as a safety buffer against "
+            "nextval() calls on the source between reading it and the app "
+            "actually stopping. Do not use with --loop — it would compound "
+            "on every iteration."
+        ),
+    ),
     format: str = typer.Option("rich", "--format", "-f", help="Output format: rich (default), simple, json"),
 ):
     """Synchronize sequences from source to target."""
+    if margin and loop:
+        console.print(
+            "[bold red]--margin cannot be used with --loop[/bold red] — it applies on "
+            "every advancing write and would keep inflating the target ahead of the "
+            "source with each iteration. Use --margin only for the final, one-shot "
+            "sync-sequences run at cutover."
+        )
+        raise typer.Exit(1)
     import json as _json
 
     from pg_emigrant.db import discover_databases
@@ -168,7 +191,9 @@ def sync_sequences(
             await asyncio.gather(*tasks)
             return
 
-        reports = await asyncio.gather(*[sync_sequences_once(cfg, db) for db in dbs])
+        reports = await asyncio.gather(
+            *[sync_sequences_once(cfg, db, margin=margin) for db in dbs]
+        )
         all_data = []
         for db, report in zip(dbs, reports):
             if format == "json":

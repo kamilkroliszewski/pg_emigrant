@@ -20,10 +20,16 @@ from pg_emigrant.schema_sync import (
     get_functions,
     get_indexes,
     get_object_owners,
+    get_policies,
+    get_privileges,
+    get_row_security_tables,
     get_tables,
     get_triggers,
     get_views,
+    make_grant_ddl,
     make_owner_fix_ddl,
+    make_policy_ddl,
+    make_revoke_ddl,
 )
 from pg_emigrant.utils import get_logger, qi, qt
 
@@ -396,6 +402,75 @@ async def detect_drift(
                     ),
                 ))
 
+        # Row-level security: ENABLE/FORCE flags per table, then policies.
+        src_rls_tables = await get_row_security_tables(src, schemas)
+        tgt_rls_map = {
+            (r["schema_name"], r["table_name"]): r
+            for r in await get_row_security_tables(tgt, schemas)
+        }
+        for t in src_rls_tables:
+            if not (t["rowsecurity"] or t["force_rowsecurity"]):
+                continue
+            key = (t["schema_name"], t["table_name"])
+            tgt_t = tgt_rls_map.get(key)
+            if tgt_t is None:
+                continue  # missing table itself is already reported above
+            fqn = qt(t["schema_name"], t["table_name"])
+            stmts = []
+            if t["rowsecurity"] and not tgt_t["rowsecurity"]:
+                stmts.append(f"ALTER TABLE {fqn} ENABLE ROW LEVEL SECURITY;")
+            if t["force_rowsecurity"] and not tgt_t["force_rowsecurity"]:
+                stmts.append(f"ALTER TABLE {fqn} FORCE ROW LEVEL SECURITY;")
+            if stmts:
+                report.items.append(DriftItem(
+                    object_type="row_security",
+                    schema=t["schema_name"],
+                    table=t["table_name"],
+                    name=t["table_name"],
+                    drift_type="different",
+                    detail=f"Row security not fully enabled on target for {fqn}",
+                    fix_ddl="\n".join(stmts),
+                ))
+
+        src_policies = await get_policies(src, schemas)
+        tgt_policies = await get_policies(tgt, schemas)
+        tgt_policy_map = {
+            (p["schema_name"], p["table_name"], p["policy_name"]): p for p in tgt_policies
+        }
+        for p in src_policies:
+            key = (p["schema_name"], p["table_name"], p["policy_name"])
+            tgt_p = tgt_policy_map.get(key)
+            fqn = qt(p["schema_name"], p["table_name"])
+            if tgt_p is None:
+                report.items.append(DriftItem(
+                    object_type="policy",
+                    schema=p["schema_name"],
+                    table=p["table_name"],
+                    name=p["policy_name"],
+                    drift_type="missing_on_target",
+                    detail=f"Policy {p['policy_name']} on {fqn} missing on target",
+                    fix_ddl=make_policy_ddl(p),
+                ))
+            elif (
+                p["polcmd"] != tgt_p["polcmd"]
+                or p["permissive"] != tgt_p["permissive"]
+                or sorted(p["roles"] or []) != sorted(tgt_p["roles"] or [])
+                or (p["using_expr"] or "") != (tgt_p["using_expr"] or "")
+                or (p["check_expr"] or "") != (tgt_p["check_expr"] or "")
+            ):
+                report.items.append(DriftItem(
+                    object_type="policy",
+                    schema=p["schema_name"],
+                    table=p["table_name"],
+                    name=p["policy_name"],
+                    drift_type="different",
+                    detail=f"Policy {p['policy_name']} on {fqn} definition differs",
+                    fix_ddl=(
+                        f"DROP POLICY IF EXISTS {qi(p['policy_name'])} ON {fqn};\n"
+                        + make_policy_ddl(p)
+                    ),
+                ))
+
         # Views and materialized views
         src_views = await get_views(src, schemas)
         tgt_views = await get_views(tgt, schemas)
@@ -488,6 +563,75 @@ async def detect_drift(
                 drift_type="different",
                 detail=detail,
                 fix_ddl=fix,
+            ))
+
+        # Privilege (GRANT/ACL) drift — additive direction (missing_on_target)
+        # is fixed by --apply like everything else; the narrowing direction
+        # (an extra grant on target) is reported but only fixed by the
+        # existing --apply --drop-extra flag, consistent with how every other
+        # "extra on target" case already works.
+        src_privs = await get_privileges(src, schemas, dbname=dbname)
+        tgt_privs = await get_privileges(tgt, schemas, dbname=dbname)
+
+        def _priv_key(r: dict) -> tuple:
+            return (
+                r["acl_kind"], r["schema_name"], r["object_name"],
+                r["grantee"], r["privilege_type"], r["is_grantable"],
+            )
+
+        src_priv_map = {_priv_key(r): r for r in src_privs}
+        tgt_priv_map = {_priv_key(r): r for r in tgt_privs}
+        existing_roles_priv = {
+            r["rolname"] for r in await tgt.fetch("SELECT rolname FROM pg_roles")
+        }
+        existing_roles_priv.add("PUBLIC")
+
+        for key, rec in src_priv_map.items():
+            if key in tgt_priv_map:
+                continue
+            if rec["grantee"] not in existing_roles_priv:
+                fix = ""
+                detail = (
+                    f"Grant {rec['privilege_type']} on {rec['kind']} "
+                    f"{rec['schema_name']}.{rec['object_name']} to {rec['grantee']!r} — "
+                    f"role does not exist on target, create it first"
+                )
+            else:
+                fix = make_grant_ddl(rec)
+                detail = (
+                    f"Grant {rec['privilege_type']} on {rec['kind']} "
+                    f"{rec['schema_name']}.{rec['object_name']} to {rec['grantee']} "
+                    f"exists on source but not target"
+                )
+            report.items.append(DriftItem(
+                object_type=f"privilege ({rec['kind']})",
+                schema=rec["schema_name"],
+                table=rec["object_name"] if rec["kind"] in (
+                    "table", "view", "materialized_view", "sequence"
+                ) else "",
+                name=f"{rec['grantee']}:{rec['privilege_type']}",
+                drift_type="missing_on_target",
+                detail=detail,
+                fix_ddl=fix,
+            ))
+
+        for key, rec in tgt_priv_map.items():
+            if key in src_priv_map:
+                continue
+            report.items.append(DriftItem(
+                object_type=f"privilege ({rec['kind']})",
+                schema=rec["schema_name"],
+                table=rec["object_name"] if rec["kind"] in (
+                    "table", "view", "materialized_view", "sequence"
+                ) else "",
+                name=f"{rec['grantee']}:{rec['privilege_type']}",
+                drift_type="missing_on_source",
+                detail=(
+                    f"Grant {rec['privilege_type']} on {rec['kind']} "
+                    f"{rec['schema_name']}.{rec['object_name']} to {rec['grantee']} "
+                    f"exists on target but not source"
+                ),
+                fix_ddl=make_revoke_ddl(rec),
             ))
 
     return report

@@ -9,8 +9,6 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Sequence
 
-import asyncpg
-
 from pg_emigrant.config import ReplicatorConfig
 from pg_emigrant.db import connect
 from pg_emigrant.utils import get_logger, qi, qt
@@ -185,7 +183,9 @@ async def copy_table_data_pipe(
             where = f"ctid >= '({page_start},0)'::tid"
             if page_end is not None:
                 where += f" AND ctid < '({page_end},0)'::tid"
-            query = f"SELECT {cols_select} FROM {fqn} WHERE {where}"
+            # ONLY: a classic-inheritance parent would otherwise also return its
+            # children's rows, duplicating them (children are copied separately).
+            query = f"SELECT {cols_select} FROM ONLY {fqn} WHERE {where}"
 
             async with (
                 connect(source_cfg, dbname) as src,
@@ -201,7 +201,9 @@ async def copy_table_data_pipe(
         await asyncio.gather(*[_copy_chunk(s, e) for s, e in ranges])
 
     else:
-        query = f"SELECT {cols_select} FROM {fqn}"
+        # ONLY: see the chunked variant above — prevents duplicating rows of
+        # classic-inheritance children through their parent.
+        query = f"SELECT {cols_select} FROM ONLY {fqn}"
         async with (
             connect(source_cfg, dbname) as src,
             connect(target_cfg, dbname) as tgt,
@@ -214,31 +216,17 @@ async def copy_table_data_pipe(
             await src.execute("COMMIT;")
 
     async with connect(target_cfg, dbname) as tgt:
-        row_count: int = await tgt.fetchval(f"SELECT count(*) FROM {fqn};")
+        row_count: int = await tgt.fetchval(f"SELECT count(*) FROM ONLY {fqn};")
 
     log.info("Copied %s rows to %s", row_count, fqn)
     return row_count
-
-
-async def export_snapshot(source_cfg, dbname: str) -> tuple[asyncpg.Connection, str]:
-    """Open a REPEATABLE READ transaction and export its snapshot ID.
-
-    The caller must keep the returned connection open until all workers
-    have finished using the snapshot, then COMMIT and close it.
-    """
-    from pg_emigrant.db import _dsn
-
-    conn = await asyncpg.connect(_dsn(source_cfg, dbname))
-    await conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
-    snapshot_id = await conn.fetchval("SELECT pg_export_snapshot();")
-    log.info("Exported snapshot %s for database %s", snapshot_id, dbname)
-    return conn, snapshot_id
 
 
 async def copy_all_tables(
     cfg: ReplicatorConfig,
     dbname: str,
     tables: list[dict],
+    snapshot_id: str,
     parallel: int | None = None,
     on_table_start: Callable[[str], None] | None = None,
     on_table_done: Callable[[str, int], None] | None = None,
@@ -247,6 +235,15 @@ async def copy_all_tables(
 
     *tables* is a list of dicts with 'schema_name' and 'table_name' keys
     (as returned by ``schema_sync.get_tables``).
+
+    *snapshot_id* MUST be the snapshot exported by
+    ``replication.create_replication_slot_with_snapshot`` — copying with the
+    exact snapshot the replication slot started from is what makes the data
+    copy and the start of WAL streaming a single consistent point, with no gap
+    in which a concurrent write could be lost.  The caller is responsible for
+    keeping that snapshot's holder connection open for the duration of this
+    call (this function only *uses* the snapshot id; it does not export or
+    manage its lifetime).
 
     Returns a dict mapping ``schema.table`` to row count.
     """
@@ -264,9 +261,6 @@ async def copy_all_tables(
             f"{qi(t['schema_name'])}.{qi(t['table_name'])}" for t in tables
         )
         await tgt_conn.execute(f"TRUNCATE {table_list} CASCADE;")
-
-    # Export a snapshot so all workers see the same data
-    holder_conn, snapshot_id = await export_snapshot(cfg.source, dbname)
 
     sem = asyncio.Semaphore(workers)
 
@@ -298,18 +292,14 @@ async def copy_all_tables(
     for key, count in done:
         results[key] = count
 
-    # Release the snapshot holder
-    await holder_conn.execute("COMMIT;")
-    await holder_conn.close()
-
     failed = [key for key, count in results.items() if count < 0]
     total = sum(c for c in results.values() if c >= 0)
     if failed:
         log.error(
             "Data copy INCOMPLETE for %s — %d table(s) failed to copy: %s. "
-            "FK constraints referencing these tables will be skipped. "
-            "Re-run bootstrap or wait for replication to sync the missing data, "
-            "then run 'detect-ddl --apply' to add the missing FK constraints.",
+            "Logical replication will NOT backfill the missing rows. "
+            "Bootstrap aborts for this database before any replication objects "
+            "are created — fix the cause and re-run bootstrap.",
             dbname, len(failed), ", ".join(sorted(failed)),
         )
     log.info(
@@ -317,3 +307,46 @@ async def copy_all_tables(
         dbname, len(results), total,
     )
     return results
+
+
+async def verify_copy_counts(
+    cfg: ReplicatorConfig,
+    dbname: str,
+    tables: list[dict],
+    snapshot_id: str,
+    target_counts: dict[str, int],
+) -> dict[str, tuple[int, int]]:
+    """Cross-check source row counts against what COPY reported on the target.
+
+    Source counts are read under *snapshot_id* — the SAME snapshot the copy
+    itself used — so both sides are counted at the identical, frozen point in
+    time. This makes the comparison exact, not a race with concurrent writes
+    (those are handled separately: writes committed after the slot/snapshot
+    was taken arrive later over the replication stream). Any mismatch found
+    here is therefore a genuine bug in the copy path itself, not a timing
+    artifact — e.g. a driver quirk silently dropping or duplicating rows.
+
+    Call this BEFORE releasing the snapshot (before closing the
+    ``SlotSnapshot`` returned by ``create_replication_slot_with_snapshot``).
+
+    Returns only the tables that don't match, as
+    ``{"schema.table": (source_count, target_count)}``; an empty dict means
+    every table matched exactly.
+    """
+    mismatches: dict[str, tuple[int, int]] = {}
+    async with connect(cfg.source, dbname) as src:
+        await src.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+        await src.execute(f"SET TRANSACTION SNAPSHOT '{snapshot_id}';")
+        try:
+            for t in tables:
+                key = f"{t['schema_name']}.{t['table_name']}"
+                tgt_count = target_counts.get(key)
+                if tgt_count is None or tgt_count < 0:
+                    continue  # already-failed table — reported separately
+                fqn = qt(t["schema_name"], t["table_name"])
+                src_count = await src.fetchval(f"SELECT count(*) FROM ONLY {fqn};")
+                if src_count != tgt_count:
+                    mismatches[key] = (src_count, tgt_count)
+        finally:
+            await src.execute("COMMIT;")
+    return mismatches

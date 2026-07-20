@@ -34,3 +34,8 @@ def qi(identifier: str) -> str:
 def qt(schema: str, table: str) -> str:
     """Return a fully qualified ``"schema"."table"`` reference."""
     return f"{qi(schema)}.{qi(table)}"
+
+
+def ql(text: str) -> str:
+    """Quote a SQL string literal (double any embedded single quotes)."""
+    return "'" + text.replace("'", "''") + "'"

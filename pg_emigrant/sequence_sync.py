@@ -14,7 +14,7 @@ import asyncpg
 from pg_emigrant.config import ReplicatorConfig
 from pg_emigrant.db import connect, discover_schemas, src_tgt_conns
 from pg_emigrant.schema_sync import get_sequences
-from pg_emigrant.utils import get_logger, qt
+from pg_emigrant.utils import get_logger, qi, ql, qt
 
 log = get_logger(__name__)
 
@@ -40,16 +40,31 @@ def _effective_value(row) -> tuple[int, bool]:
 async def sync_sequences_once(
     cfg: ReplicatorConfig,
     dbname: str,
+    *,
+    margin: int = 0,
 ) -> list[dict]:
     """Synchronize all sequences once.  Returns a report of changes.
 
     Uses two batch SELECTs (one per server) and a single DO-block to apply
     all setval() calls, reducing round-trips from O(N) to O(1) per server.
-    
+
     Also handles orphaned sequences (exist on target but not on source):
     - If a sequence exists only on target, it attempts to determine its proper
       value by finding the maximum ID in tables that use it as DEFAULT.
     - If unable to find the table, logs a warning for manual intervention.
+
+    Args:
+        margin: When a sequence needs to advance, set the target to
+            ``source_value + margin`` instead of exactly ``source_value``.
+            Defaults to 0 (exact match). Intended for the LAST, authoritative
+            ``sync-sequences`` run at cutover: it guards against nextval()
+            calls on the source between reading its value here and the
+            application actually stopping being reflected in this read — a
+            margin makes the target tolerant of a handful of such calls
+            instead of risking a duplicate-key collision right after cutover.
+            Do NOT use a nonzero margin on every ``--loop`` iteration: since
+            it applies on every advancing write, it would compound and keep
+            inflating the target ahead of the source for no reason.
     """
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
         schemas = await discover_schemas(src, cfg)
@@ -104,9 +119,14 @@ async def sync_sequences_once(
 
             status = "ok"
             if src_last > tgt_last:
-                updates.append((schema, name, src_last, src_is_called))
+                new_val = src_last + margin
+                updates.append((schema, name, new_val, src_is_called))
                 status = "updated"
-                log.info("Sequence %s [db: %s]: %d → %d", fqn, dbname, tgt_last, src_last)
+                log.info(
+                    "Sequence %s [db: %s]: %d → %d%s",
+                    fqn, dbname, tgt_last, new_val,
+                    f" (source={src_last} + margin={margin})" if margin else "",
+                )
             elif src_last < tgt_last:
                 status = "target_ahead"
                 log.debug("Sequence %s: target %d > source %d, skipping", fqn, tgt_last, src_last)
@@ -150,9 +170,9 @@ async def sync_sequences_once(
                     (SELECT oid FROM pg_namespace WHERE nspname = t.schemaname)
                 JOIN pg_attribute c ON c.attrelid = pc.oid
                 WHERE pg_get_serial_sequence(
-                    quote_ident(t.schemaname) || '.' || quote_ident(t.tablename), 
+                    quote_ident(t.schemaname) || '.' || quote_ident(t.tablename),
                     c.attname
-                ) = {repr(fqn)}
+                ) = {ql(fqn)}
                 LIMIT 1;
                 """
                 
@@ -162,7 +182,7 @@ async def sync_sequences_once(
                         table_name = user_rows[0]["tablename"]
                         column_name = user_rows[0]["attname"]
                         # Find max value in that column
-                        max_id_sql = f"SELECT COALESCE(MAX({qt(column_name)}), 0) as max_id FROM {qt(schema, table_name)}"
+                        max_id_sql = f"SELECT COALESCE(MAX({qi(column_name)}), 0) as max_id FROM {qt(schema, table_name)}"
                         max_id_row = await tgt.fetchrow(max_id_sql)
                         max_id = max_id_row["max_id"]
                         new_val = max(max_id + 1, tgt_last)
@@ -211,8 +231,12 @@ async def sync_sequences_once(
 
         # --- batch write (single round-trip) ------------------------------
         if updates:
+            # qt() double-quotes the identifiers inside the literal so that
+            # mixed-case names like "Platforms_id_seq" survive the text→regclass
+            # cast (unquoted identifiers would be folded to lowercase and the
+            # whole DO block — i.e. every update in the batch — would fail).
             calls = "\n  ".join(
-                f"PERFORM setval({repr(f'{schema}.{name}')}, {value}, {str(is_called).lower()});"
+                f"PERFORM setval({ql(qt(schema, name))}, {value}, {str(is_called).lower()});"
                 for schema, name, value, is_called in updates
             )
             do_block = f"DO $$\nBEGIN\n  {calls}\nEND;\n$$;"
