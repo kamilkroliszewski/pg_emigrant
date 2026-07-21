@@ -19,10 +19,16 @@ from pg_emigrant.utils import get_logger, qi, ql, qt
 log = get_logger(__name__)
 
 # Batch query — reads last_value + start_value for all sequences in given schemas.
-# pg_sequences.last_value is NULL when the sequence has never been called
-# (equivalent to is_called=false).  start_value is needed in that case.
+# pg_sequences.last_value is NULL in TWO distinct cases: the sequence has never
+# been called (is_called=false) — OR the current role simply lacks SELECT/USAGE
+# on it.  Conflating them would treat a far-advanced but unreadable sequence as
+# "still at start_value" and silently leave the target behind (a duplicate-key
+# generator at cutover), so the privilege case is detected explicitly.
 _BATCH_SEQ_VALUES_SQL = """
-SELECT schemaname, sequencename, last_value, start_value
+SELECT schemaname, sequencename, last_value, start_value,
+       has_sequence_privilege(
+           quote_ident(schemaname) || '.' || quote_ident(sequencename),
+           'SELECT,USAGE') AS readable
 FROM pg_sequences
 WHERE schemaname = ANY($1::text[])
 ORDER BY schemaname, sequencename;
@@ -35,6 +41,12 @@ def _effective_value(row) -> tuple[int, bool]:
         # Never called — next nextval() will return start_value
         return row["start_value"], False
     return row["last_value"], True
+
+
+def _unreadable(row) -> bool:
+    """True when last_value is NULL because of missing privileges, not
+    because the sequence was never called — see _BATCH_SEQ_VALUES_SQL."""
+    return row["last_value"] is None and not row["readable"]
 
 
 async def sync_sequences_once(
@@ -113,6 +125,23 @@ async def sync_sequences_once(
             if tgt_row is None:
                 log.warning("Sequence %s not found on target, skipping", fqn)
                 continue
+            if _unreadable(src_row) or _unreadable(tgt_row):
+                side = "source" if _unreadable(src_row) else "target"
+                log.error(
+                    "Cannot read %s sequence %s — the migration role lacks "
+                    "SELECT/USAGE on it, so its value will NOT be synchronized "
+                    "(duplicate-key risk at cutover). Grant the privilege and "
+                    "re-run sync-sequences.",
+                    side, fqn,
+                )
+                report.append({
+                    "schema": schema,
+                    "sequence": name,
+                    "source_value": None if _unreadable(src_row) else _effective_value(src_row)[0],
+                    "target_value": None if _unreadable(tgt_row) else _effective_value(tgt_row)[0],
+                    "status": "permission_denied",
+                })
+                continue
 
             src_last, src_is_called = _effective_value(src_row)
             tgt_last, _ = _effective_value(tgt_row)
@@ -161,18 +190,23 @@ async def sync_sequences_once(
                 tgt_row = tgt_map[(schema, seq_name)]
                 tgt_last, _ = _effective_value(tgt_row)
                 
-                # Try to find which table uses this sequence
-                # Query: find all columns that use this sequence in DEFAULT
+                # Try to find which table uses this sequence.
+                # Compare as regclass, not text: pg_get_serial_sequence()
+                # quotes only when necessary ("public.users_id_seq") while
+                # qt() always quotes ('"public"."users_id_seq"') — a plain
+                # text equality would never match for ordinary lowercase
+                # names, silently degrading every orphan to
+                # 'orphaned_unknown'.
                 find_users_sql = f"""
                 SELECT t.tablename, c.attname
                 FROM pg_tables t
-                JOIN pg_class pc ON pc.relname = t.tablename AND pc.relnamespace = 
+                JOIN pg_class pc ON pc.relname = t.tablename AND pc.relnamespace =
                     (SELECT oid FROM pg_namespace WHERE nspname = t.schemaname)
                 JOIN pg_attribute c ON c.attrelid = pc.oid
                 WHERE pg_get_serial_sequence(
                     quote_ident(t.schemaname) || '.' || quote_ident(t.tablename),
                     c.attname
-                ) = {ql(fqn)}
+                )::regclass = {ql(fqn)}::regclass
                 LIMIT 1;
                 """
                 
@@ -281,6 +315,19 @@ async def get_sequence_status(
             tgt_row = tgt_map.get((schema, name))
 
             if src_row is None:
+                continue
+
+            if _unreadable(src_row) or (tgt_row is not None and _unreadable(tgt_row)):
+                report.append({
+                    "schema": schema,
+                    "sequence": name,
+                    "source_value": None if _unreadable(src_row) else _effective_value(src_row)[0],
+                    "target_value": (
+                        None if tgt_row is None or _unreadable(tgt_row)
+                        else _effective_value(tgt_row)[0]
+                    ),
+                    "status": "permission_denied",
+                })
                 continue
 
             src_last, _ = _effective_value(src_row)

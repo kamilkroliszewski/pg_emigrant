@@ -30,8 +30,9 @@ from pg_emigrant.schema_sync import (
     make_owner_fix_ddl,
     make_policy_ddl,
     make_revoke_ddl,
+    make_trigger_enable_ddl,
 )
-from pg_emigrant.utils import get_logger, qi, qt
+from pg_emigrant.utils import get_logger, qi, ql, qt
 
 log = get_logger(__name__)
 
@@ -286,7 +287,7 @@ async def detect_drift(
             key = (schema, type_name)
 
             if key not in tgt_enum_map:
-                labels_sql = ", ".join(f"'{lbl}'" for lbl in src_labels)
+                labels_sql = ", ".join(ql(lbl) for lbl in src_labels)
                 fix = (
                     f"CREATE TYPE {qi(schema)}.{qi(type_name)} "
                     f"AS ENUM ({labels_sql});"
@@ -306,7 +307,7 @@ async def detect_drift(
                     if label not in tgt_label_set:
                         fix = (
                             f"ALTER TYPE {qi(schema)}.{qi(type_name)} "
-                            f"ADD VALUE IF NOT EXISTS '{label}';"
+                            f"ADD VALUE IF NOT EXISTS {ql(label)};"
                         )
                         report.items.append(DriftItem(
                             object_type="enum",
@@ -362,11 +363,12 @@ async def detect_drift(
                     fix_ddl=src_def + ";",
                 ))
 
-        # Triggers
+        # Triggers — compared on definition AND enable state (tgenabled),
+        # which pg_get_triggerdef never includes.
         src_trigs = await get_triggers(src, schemas)
         tgt_trigs = await get_triggers(tgt, schemas)
         tgt_trig_map = {
-            (t["schema_name"], t["table_name"], t["trigger_name"]): t["trigger_def"]
+            (t["schema_name"], t["table_name"], t["trigger_name"]): t
             for t in tgt_trigs
         }
 
@@ -376,9 +378,11 @@ async def detect_drift(
             trig_name = src_trig["trigger_name"]
             src_def = src_trig["trigger_def"]
             key = (trig_schema, trig_table, trig_name)
-            tgt_def = tgt_trig_map.get(key)
+            tgt_t = tgt_trig_map.get(key)
             fqn = f"{qi(trig_schema)}.{qi(trig_table)}"
-            if tgt_def is None:
+            enable_ddl = make_trigger_enable_ddl(src_trig["enabled"], fqn, trig_name)
+            src_full_ddl = src_def + ";" + (f"\n{enable_ddl}" if enable_ddl else "")
+            if tgt_t is None:
                 report.items.append(DriftItem(
                     object_type="trigger",
                     schema=trig_schema,
@@ -386,19 +390,30 @@ async def detect_drift(
                     name=trig_name,
                     drift_type="missing_on_target",
                     detail=f"Trigger {trig_name} on {trig_schema}.{trig_table} missing on target",
-                    fix_ddl=src_def + ";",
+                    fix_ddl=src_full_ddl,
                 ))
-            elif src_def != tgt_def:
+            elif (
+                src_def != tgt_t["trigger_def"]
+                or src_trig["enabled"] != tgt_t["enabled"]
+            ):
+                if src_def != tgt_t["trigger_def"]:
+                    detail = f"Trigger {trig_name} on {trig_schema}.{trig_table} body differs"
+                else:
+                    detail = (
+                        f"Trigger {trig_name} on {trig_schema}.{trig_table} ENABLE "
+                        f"state differs (source={src_trig['enabled']!r}, "
+                        f"target={tgt_t['enabled']!r})"
+                    )
                 report.items.append(DriftItem(
                     object_type="trigger",
                     schema=trig_schema,
                     table=trig_table,
                     name=trig_name,
                     drift_type="different",
-                    detail=f"Trigger {trig_name} on {trig_schema}.{trig_table} body differs",
+                    detail=detail,
                     fix_ddl=(
                         f"DROP TRIGGER IF EXISTS {qi(trig_name)} ON {fqn};\n"
-                        + src_def + ";"
+                        + src_full_ddl
                     ),
                 ))
 
@@ -496,7 +511,16 @@ async def detect_drift(
                 if relkind == "v":
                     fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
                 else:
-                    fix = f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def.rstrip().rstrip(';')} WITH NO DATA;"
+                    # REFRESH right after creation — a matview left WITH NO
+                    # DATA silently serves zero rows.  Both statements run in
+                    # one implicit transaction, so a failed refresh rolls the
+                    # creation back too (missing again next scan — visible,
+                    # not silently empty).
+                    fix = (
+                        f"CREATE MATERIALIZED VIEW {fqn} AS\n"
+                        f"{src_def.rstrip().rstrip(';')} WITH NO DATA;\n"
+                        f"REFRESH MATERIALIZED VIEW {fqn};"
+                    )
                 report.items.append(DriftItem(
                     object_type=obj_type,
                     schema=vschema,
@@ -510,9 +534,13 @@ async def detect_drift(
                 if relkind == "v":
                     fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
                 else:
+                    # REFRESH after recreation — see the missing-on-target
+                    # matview case above.
                     fix = (
                         f"DROP MATERIALIZED VIEW IF EXISTS {fqn};\n"
-                        f"CREATE MATERIALIZED VIEW {fqn} AS\n{src_def.rstrip().rstrip(';')} WITH NO DATA;"
+                        f"CREATE MATERIALIZED VIEW {fqn} AS\n"
+                        f"{src_def.rstrip().rstrip(';')} WITH NO DATA;\n"
+                        f"REFRESH MATERIALIZED VIEW {fqn};"
                     )
                 report.items.append(DriftItem(
                     object_type=obj_type,

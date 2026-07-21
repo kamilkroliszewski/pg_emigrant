@@ -212,7 +212,11 @@ def sync_sequences(
                         f" status={r['status']}"
                     )
             else:  # rich
-                _STATUS_STYLE = {"ok": "green", "updated": "yellow", "target_ahead": "cyan"}
+                _STATUS_STYLE = {
+                    "ok": "green", "updated": "yellow", "target_ahead": "cyan",
+                    "permission_denied": "red", "orphaned_unknown": "red",
+                    "orphaned_error": "red",
+                }
                 tbl = Table(title=f"Sequence Sync — {db}", show_lines=True)
                 tbl.add_column("Schema")
                 tbl.add_column("Sequence")
