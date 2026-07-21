@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from urllib.parse import quote
 
 import asyncpg
 
@@ -14,11 +15,17 @@ log = get_logger(__name__)
 
 
 def _dsn(cfg: DatabaseConfig, dbname: str | None = None) -> str:
-    """Build a PostgreSQL DSN string from config."""
+    """Build a PostgreSQL DSN string from config.
+
+    User, password and database name are percent-encoded — a password
+    containing ``@``, ``/``, ``:``, ``#`` or ``?`` would otherwise mis-parse
+    the URL.  (The libpq path in replication.py does the equivalent escaping
+    with its own conninfo rules.)
+    """
     db = dbname or cfg.dbname
     return (
-        f"postgresql://{cfg.user}:{cfg.password}"
-        f"@{cfg.host}:{cfg.port}/{db}"
+        f"postgresql://{quote(cfg.user, safe='')}:{quote(cfg.password, safe='')}"
+        f"@{cfg.host}:{cfg.port}/{quote(db, safe='')}"
         f"?sslmode={cfg.sslmode}"
     )
 
@@ -27,10 +34,30 @@ def _dsn(cfg: DatabaseConfig, dbname: str | None = None) -> str:
 async def connect(
     cfg: DatabaseConfig, dbname: str | None = None
 ) -> AsyncIterator[asyncpg.Connection]:
-    """Open a single connection and yield it, closing on exit."""
+    """Open a single connection and yield it, closing on exit.
+
+    Session-affecting per-database/role settings are neutralised on every
+    connection (the same defensive setup pg_dump performs):
+
+    * ``search_path = ''`` — makes every server-side deparse (format_type,
+      pg_get_expr, pg_get_viewdef, pg_get_constraintdef, …) fully
+      schema-qualify its output.  Otherwise a source-side ``ALTER DATABASE …
+      SET search_path`` yields UNQUALIFIED type/table names in the generated
+      DDL, which the target — which doesn't have that setting yet — cannot
+      resolve.  It also keeps source-vs-target definition comparisons (drift
+      detection) on equal footing.
+    * ``statement_timeout = 0`` / ``idle_in_transaction_session_timeout = 0``
+      — a per-database timeout on the source would otherwise kill a long
+      COPY read or the snapshot-holder transaction mid-bootstrap.
+    """
     dsn = _dsn(cfg, dbname)
     conn = await asyncpg.connect(dsn)
     try:
+        await conn.execute(
+            "SELECT pg_catalog.set_config('search_path', '', false);"
+            "SET statement_timeout = 0;"
+            "SET idle_in_transaction_session_timeout = 0;"
+        )
         yield conn
     finally:
         await conn.close()

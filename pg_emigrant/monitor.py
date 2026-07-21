@@ -433,7 +433,10 @@ def _render_rich(data: dict[str, Any], sections: frozenset[str]) -> None:
         seq_table.add_column("Target Value")
         seq_table.add_column("Status")
         for s in data.get("sequences", []):
-            style = {"behind": "yellow", "target_ahead": "cyan", "missing_on_target": "red"}.get(s["status"], "")
+            style = {
+                "behind": "yellow", "target_ahead": "cyan",
+                "missing_on_target": "red", "permission_denied": "red",
+            }.get(s["status"], "")
             seq_table.add_row(
                 s["schema"], s["sequence"],
                 str(s["source_value"]), str(s["target_value"]),

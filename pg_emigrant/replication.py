@@ -7,6 +7,7 @@ Provides start / stop / status operations.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -15,15 +16,27 @@ import psycopg2
 import psycopg2.extras
 
 from pg_emigrant.config import DatabaseConfig, ReplicatorConfig
-from pg_emigrant.db import connect
+from pg_emigrant.db import connect, discover_schemas
 from pg_emigrant.utils import get_logger, qi, ql
 
 log = get_logger(__name__)
 
 
 def _safe_dbname(dbname: str) -> str:
-    """Sanitize a database name for use as part of a PG identifier."""
-    return re.sub(r"[^a-zA-Z0-9]", "_", dbname)
+    """Sanitize a database name for use in publication/subscription/slot names.
+
+    Replication slot names may only contain lower-case letters, digits and
+    underscores, and slots are CLUSTER-WIDE on the source — so the mapping
+    must also be collision-free: "my-app" and "my_app" (or "MyApp" and
+    "myapp") must not produce the same slot name, otherwise bootstrapping one
+    database would terminate and drop the other's live slot.  When the
+    sanitisation is lossy, a short stable hash of the original name is
+    appended so distinct databases stay distinct.
+    """
+    safe = re.sub(r"[^a-z0-9]", "_", dbname.lower())
+    if safe != dbname:
+        safe += "_" + hashlib.sha1(dbname.encode()).hexdigest()[:6]
+    return safe
 
 
 def pub_name(cfg: ReplicatorConfig, dbname: str) -> str:
@@ -236,7 +249,37 @@ async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
 
     Only transactions older than 30 seconds are reported to avoid noise from
     short-lived in-flight transactions.
+
+    Prepared (two-phase) transactions are checked separately: they hold their
+    XID until COMMIT/ROLLBACK PREPARED, block slot creation indefinitely, and
+    do NOT appear in pg_stat_activity at all.
     """
+    prepared = await conn.fetch(
+        """
+        SELECT gid, prepared, owner, database
+        FROM   pg_prepared_xacts
+        WHERE  prepared < now() - interval '30 seconds'
+        ORDER  BY prepared
+        """
+    )
+    if prepared:
+        log.warning(
+            "Found %d prepared transaction(s) (two-phase commit) on the source. "
+            "They hold their XID until COMMIT/ROLLBACK PREPARED and will block "
+            "CREATE_REPLICATION_SLOT indefinitely — and they never show up in "
+            "pg_stat_activity, so no backend list below can include them.",
+            len(prepared),
+        )
+        for row in prepared:
+            log.warning(
+                "  Prepared xact  gid=%-30s  db=%-20s  owner=%-15s  prepared=%s",
+                row["gid"], row["database"], row["owner"], row["prepared"],
+            )
+            log.warning(
+                "  → To unblock run in database %s:  ROLLBACK PREPARED %s;  (or COMMIT PREPARED)",
+                row["database"], ql(row["gid"]),
+            )
+
     rows = await conn.fetch(
         """
         SELECT pid,
@@ -660,8 +703,13 @@ async def reinit_sync(
 
     if not pub_exists:
         issues.append(f"Publication '{pub}' not found on source")
-        schema_list = ", ".join(qi(s) for s in cfg.schemas)
         async with connect(cfg.source, dbname) as conn:
+            # cfg.schemas may be empty (auto-discover mode) — an empty list
+            # would render "FOR TABLES IN SCHEMA ;", a syntax error, exactly
+            # in the disaster-recovery path.  Resolve the actual schema list
+            # the same way bootstrap does.
+            schemas = await discover_schemas(conn, cfg)
+            schema_list = ", ".join(qi(s) for s in schemas)
             await conn.execute(
                 f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
             )
@@ -674,7 +722,7 @@ async def reinit_sync(
     async with connect(cfg.source, dbname) as conn:
         slot_row = await conn.fetchrow(
             """
-            SELECT slot_name, active, active_pid, wal_status
+            SELECT slot_name, active, active_pid, wal_status, confirmed_flush_lsn
             FROM pg_replication_slots
             WHERE slot_name = $1
             """,
@@ -747,6 +795,8 @@ async def reinit_sync(
             )
 
         # Gracefully drop the subscription if it still exists on target.
+        # (slot_name = NONE detaches it first, so a surviving slot on the
+        # source is NOT dropped along with it.)
         if sub_row is not None:
             async with connect(cfg.target, dbname) as conn:
                 await conn.execute(f"ALTER SUBSCRIPTION {qi(sub)} DISABLE;")
@@ -754,17 +804,78 @@ async def reinit_sync(
                 await conn.execute(f"DROP SUBSCRIPTION IF EXISTS {qi(sub)};")
             log.info("reinit_sync [%s]: dropped broken subscription %s", dbname, sub)
 
-        # Drop any orphaned slot that might still linger on source.
-        async with connect(cfg.source, dbname) as conn:
-            if await _drop_slot_if_present(conn, sub):
-                log.info("reinit_sync [%s]: dropped orphaned slot %s", dbname, sub)
+        if slot_ok and slot_row is not None:
+            # The slot survived (only the subscription is gone/broken).
+            # Attach a new subscription to it instead of dropping it: the
+            # slot has retained WAL since its last confirmed LSN, so
+            # replication resumes from there with NO data gap.  (A small
+            # overlap right at the boundary is possible — the old
+            # subscription may have applied slightly past the last
+            # *confirmed* flush — which surfaces as visible duplicate-key
+            # apply errors rather than silent loss; resolve those with
+            # ALTER SUBSCRIPTION ... SKIP.)
+            await create_subscription(cfg, dbname, create_slot=False)
+            actions.append(
+                f"Recreated subscription '{sub}' attached to the surviving "
+                f"replication slot (resumes from {slot_row['confirmed_flush_lsn']} "
+                f"— no data gap)"
+            )
+            log.info(
+                "reinit_sync [%s]: recreated subscription %s attached to the "
+                "surviving slot (resumes at %s)",
+                dbname, sub, slot_row["confirmed_flush_lsn"],
+            )
+        else:
+            # ── DATA-LOSS WINDOW ──────────────────────────────────────────
+            # The old slot is gone or its WAL was already recycled — the
+            # usual outcome of a Patroni promotion, since logical slots do
+            # not survive failover before PostgreSQL 17 failover slots.  A
+            # fresh slot only streams changes from the moment it is created:
+            # everything committed on the source between the old slot's last
+            # confirmed LSN and now was never streamed and will NOT be
+            # replayed.  That gap cannot be repaired here without a re-copy
+            # — make it impossible to miss.
+            old_flush = slot_row["confirmed_flush_lsn"] if slot_row else None
+            gap_start = (
+                f"the old slot's last confirmed LSN ({old_flush})"
+                if old_flush is not None
+                else "an unknown point (the old slot is gone entirely)"
+            )
+            log.warning(
+                "reinit_sync [%s]: recreating subscription '%s' with a FRESH "
+                "replication slot. The new slot starts at the CURRENT WAL "
+                "position — any write committed on the source between %s and "
+                "now was never streamed and is PERMANENTLY MISSING on the "
+                "target. Verify data consistency (row counts / checksums on "
+                "recently-written tables) before trusting this target for "
+                "cutover, and re-copy affected tables if needed. On "
+                "PostgreSQL 17+ consider failover slots "
+                "(sync_replication_slots = on) so a switchover no longer "
+                "loses the slot.",
+                dbname, sub, gap_start,
+            )
+            issues.append(
+                "DATA-LOSS WINDOW: the fresh slot starts at the current LSN — "
+                f"writes since {gap_start} were never streamed to the target. "
+                "Verify affected tables (row counts / checksums) and re-copy "
+                "them if needed before cutover."
+            )
 
-        # Create a fresh subscription — PostgreSQL will also create the slot.
-        # (reinit-sync never re-copies data, so there is no snapshot/slot
-        # consistency window to worry about here — unlike bootstrap.)
-        await create_subscription(cfg, dbname, create_slot=True)
-        actions.append(f"Recreated subscription '{sub}' with a fresh replication slot")
-        log.info("reinit_sync [%s]: recreated subscription %s", dbname, sub)
+            # Drop the dead/lost slot that might still linger on source.
+            async with connect(cfg.source, dbname) as conn:
+                if await _drop_slot_if_present(conn, sub):
+                    log.info("reinit_sync [%s]: dropped orphaned slot %s", dbname, sub)
+
+            # Create a fresh subscription — PostgreSQL will also create the
+            # slot.  (reinit-sync never re-copies data, so there is no
+            # snapshot/slot consistency window to worry about here — unlike
+            # bootstrap — but see the data-gap warning above.)
+            await create_subscription(cfg, dbname, create_slot=True)
+            actions.append(
+                f"Recreated subscription '{sub}' with a fresh replication slot "
+                f"(⚠ data gap — see issues)"
+            )
+            log.info("reinit_sync [%s]: recreated subscription %s", dbname, sub)
 
     return {
         "database": dbname,

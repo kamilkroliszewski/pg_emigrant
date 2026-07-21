@@ -1,7 +1,8 @@
 """Efficient initial data copy using PostgreSQL COPY protocol.
 
-Uses asyncpg's copy_from_table / copy_to_table for streaming binary copies.
-Supports parallel workers and snapshot-consistent reads.
+Streams each table (or ctid page-range slice of it) source→target through a
+bounded asyncio.Queue as CSV COPY — flat memory regardless of table size,
+parallel across (and within) tables, snapshot-consistent reads.
 """
 
 from __future__ import annotations
@@ -14,65 +15,6 @@ from pg_emigrant.db import connect
 from pg_emigrant.utils import get_logger, qi, qt
 
 log = get_logger(__name__)
-
-
-async def copy_table_data(
-    source_cfg,
-    target_cfg,
-    dbname: str,
-    schema: str,
-    table: str,
-    snapshot_id: str | None = None,
-) -> int:
-    """Copy all rows from a single table using COPY protocol.
-
-    If *snapshot_id* is given the source transaction is set to use that
-    snapshot for a consistent read across tables.
-
-    Returns the number of rows copied.
-    """
-    fqn = qt(schema, table)
-
-    async with connect(source_cfg, dbname) as src, connect(target_cfg, dbname) as tgt:
-        # Set up snapshot isolation on source
-        await src.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
-        if snapshot_id:
-            await src.execute(f"SET TRANSACTION SNAPSHOT '{snapshot_id}';")
-
-        # Truncate target table to ensure idempotency
-        await tgt.execute(f"TRUNCATE TABLE {fqn} CASCADE;")
-
-        # Stream data via COPY using a queue — no in-memory accumulation
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
-
-        async def _produce() -> None:
-            async def _chunk(data: bytes) -> None:
-                await queue.put(data)
-            try:
-                await src.copy_from_table(
-                    table, schema_name=schema, output=_chunk, format="binary"
-                )
-            finally:
-                await queue.put(None)  # sentinel — always sent, even on error
-
-        async def _consume() -> None:
-            async def _reader():
-                while True:
-                    chunk = await queue.get()
-                    if chunk is None:
-                        return
-                    yield chunk
-            await tgt.copy_to_table(
-                table, schema_name=schema, source=_reader(), format="binary"
-            )
-
-        await asyncio.gather(_produce(), _consume())
-
-        row_count = await tgt.fetchval(f"SELECT count(*) FROM {fqn};")
-        await src.execute("COMMIT;")
-
-    log.info("Copied %s rows to %s", row_count, fqn)
-    return row_count
 
 
 async def copy_table_data_pipe(
@@ -106,9 +48,14 @@ async def copy_table_data_pipe(
     # no snapshot needed).
     async with connect(source_cfg, dbname) as src, connect(target_cfg, dbname) as tgt:
         src_cols = {r["column_name"] for r in await src.fetch(_col_query, schema, table)}
+        # relpages is a statistic — 0 for a never-analyzed table no matter how
+        # large it really is, which would silently disable intra-table
+        # parallelism.  Floor it with the actual physical size.
         relpages: int = (
             await src.fetchval(
-                "SELECT relpages FROM pg_class"
+                "SELECT GREATEST(relpages,"
+                " (pg_relation_size(oid) / current_setting('block_size')::int)::int)"
+                " FROM pg_class"
                 " WHERE oid = (quote_ident($1) || '.' || quote_ident($2))::regclass",
                 schema,
                 table,
@@ -121,12 +68,22 @@ async def copy_table_data_pipe(
     common_columns = [r["column_name"] for r in tgt_col_rows if r["column_name"] in src_cols]
     cols_select = ", ".join(qi(c) for c in common_columns)
 
-    async def _stream_query(src_conn, tgt_conn, query: str) -> None:
+    async def _stream_query(src_conn, tgt_conn, query: str) -> int:
         """Pipe SELECT query to target COPY via asyncio.Queue — zero RAM accumulation.
 
-        When the producer fails mid-stream the consumer raises the same exception
-        inside the COPY source generator.  asyncpg forwards it as a CopyFail to
-        PostgreSQL, which rolls back the entire COPY — no partial data is committed.
+        Returns the row count the target reported in its ``COPY <n>`` command
+        status — no extra ``count(*)`` scan needed.
+
+        Failure handling:
+        * Producer fails mid-stream → the consumer raises the same exception
+          inside the COPY source generator.  asyncpg forwards it as a CopyFail
+          to PostgreSQL, which rolls back the entire COPY — no partial data is
+          committed.
+        * CONSUMER fails first (target-side error: type mismatch, disk full,
+          …) → the producer is cancelled and the queue drained.  Without
+          that, the producer would block forever on the full queue, and the
+          graceful connection close would never return — hanging the whole
+          bootstrap instead of failing this one table.
         """
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
         _produce_exc: BaseException | None = None
@@ -143,7 +100,7 @@ async def copy_table_data_pipe(
             finally:
                 await queue.put(None)  # sentinel — always sent, even on error
 
-        async def _consume() -> None:
+        async def _consume() -> int:
             async def _reader():
                 while True:
                     chunk = await queue.get()
@@ -152,15 +109,31 @@ async def copy_table_data_pipe(
                             raise _produce_exc  # abort COPY — rolls back partial data
                         return
                     yield chunk
-            await tgt_conn.copy_to_table(
+            status = await tgt_conn.copy_to_table(
                 table,
                 schema_name=schema,
                 source=_reader(),
                 format="csv",
                 columns=common_columns,
             )
+            return int(status.split()[-1])  # command status is 'COPY <n>'
 
-        await asyncio.gather(_produce(), _consume())
+        producer = asyncio.create_task(_produce())
+        try:
+            copied = await _consume()
+        except BaseException:
+            # Unblock and stop the producer before anything touches src_conn
+            # again (COMMIT / connection close) — see docstring.
+            producer.cancel()
+            while not queue.empty():
+                queue.get_nowait()
+            raise
+        finally:
+            try:
+                await producer
+            except (asyncio.CancelledError, Exception):
+                pass  # its failure was already propagated via _produce_exc
+        return copied
 
     # Use ctid-based chunking when multiple workers are requested and the
     # table has enough pages to make the split worthwhile.
@@ -179,7 +152,7 @@ async def copy_table_data_pipe(
             fqn, len(ranges), chunk_size, relpages,
         )
 
-        async def _copy_chunk(page_start: int, page_end: int | None) -> None:
+        async def _copy_chunk(page_start: int, page_end: int | None) -> int:
             where = f"ctid >= '({page_start},0)'::tid"
             if page_end is not None:
                 where += f" AND ctid < '({page_end},0)'::tid"
@@ -195,10 +168,12 @@ async def copy_table_data_pipe(
                 if snapshot_id:
                     await src.execute(f"SET TRANSACTION SNAPSHOT '{snapshot_id}';")
                 await tgt.execute("SET session_replication_role = 'replica';")
-                await _stream_query(src, tgt, query)
+                rows = await _stream_query(src, tgt, query)
                 await src.execute("COMMIT;")
+                return rows
 
-        await asyncio.gather(*[_copy_chunk(s, e) for s, e in ranges])
+        chunk_counts = await asyncio.gather(*[_copy_chunk(s, e) for s, e in ranges])
+        row_count: int = sum(chunk_counts)
 
     else:
         # ONLY: see the chunked variant above — prevents duplicating rows of
@@ -212,11 +187,8 @@ async def copy_table_data_pipe(
             if snapshot_id:
                 await src.execute(f"SET TRANSACTION SNAPSHOT '{snapshot_id}';")
             await tgt.execute("SET session_replication_role = 'replica';")
-            await _stream_query(src, tgt, query)
+            row_count = await _stream_query(src, tgt, query)
             await src.execute("COMMIT;")
-
-    async with connect(target_cfg, dbname) as tgt:
-        row_count: int = await tgt.fetchval(f"SELECT count(*) FROM ONLY {fqn};")
 
     log.info("Copied %s rows to %s", row_count, fqn)
     return row_count

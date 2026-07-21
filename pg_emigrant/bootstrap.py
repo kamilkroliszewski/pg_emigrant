@@ -50,6 +50,7 @@ from pg_emigrant.replication import (
 )
 from pg_emigrant.schema_sync import (
     get_tables,
+    sync_db_settings,
     sync_deferred_indexes,
     sync_ownership,
     sync_post_copy_constraints,
@@ -91,17 +92,30 @@ async def ensure_database_exists(cfg: ReplicatorConfig, dbname: str) -> None:
         )
         if not exists:
             async with connect(cfg.source, dbname) as src:
+                # PostgreSQL 17 renamed pg_database.daticulocale to datlocale
+                # (and added the 'b' builtin locale provider) — querying the
+                # old column name unconditionally fails outright on 17+.
+                src_major = src.get_server_version().major
+                loc_col = "datlocale" if src_major >= 17 else "daticulocale"
                 meta = await src.fetchrow(
                     "SELECT pg_encoding_to_char(encoding) AS encoding,"
                     " datcollate, datctype, datlocprovider::text AS locprovider,"
-                    " daticulocale"
+                    f" {loc_col} AS provider_locale"
                     " FROM pg_database WHERE datname = current_database()"
                 )
             opts = [f"ENCODING {ql(meta['encoding'])}"]
             if meta["locprovider"] == "i":
                 opts.append("LOCALE_PROVIDER icu")
-                if meta["daticulocale"]:
-                    opts.append(f"ICU_LOCALE {ql(meta['daticulocale'])}")
+                if meta["provider_locale"]:
+                    opts.append(f"ICU_LOCALE {ql(meta['provider_locale'])}")
+            elif meta["locprovider"] == "b":
+                # PostgreSQL 17+ builtin provider ("C", "C.UTF-8", …).
+                # Requires a 17+ target too; an older target fails the CREATE
+                # and lands in the locale-fallback path below, with its loud
+                # warning.
+                opts.append("LOCALE_PROVIDER builtin")
+                if meta["provider_locale"]:
+                    opts.append(f"BUILTIN_LOCALE {ql(meta['provider_locale'])}")
             else:
                 opts.append(f"LC_COLLATE {ql(meta['datcollate'])}")
                 opts.append(f"LC_CTYPE {ql(meta['datctype'])}")
@@ -168,6 +182,30 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
                 # Step 2: ensure database exists on target
                 progress.update(task, description=f"[{dbname}] Creating database…")
                 await ensure_database_exists(cfg, dbname)
+
+                # Step 2b: refuse to re-bootstrap a database that is already
+                # replicating.  Without this guard, a re-run would treat the
+                # LIVE slot as orphaned (terminating its walsender and
+                # recreating the slot at a new LSN) and then TRUNCATE the
+                # target while the still-enabled apply worker is running —
+                # guaranteeing duplicate-apply conflicts.  Tearing down must
+                # be an explicit, separate decision.
+                async with connect(cfg.target, dbname) as probe:
+                    already_subscribed = bool(await probe.fetchval(
+                        "SELECT 1 FROM pg_subscription WHERE subname = $1"
+                        " AND subdbid = (SELECT oid FROM pg_database"
+                        " WHERE datname = current_database())",
+                        sub_name(cfg, dbname),
+                    ))
+                if already_subscribed:
+                    raise _DatabaseBootstrapFailed(
+                        f"subscription {sub_name(cfg, dbname)!r} already exists — "
+                        f"this database is already replicating. Re-running "
+                        f"bootstrap would drop its live replication slot and "
+                        f"truncate the target mid-replication. Run "
+                        f"'pg_emigrant teardown --database {dbname}' first if "
+                        f"you really want to re-bootstrap it."
+                    )
 
                 # Step 3: discover schemas for this database, then synchronize them
                 progress.update(task, description=f"[{dbname}] Syncing schemas…")
@@ -317,6 +355,17 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
                     priv_count = await sync_privileges(src, tgt, schemas, dbname=dbname)
                     if priv_count:
                         console.print(f"  [{dbname}] Applied {priv_count} privilege grant(s)")
+
+                # Step 4d-3: per-database configuration (ALTER DATABASE … SET
+                # / ALTER ROLE … IN DATABASE … SET) — never carried by
+                # logical replication, and missing settings (a per-database
+                # search_path being the classic case) only surface after
+                # cutover as runtime misbehaviour.
+                progress.update(task, description=f"[{dbname}] Syncing database settings…")
+                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                    set_count = await sync_db_settings(src, tgt, dbname)
+                    if set_count:
+                        console.print(f"  [{dbname}] Applied {set_count} per-database setting(s)")
 
                 # Step 4e: final sequence value sync.  Identity-backed sequences
                 # are not pre-created (their tables create them), so their
