@@ -47,6 +47,7 @@ from pg_emigrant.replication import (
     drop_publication,
     drop_replication_slot,
     sub_name,
+    warn_if_unstable_host,
 )
 from pg_emigrant.schema_sync import (
     get_tables,
@@ -156,6 +157,8 @@ async def ensure_database_exists(cfg: ReplicatorConfig, dbname: str) -> None:
 async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
     """Run the full bootstrap migration."""
     console.rule("[bold green]pg_emigrant bootstrap")
+
+    warn_if_unstable_host(cfg)
 
     # Step 1: discover databases
     if database:

@@ -98,6 +98,50 @@ async def _node_fingerprint(conn: asyncpg.Connection) -> str:
     return f"{role} at {row['addr'] or 'local socket'}:{row['port']}"
 
 
+_UNSTABLE_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def warn_if_unstable_host(cfg: ReplicatorConfig) -> None:
+    """Warn when ``source``/``target`` is configured as ``localhost`` (or an
+    equivalent loopback address) — confirmed in production to cause exactly
+    the silent-slot-vanishing failure this module otherwise defends against.
+
+    The trap: running pg_emigrant directly on one of a Patroni cluster's own
+    database hosts, for network locality, with ``host: localhost`` in
+    config.yaml. ``localhost`` pins EVERY connection to *that one specific
+    machine*, regardless of its current Patroni role — unlike a cluster
+    VIP/HAProxy endpoint, which Patroni actively repoints at whichever node
+    is the current primary. If that machine is later demoted (a
+    failover/switchover elsewhere in the cluster, or this node getting
+    rewound/reinitialized as a new standby), every subsequent ``localhost``
+    connection keeps reaching the SAME machine — now a standby whose data
+    directory no longer has the replication slot that was created while it
+    was still the primary. The result is a subscription that "succeeds" at
+    creation time and then fails forever in the background with
+    ``replication slot "..." does not exist`` — logged only on that node,
+    invisible to pg_emigrant, and NOT fixed by repeated ``reinit-sync`` runs
+    (each one hits the same wrong, pinned address again). A single-node,
+    non-HA source/target genuinely at ``localhost`` forever is fine; this is
+    a warning, not a hard error, because pg_emigrant cannot tell the two
+    situations apart from the config alone.
+    """
+    for label, side in (("source", cfg.source), ("target", cfg.target)):
+        if side.host.strip().lower() in _UNSTABLE_HOSTS:
+            log.warning(
+                "%s.host is %r. If this is a Patroni/HA-managed cluster and "
+                "pg_emigrant is running directly on one of its own database "
+                "hosts, this WILL silently break replication the moment this "
+                "specific machine stops being the primary (a confirmed "
+                "production failure mode — see README 'Special handling & "
+                "edge cases'). Point '%s' at the cluster's VIP/HAProxy "
+                "leader-only endpoint instead — one that Patroni itself keeps "
+                "repointed at the current primary — not at this one machine's "
+                "loopback address. Harmless to ignore only if '%s' truly has "
+                "no HA/failover at all.",
+                label, side.host, label, label,
+            )
+
+
 async def _drop_slot_if_present(conn: asyncpg.Connection, slot_name: str) -> bool:
     """Terminate the holding backend (if any) and drop *slot_name* if it exists.
 

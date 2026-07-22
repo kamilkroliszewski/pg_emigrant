@@ -256,23 +256,44 @@ subscriber would reject it.
   - **Target:** ability to `CREATE DATABASE`, create schema objects, and
     `CREATE SUBSCRIPTION` (superuser, or the relevant privileges).
 - **`source.host` (and `target.host`) must resolve to the SAME physical
-  instance for every connection pg_emigrant opens over the whole bootstrap.**
-  If it's a Patroni cluster, point it at the leader-only endpoint (Patroni's
-  own REST API-driven VIP/HAProxy port, or a direct connection to the current
-  primary) — **never** a load-balanced or read-replica endpoint that can
-  round-robin across nodes. The replication slot is created on whichever
-  instance the very first connection reaches; if a later connection (e.g. the
-  one issuing `CREATE SUBSCRIPTION`) reaches a *different* node — because of a
-  failover/switchover mid-bootstrap, or because the endpoint balances reads
-  across replicas — the publication is still visible there (ordinary catalog
-  rows, carried by physical streaming) but the slot is not (slots are local
-  storage on one instance). `CREATE SUBSCRIPTION` itself does **not** validate
-  that the slot exists — PostgreSQL only discovers this later, when the apply
-  worker tries to start streaming in the background, logging a bare
-  `replication slot "..." does not exist` in the *source's* own log with
-  nothing on the client that issued the DDL. pg_emigrant detects this
-  specific case immediately after creating the subscription and fails
-  bootstrap loudly instead — see [Special handling](#special-handling--edge-cases).
+  instance for every connection pg_emigrant opens over the whole bootstrap —
+  and, on a Patroni/HA cluster, that instance must always be the CURRENT
+  PRIMARY.** Point it at the cluster's leader-only VIP/HAProxy endpoint —
+  the one Patroni itself keeps repointed at whichever node is currently the
+  primary — never at a load-balanced/read-replica endpoint, and **never at
+  `localhost` (or `127.0.0.1`)**.
+  >
+  > **Confirmed in production:** running pg_emigrant directly on one of the
+  > cluster's own database hosts with `host: localhost` in `config.yaml`
+  > reproduces this exactly. `localhost` pins every connection to *that one
+  > specific machine* regardless of its current Patroni role. If that node
+  > is later demoted — a failover/switchover elsewhere in the cluster, or
+  > this node itself getting rewound/reinitialized as the new standby —
+  > every later `localhost` connection keeps reaching the SAME machine, now
+  > a standby whose data directory no longer has the replication slot that
+  > was created while it was still the primary. The result: `bootstrap`
+  > (or `reinit-sync`, repeatedly) appears to succeed, and the subscription
+  > fails forever in the background with a bare
+  > `replication slot "..." does not exist` — logged only on that one
+  > machine, invisible to pg_emigrant. Switching `source.host` from
+  > `localhost` to the cluster's real (VIP) address resolved it completely.
+  > pg_emigrant now logs a warning at the start of `bootstrap` and
+  > `reinit-sync` whenever `source.host`/`target.host` is a loopback
+  > address, precisely for this reason.
+  >
+  The replication slot is created on whichever instance the very first
+  connection reaches; if a later connection (e.g. the one issuing
+  `CREATE SUBSCRIPTION`) reaches a *different* node, the publication is
+  still visible there too (ordinary catalog rows, carried by physical
+  streaming) but the slot is not (slots are local storage on one instance).
+  `CREATE SUBSCRIPTION` itself does **not** validate that the slot exists —
+  PostgreSQL only discovers this later, when the apply worker tries to
+  start streaming in the background, logging a bare
+  `replication slot "..." does not exist` on the *source*, with nothing on
+  the client that issued the DDL. pg_emigrant detects this specific case
+  immediately after every `CREATE SUBSCRIPTION` and fails loudly instead,
+  quoting exactly which node (primary/standby + address) the verifying
+  connection reached — see [Special handling](#special-handling--edge-cases).
 - **Source** `postgresql.conf`:
   ```ini
   wal_level = logical
@@ -837,9 +858,13 @@ pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
   never streamed anything) or, if nothing depends on this subscription yet,
   `pg_emigrant teardown --database <db>` followed by a clean re-`bootstrap`.
   **If this keeps recurring even across `reinit-sync` attempts**, the
-  endpoint itself is the problem, not a one-off failover: confirm
-  `source.host:port` in `config.yaml` is a single fixed address that always
-  reaches the SAME physical instance (run
+  endpoint itself is the problem, not a one-off failover — check, in this
+  order: (1) is `source.host`/`target.host` set to `localhost` or
+  `127.0.0.1`? This is the confirmed production cause above — pg_emigrant
+  now warns about it at startup, but if you're reading this because it
+  already happened, point it at the cluster's VIP instead. (2) If it's
+  already a proper cluster address, confirm it's a single fixed endpoint
+  that always reaches the SAME physical instance (run
   `SELECT pg_is_in_recovery(), inet_server_addr();` against it several times
   in a row — it must return identically every time), and rule out a
   connection pooler (PgBouncer, …) sitting in front of it in a pooling mode
