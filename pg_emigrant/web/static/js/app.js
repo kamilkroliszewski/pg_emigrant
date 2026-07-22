@@ -88,7 +88,6 @@ function computeHealth(data) {
   const slots = data.slots || [];
   const subs = data.subscription || [];
   const tables = data.tables || [];
-  const drift = data.drift || {};
 
   // Hard failure: cannot reach servers for the core sections.
   if (errs.subscription || errs.slots || errs.lag) {
@@ -103,7 +102,18 @@ function computeHealth(data) {
     return { cls: 'warn', label: 'no replication' };
   }
   if (!slotActive) return { cls: 'warn', label: 'slot inactive' };
-  if (drift.has_drift || tableMismatch || hasLag) return { cls: 'warn', label: 'warning' };
+  if (tableMismatch || hasLag) return { cls: 'warn', label: 'warning' };
+  // Schema drift (DDL differences) is intentionally NOT a health signal here:
+  // it means "the schema has drifted", not "replication is broken" — a
+  // subscription can be fully healthy and actively streaming data while a
+  // column/index/function/trigger difference sits unresolved. Folding it in
+  // also produced a confusing, load-order-dependent inconsistency: drift is
+  // scanned lazily per card (only once a card scrolls into view — see
+  // setupDriftLazyLoading), so two equally-drifted databases could show
+  // different overall colors purely because one card had been scrolled past
+  // and the other hadn't. Drift still gets its own dedicated badge in the
+  // card's "Drift" row (see populateDrift) — it's just not conflated with
+  // "is this database actively replicating".
   return { cls: 'ok', label: 'ok' };
 }
 
@@ -328,19 +338,9 @@ function populateDrift(data) {
   const err = (data.errors || {}).drift;
   if (err) { setCardMetric(card, 'drift', sectionError(err)); return; }
   const drift = data.drift || {};
+  // Drift gets its own badge here — it deliberately does NOT touch the
+  // card's overall health pill (see the comment in computeHealth() for why).
   setCardMetric(card, 'drift', drift.has_drift ? badge(drift.summary || 'drift', 'warn') : badge('none', 'ok'));
-
-  // Drift can downgrade health from ok → warning; re-evaluate now that we know.
-  if (drift.has_drift) {
-    const pill = card.querySelector('.health-pill');
-    if (pill.classList.contains('ok')) {
-      pill.className = 'health-pill warn';
-      pill.querySelector('.dot').className = 'dot dot-warn';
-      pill.querySelector('.health-label').textContent = 'warning';
-      setCardHealth(card, 'warn');
-      updateStatsSummary();
-    }
-  }
 }
 
 function wireQuickActions() {
