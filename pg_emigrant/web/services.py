@@ -132,6 +132,7 @@ def masked_config(cfg: ReplicatorConfig) -> dict[str, Any]:
         "source": _mask_endpoint(cfg.source),
         "target": _mask_endpoint(cfg.target),
         "schemas": cfg.schemas,
+        "exclude_schemas": cfg.exclude_schemas,
         "databases": cfg.databases,
         "exclude_databases": cfg.exclude_databases,
         "exclude_tables": cfg.exclude_tables,

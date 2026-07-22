@@ -36,6 +36,10 @@ class ReplicatorConfig(BaseModel):
     exclude_databases: list[str] = Field(
         default_factory=lambda: ["template0", "template1", "postgres"]
     )
+    # Only applies in auto-discover mode (schemas: []) — same relationship as
+    # exclude_databases has to databases: an explicit "schemas" list already
+    # says exactly what to migrate and always wins outright.
+    exclude_schemas: list[str] = Field(default_factory=list)
     exclude_tables: list[str] = Field(default_factory=list)
 
 

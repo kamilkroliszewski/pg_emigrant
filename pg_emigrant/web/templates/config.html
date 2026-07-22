@@ -36,6 +36,7 @@
       <span class="card-title"><i class="material-icons left">schema</i>Migration scope</span>
       <table class="kv-table">
         <tr><th>Schemas</th><td>{{ config_data.schemas if config_data.schemas else 'auto-discover' }}</td></tr>
+        <tr><th>Exclude schemas</th><td>{{ config_data.exclude_schemas if config_data.exclude_schemas else '—' }}</td></tr>
         <tr><th>Databases</th><td>{{ config_data.databases if config_data.databases else 'auto-discover' }}</td></tr>
         <tr><th>Exclude DBs</th><td>{{ config_data.exclude_databases }}</td></tr>
         <tr><th>Exclude tables</th><td>{{ config_data.exclude_tables if config_data.exclude_tables else '—' }} <span class="muted small">(inactive)</span></td></tr>
