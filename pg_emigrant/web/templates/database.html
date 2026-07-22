@@ -19,7 +19,7 @@
       <span class="lever"></span>
       Auto-refresh <span id="autorefresh-state" class="autorefresh-state off">Off</span>
     </label>
-    <a class="btn-small waves-effect blue darken-2" id="refresh-db">
+    <a class="btn-small waves-effect btn-primary-grad" id="refresh-db">
       <i class="material-icons left">refresh</i>Refresh
     </a>
   </div>
@@ -31,7 +31,7 @@
     <span class="card-title"><i class="material-icons left">bolt</i>Actions</span>
     <div class="action-buttons">
       {% for key, spec in actions.items() %}
-      <a class="btn waves-effect btn-action {{ 'red darken-1' if spec.destructive else 'blue-grey darken-1' }}"
+      <a class="btn waves-effect btn-action {{ 'red darken-1' if spec.destructive else 'btn-primary-grad' }}"
          data-action="{{ key }}"
          data-db="{{ database }}"
          data-label="{{ spec.label }}"
