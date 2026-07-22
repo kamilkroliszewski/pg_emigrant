@@ -390,8 +390,15 @@ target:
   sslmode: prefer
 
 # Schemas to replicate. Empty list = auto-discover every non-system schema,
-# independently per database.
+# independently per database (recommended — a schema you forgot to list,
+# e.g. one that isn't "public", is otherwise silently skipped). Use
+# exclude_schemas below to opt specific ones back out instead.
 schemas: []
+
+# Schemas skipped during auto-discovery. Only consulted when schemas: []
+# (an explicit schemas: list already says exactly what to include and always
+# wins outright — same relationship exclude_databases has to databases).
+exclude_schemas: []
 
 # Databases to migrate. Empty list = auto-discover all non-template databases
 # (minus exclude_databases).
@@ -432,7 +439,8 @@ sequence_sync_interval: 10
 | `source/target.password` | str | `""` | Password (kept in memory only; never logged). |
 | `source/target.dbname` | str | `postgres` | Admin/maintenance DB used for discovery and `CREATE DATABASE`. |
 | `source/target.sslmode` | str | `prefer` | libpq SSL mode. |
-| `schemas` | list[str] | `[]` | Schemas to replicate; empty = auto-discover per database. An explicit list is applied to **all** databases, and any source schema not in the list is logged as a skipped-schema **warning**. |
+| `schemas` | list[str] | `[]` | Schemas to replicate; empty = auto-discover per database. An explicit list is applied to **all** databases, and any source schema not in the list is logged as a skipped-schema **warning** — leave this empty and use `exclude_schemas` instead unless you specifically need a fixed list applied identically across every database. |
+| `exclude_schemas` | list[str] | `[]` | Schemas skipped during schema auto-discovery. Only consulted when `schemas: []` — an explicit `schemas` list already wins outright and isn't filtered by this. |
 | `databases` | list[str] | `[]` | Databases to migrate; empty = auto-discover. |
 | `exclude_databases` | list[str] | `[template0, template1, postgres]` | Skipped during database auto-discovery. |
 | `publication_name` | str | `pg_emigrant_pub` | Publication name prefix; `_<dbname>` appended. |
@@ -452,9 +460,13 @@ sequence_sync_interval: 10
 
 - **Databases:** every row in `pg_database` where `datistemplate = false`, minus
   `exclude_databases`. Provide an explicit `databases:` list to override.
-- **Schemas:** every schema **except** the always-excluded set below. With an
-  explicit `schemas:` list, that list wins (and uncovered source schemas are
-  warned about).
+- **Schemas:** every schema **except** the always-excluded set below and
+  anything listed in `exclude_schemas`, discovered independently per
+  database — so a schema that isn't `public` (e.g. an app-specific one like
+  `ucp`) is picked up automatically, with nothing to configure. Provide an
+  explicit `schemas:` list to override (applied identically to **every**
+  database, and `exclude_schemas` is then ignored — same relationship
+  `databases:` has to `exclude_databases`).
 
 Always-excluded schemas:
 

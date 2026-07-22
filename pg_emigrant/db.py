@@ -129,9 +129,14 @@ async def discover_schemas(
     """Return user-defined schemas present in the connected database.
 
     If ``cfg.schemas`` is non-empty those are returned directly (explicit list
-    always wins).  Otherwise every schema that is not a PostgreSQL internal
-    schema (``pg_catalog``, ``information_schema``, ``pg_toast``,
-    ``pg_temp_*``, ``pg_toast_temp_*``) is included.
+    always wins — ``exclude_schemas`` is NOT consulted in this branch, mirroring
+    how ``exclude_databases`` never trims an explicit ``databases`` list).
+    Otherwise every schema is auto-discovered: every non-system schema
+    (``pg_catalog``, ``information_schema``, ``pg_toast``, ``pg_temp_*``,
+    ``pg_toast_temp_*``, …) EXCEPT those listed in ``exclude_schemas`` is
+    included — so a schema like ``ucp`` that doesn't live in the default
+    ``public`` schema is picked up automatically with no config changes
+    needed, and ``exclude_schemas`` is only for opting specific ones back out.
     """
     if cfg.schemas:
         # Warn about schemas that exist in the source database but are not in
@@ -168,7 +173,7 @@ async def discover_schemas(
           AND nspname != ALL($1::text[])
         ORDER BY nspname
         """,
-        list(_SYSTEM_SCHEMAS),
+        list(_SYSTEM_SCHEMAS | set(cfg.exclude_schemas)),
     )
     schemas = [r["nspname"] for r in rows]
     log.info("Discovered schemas: %s", schemas)

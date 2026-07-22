@@ -12,8 +12,13 @@ target:
   password: CHANGE_ME
   dbname: postgres
 
-schemas:
-  - public
+# Leave empty to auto-discover every non-system schema, independently per
+# database (recommended — avoids silently skipping a schema you forgot to
+# list, e.g. one that isn't "public"). Use exclude_schemas below to opt
+# specific ones back out instead of hand-listing every schema to include.
+schemas: []
+
+exclude_schemas: []
 
 # Leave empty to auto-discover all non-system databases
 databases: []
