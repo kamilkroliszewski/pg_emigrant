@@ -255,6 +255,24 @@ subscriber would reject it.
     objects.
   - **Target:** ability to `CREATE DATABASE`, create schema objects, and
     `CREATE SUBSCRIPTION` (superuser, or the relevant privileges).
+- **`source.host` (and `target.host`) must resolve to the SAME physical
+  instance for every connection pg_emigrant opens over the whole bootstrap.**
+  If it's a Patroni cluster, point it at the leader-only endpoint (Patroni's
+  own REST API-driven VIP/HAProxy port, or a direct connection to the current
+  primary) — **never** a load-balanced or read-replica endpoint that can
+  round-robin across nodes. The replication slot is created on whichever
+  instance the very first connection reaches; if a later connection (e.g. the
+  one issuing `CREATE SUBSCRIPTION`) reaches a *different* node — because of a
+  failover/switchover mid-bootstrap, or because the endpoint balances reads
+  across replicas — the publication is still visible there (ordinary catalog
+  rows, carried by physical streaming) but the slot is not (slots are local
+  storage on one instance). `CREATE SUBSCRIPTION` itself does **not** validate
+  that the slot exists — PostgreSQL only discovers this later, when the apply
+  worker tries to start streaming in the background, logging a bare
+  `replication slot "..." does not exist` in the *source's* own log with
+  nothing on the client that issued the DDL. pg_emigrant detects this
+  specific case immediately after creating the subscription and fails
+  bootstrap loudly instead — see [Special handling](#special-handling--edge-cases).
 - **Source** `postgresql.conf`:
   ```ini
   wal_level = logical
@@ -793,6 +811,28 @@ the same way a new row does. Nothing to remember, nothing to run by hand.
 
 pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
 
+- **A subscription attached to a slot that turns out to be missing fails
+  bootstrap immediately, instead of silently.** `CREATE SUBSCRIPTION … WITH
+  (create_slot = false, slot_name = X)` — the statement pg_emigrant issues to
+  attach to the slot it created just before the data copy — does **not**
+  validate that slot `X` actually exists on the source; PostgreSQL only
+  discovers a missing slot later, when the apply worker tries to start
+  streaming, in the background, and logs a bare
+  `replication slot "X" does not exist` on the **source**, invisible to
+  whatever issued the `CREATE SUBSCRIPTION`. (Verified directly: the SQL
+  statement returns success even when the slot has already been dropped.)
+  This can happen when `source.host` resolves to a load-balanced/failover
+  endpoint that reached a different physical node than the one the slot was
+  created on moments earlier (see [Requirements](#requirements)). pg_emigrant
+  re-checks `pg_replication_slots` on the source immediately after `CREATE
+  SUBSCRIPTION` returns and raises immediately if the slot isn't there,
+  turning it into a loud, actionable bootstrap failure. If this happens:
+  `pg_emigrant status --database <db>` to confirm, then either
+  `pg_emigrant reinit-sync --database <db>` (recreates the subscription with
+  a fresh slot — data committed since the original slot's last confirmed LSN
+  is not recoverable, since the slot never streamed anything) or, if nothing
+  depends on this subscription yet, `pg_emigrant teardown --database <db>`
+  followed by a clean re-`bootstrap`.
 - **Bootstrap refuses to run twice.** If the target already has this
   database's subscription, `bootstrap` aborts that database with a clear
   message instead of proceeding — a re-run would otherwise terminate the live

@@ -521,6 +521,46 @@ async def create_subscription(
             ) from exc
         log.info("Created subscription %s in %s", sub, dbname)
 
+        if not create_slot:
+            # CREATE SUBSCRIPTION succeeded because the PUBLICATION exists on
+            # whatever server "cfg.source" resolved to for THIS connection —
+            # but the slot it just attached to was created moments earlier by
+            # a SEPARATE connection (create_replication_slot_with_snapshot).
+            # If "cfg.source" is a Patroni VIP/HAProxy/DNS endpoint and a
+            # failover/switchover happened in between (or routes reads to a
+            # different node than the leader), that earlier connection and
+            # this one can land on DIFFERENT physical instances — the
+            # publication is visible on both (ordinary catalog rows, carried
+            # by physical streaming), but a logical replication slot is
+            # local storage on ONE instance and does not exist on the other.
+            # The apply worker would then fail forever in the background
+            # with a bare "replication slot ... does not exist", visible only
+            # in the source's own postgres log — silent from pg_emigrant's
+            # point of view. Verify right now, while we can still fail loudly
+            # and specifically instead of leaving that ticking time bomb.
+            async with connect(cfg.source, dbname) as verify_conn:
+                slot_exists = await verify_conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                    sub,
+                )
+            if not slot_exists:
+                raise RuntimeError(
+                    f"Subscription {sub} was created in {dbname}, but its replication "
+                    f"slot is NOT visible on the source right now. The apply worker "
+                    f"would fail indefinitely in the background with 'replication slot "
+                    f"\"{sub}\" does not exist' — visible only in the SOURCE's own "
+                    f"postgres/Patroni log, not here. Most likely cause: 'source' in "
+                    f"config.yaml resolves to a load-balanced endpoint (VIP / HAProxy / "
+                    f"DNS round-robin) and this connection landed on a DIFFERENT "
+                    f"physical node than the one the slot was created on moments ago — "
+                    f"e.g. a Patroni failover/switchover during the data copy, or reads "
+                    f"being routed to a replica. Point 'source' at a fixed endpoint that "
+                    f"always resolves to the current primary (Patroni's leader-only "
+                    f"connection port, never a load-balanced/read-replica one), then run "
+                    f"'pg_emigrant teardown --database {dbname}' and re-run bootstrap."
+                )
+            log.debug("Verified slot %s still exists on source after subscribing", sub)
+
 
 async def drop_subscription(
     cfg: ReplicatorConfig,
