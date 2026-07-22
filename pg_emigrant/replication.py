@@ -840,6 +840,15 @@ async def get_all_subscription_status(cfg: ReplicatorConfig) -> list[dict]:
     the target (any database) returns the status of all per-database
     subscriptions at once — no need to connect to each database separately.
     Callers match rows back to a database via ``sub_name(cfg, dbname)``.
+
+    One row per WORKER, not per subscription: a subscription normally has a
+    single row (the main apply worker, ``relid IS NULL``), but gains extra
+    rows — with ``relid`` set — while a tablesync worker is copying a table,
+    or permanently under ``streaming = parallel``. Callers that only look at
+    the first row per subscription (e.g. the dashboard's health/lag display)
+    need that first row to reliably be the main apply worker, not a
+    transient tablesync row with an unrelated (and possibly NULL) LSN — so
+    it's ordered here rather than left to the view's unspecified scan order.
     """
     async with connect(cfg.target) as conn:
         rows = await conn.fetch(
@@ -857,7 +866,8 @@ async def get_all_subscription_status(cfg: ReplicatorConfig) -> list[dict]:
                 pg_size_pretty(
                     pg_wal_lsn_diff(latest_end_lsn, received_lsn)
                 ) AS lag
-            FROM pg_stat_subscription;
+            FROM pg_stat_subscription
+            ORDER BY subname, (relid IS NULL) DESC, pid;
             """
         )
         return [dict(r) for r in rows]
