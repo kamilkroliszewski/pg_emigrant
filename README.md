@@ -812,27 +812,38 @@ the same way a new row does. Nothing to remember, nothing to run by hand.
 pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
 
 - **A subscription attached to a slot that turns out to be missing fails
-  bootstrap immediately, instead of silently.** `CREATE SUBSCRIPTION … WITH
-  (create_slot = false, slot_name = X)` — the statement pg_emigrant issues to
-  attach to the slot it created just before the data copy — does **not**
-  validate that slot `X` actually exists on the source; PostgreSQL only
-  discovers a missing slot later, when the apply worker tries to start
-  streaming, in the background, and logs a bare
-  `replication slot "X" does not exist` on the **source**, invisible to
-  whatever issued the `CREATE SUBSCRIPTION`. (Verified directly: the SQL
-  statement returns success even when the slot has already been dropped.)
-  This can happen when `source.host` resolves to a load-balanced/failover
-  endpoint that reached a different physical node than the one the slot was
-  created on moments earlier (see [Requirements](#requirements)). pg_emigrant
-  re-checks `pg_replication_slots` on the source immediately after `CREATE
-  SUBSCRIPTION` returns and raises immediately if the slot isn't there,
-  turning it into a loud, actionable bootstrap failure. If this happens:
-  `pg_emigrant status --database <db>` to confirm, then either
-  `pg_emigrant reinit-sync --database <db>` (recreates the subscription with
-  a fresh slot — data committed since the original slot's last confirmed LSN
-  is not recoverable, since the slot never streamed anything) or, if nothing
-  depends on this subscription yet, `pg_emigrant teardown --database <db>`
-  followed by a clean re-`bootstrap`.
+  immediately, instead of silently.** `CREATE SUBSCRIPTION` — both with
+  `create_slot = true` (`reinit-sync`'s from-scratch path) and with
+  `create_slot = false, slot_name = X` (bootstrap's attach-to-an-
+  already-created-slot path) — does **not** validate that the referenced
+  slot actually exists; PostgreSQL only discovers a missing slot later, when
+  the apply worker tries to start streaming, in the background, and logs a
+  bare `replication slot "X" does not exist` on the **source**, invisible to
+  whatever issued the `CREATE SUBSCRIPTION` (verified directly against a
+  live server: the statement returns success even when the slot has already
+  been dropped). This can happen when `source.host` (or `target.host`)
+  resolves to a load-balanced/failover endpoint that reached a *different*
+  physical node than the one the slot lives on — a Patroni failover/
+  switchover in between, reads routed to a replica, or any other
+  multi-node routing (see [Requirements](#requirements)). pg_emigrant
+  re-checks `pg_replication_slots` on the source immediately after every
+  `CREATE SUBSCRIPTION` and raises immediately if the slot isn't there,
+  quoting exactly which node the verifying connection reached (primary or
+  standby, and its address) so the failure carries hard evidence instead of
+  requiring guesswork. If this happens: `pg_emigrant status --database <db>`
+  to confirm, then either `pg_emigrant reinit-sync --database <db>`
+  (recreates the subscription with a fresh slot — data committed since the
+  original slot's last confirmed LSN is not recoverable, since the slot
+  never streamed anything) or, if nothing depends on this subscription yet,
+  `pg_emigrant teardown --database <db>` followed by a clean re-`bootstrap`.
+  **If this keeps recurring even across `reinit-sync` attempts**, the
+  endpoint itself is the problem, not a one-off failover: confirm
+  `source.host:port` in `config.yaml` is a single fixed address that always
+  reaches the SAME physical instance (run
+  `SELECT pg_is_in_recovery(), inet_server_addr();` against it several times
+  in a row — it must return identically every time), and rule out a
+  connection pooler (PgBouncer, …) sitting in front of it in a pooling mode
+  that doesn't support the replication protocol.
 - **Bootstrap refuses to run twice.** If the target already has this
   database's subscription, `bootstrap` aborts that database with a clear
   message instead of proceeding — a re-run would otherwise terminate the live
