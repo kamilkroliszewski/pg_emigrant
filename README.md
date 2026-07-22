@@ -41,6 +41,7 @@ Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
   - [`reinit-sync`](#pg_emigrant-reinit-sync)
 - [Output formats](#output-formats)
 - [Web GUI](#web-gui)
+- [New tables created after bootstrap](#new-tables-created-after-bootstrap)
 - [Special handling & edge cases](#special-handling--edge-cases)
 - [Typical migration workflow](#typical-migration-workflow)
 - [Limitations](#limitations)
@@ -63,11 +64,15 @@ to the target over the WAL stream automatically.
 
 **2. Steady state (until cutover).** While the application keeps writing to the
 source, you run `pg_emigrant sync-sequences --loop` to keep sequence values in
-step (logical replication does **not** replicate sequence advances), use
-`pg_emigrant status` to watch lag, and optionally `pg_emigrant detect-ddl` to catch
-and repair schema changes made on the source after bootstrap. If the source is a
-Patroni cluster and a failover/switchover happens, `pg_emigrant reinit-sync`
-repairs the broken slot/subscription without re-copying data.
+step (logical replication does **not** replicate sequence advances) — this same
+process also picks up **tables created on the source after bootstrap**
+automatically (publication membership, target-side table creation, subscription
+refresh — no separate command needed, see [below](#new-tables-created-after-bootstrap)),
+use `pg_emigrant status` to watch lag, and optionally `pg_emigrant detect-ddl` to
+catch and repair other schema changes (columns, indexes, functions, …) made on
+the source after bootstrap. If the source is a Patroni cluster and a
+failover/switchover happens, `pg_emigrant reinit-sync` repairs the broken
+slot/subscription without re-copying data.
 
 At cutover you stop replication, run a final sequence sync, point the application
 at the target, and (optionally) tear the replication objects down.
@@ -231,9 +236,17 @@ subscriber would reject it.
 ## Requirements
 
 - **Python 3.11+**
-- **PostgreSQL 15+ on both servers.** The publication uses
-  `CREATE PUBLICATION … FOR TABLES IN SCHEMA`, which requires PostgreSQL 15 or
-  newer. (Schema-level publications are the only mode used.)
+- **PostgreSQL 13+ source, 15+ recommended; any supported version as target.**
+  On a 15+ source the publication uses `CREATE PUBLICATION … FOR TABLES IN
+  SCHEMA`, which automatically includes tables created later in an
+  already-published schema. On a 13/14 source that syntax doesn't exist, so
+  pg_emigrant enumerates the current tables with `FOR TABLE` instead. Either
+  way, **no manual action is needed for tables created after bootstrap** —
+  see [New tables created after bootstrap](#new-tables-created-after-bootstrap).
+  Version-dependent catalog differences (`daticulocale`/`datlocale`,
+  `colliculocale`/`colllocale`, PG17's builtin locale provider, PG16+ view
+  deparse changes) are handled automatically — verified end-to-end on a
+  PG 14 → PG 18 migration.
 - A migration role on each server with sufficient privileges:
   - **Source:** `REPLICATION` privilege — required for two things: creating the
     publication/replication slot (`CREATE_REPLICATION_SLOT`, issued directly by
@@ -501,6 +514,10 @@ primary-key collisions after cutover, because native logical replication never
 replicates sequence advances. Values **only ever move forward** — the target is
 never decreased.
 
+Every invocation — one-pass or `--loop` — **also** reconciles tables created on
+the source after bootstrap into replication, with no separate command; see
+[New tables created after bootstrap](#new-tables-created-after-bootstrap).
+
 ```bash
 pg_emigrant sync-sequences                       # one pass, all databases
 pg_emigrant sync-sequences --database myapp       # one pass, one database
@@ -510,9 +527,10 @@ pg_emigrant sync-sequences --database myapp --margin 1000  # final cutover sync
 ```
 
 - **One-pass mode** prints a results table (rich/simple/json) and exits.
-- **`--loop`** runs `sync_sequences_once` for every database concurrently, each on
-  its own `sequence_sync_interval` cycle, forever (recommended during a live
-  migration). Errors are logged and the loop continues.
+- **`--loop`** runs `sync_sequences_once` **and** `sync_new_tables` for every
+  database concurrently, each on its own `sequence_sync_interval` cycle,
+  forever (recommended during a live migration). Errors are logged and the
+  loop continues.
 - **`--margin N`** advances a sequence to `source_value + N` instead of exactly
   `source_value` — a safety buffer for the **last**, authoritative sync at
   cutover (see [Special handling](#special-handling--edge-cases)). Rejected
@@ -726,6 +744,48 @@ authentication**. Do **not** expose it on a public interface without putting a
 reverse proxy with authentication (and ideally TLS) in front of it. Passwords
 from `config.yaml` are masked in the UI and never transmitted to the browser, but
 the GUI can still act on the configured servers.
+
+---
+
+## New tables created after bootstrap
+
+Logical replication itself is fully automatic for **rows** — any `INSERT` /
+`UPDATE` / `DELETE` on an already-published table streams to the target with no
+action needed. **New tables are a different story**, and PostgreSQL itself
+requires explicit steps in every configuration:
+
+- On a **13/14 source**, `CREATE PUBLICATION … FOR TABLES IN SCHEMA` doesn't
+  exist, so the publication created at bootstrap is a frozen list of the
+  tables that existed then — a table created afterwards is invisible to it
+  until explicitly added with `ALTER PUBLICATION … ADD TABLE`.
+- On a **15+ source running in auto-discover mode** (`schemas: []` in
+  config), a schema created after bootstrap is likewise outside the
+  publication's schema list until explicitly added with
+  `ALTER PUBLICATION … ADD TABLES IN SCHEMA`.
+- On **every** PostgreSQL version, even once a table is a publication member,
+  the target does not start streaming it until
+  `ALTER SUBSCRIPTION … REFRESH PUBLICATION` runs — and the table must
+  already exist as an object on the target, or its tablesync worker fails and
+  retries forever.
+
+pg_emigrant closes all three gaps **automatically** — no `ALTER PUBLICATION`,
+no `detect-ddl --apply`, no manual refresh. `pg_emigrant sync-sequences`
+(both one-pass and `--loop` mode) also runs `sync_new_tables` for every
+database, which:
+
+1. Adds any new tables (13/14) or new schemas (15+ auto-discover mode) to the
+   publication.
+2. Creates the table on the target if it doesn't exist there yet.
+3. Refreshes the subscription with `copy_data = true`, so PostgreSQL's own
+   tablesync mechanism performs the initial copy for the new table —
+   coordinated internally with the replication slot, so there is no
+   WAL-replay conflict of the kind a manually-issued `COPY` would cause.
+
+As long as `pg_emigrant sync-sequences --loop` is running for the whole
+replication window (already the documented step for keeping sequences in
+sync — see [Typical migration workflow](#typical-migration-workflow)), a table
+created on the source mid-migration just appears on the target with its data,
+the same way a new row does. Nothing to remember, nothing to run by hand.
 
 ---
 

@@ -92,15 +92,24 @@ async def ensure_database_exists(cfg: ReplicatorConfig, dbname: str) -> None:
         )
         if not exists:
             async with connect(cfg.source, dbname) as src:
-                # PostgreSQL 17 renamed pg_database.daticulocale to datlocale
-                # (and added the 'b' builtin locale provider) — querying the
-                # old column name unconditionally fails outright on 17+.
+                # pg_database's locale columns are version-dependent:
+                # PG ≤14 has neither datlocprovider nor an ICU-locale column
+                # (libc only), PG15 added datlocprovider + daticulocale, and
+                # PG17 renamed daticulocale to datlocale (plus the 'b'
+                # builtin provider).  Querying the wrong shape is an
+                # UndefinedColumnError.
                 src_major = src.get_server_version().major
-                loc_col = "datlocale" if src_major >= 17 else "daticulocale"
+                if src_major >= 17:
+                    prov_cols = ("datlocprovider::text AS locprovider,"
+                                 " datlocale AS provider_locale")
+                elif src_major >= 15:
+                    prov_cols = ("datlocprovider::text AS locprovider,"
+                                 " daticulocale AS provider_locale")
+                else:
+                    prov_cols = "'c' AS locprovider, NULL::text AS provider_locale"
                 meta = await src.fetchrow(
                     "SELECT pg_encoding_to_char(encoding) AS encoding,"
-                    " datcollate, datctype, datlocprovider::text AS locprovider,"
-                    f" {loc_col} AS provider_locale"
+                    f" datcollate, datctype, {prov_cols}"
                     " FROM pg_database WHERE datname = current_database()"
                 )
             opts = [f"ENCODING {ql(meta['encoding'])}"]

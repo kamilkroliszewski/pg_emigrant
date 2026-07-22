@@ -171,6 +171,7 @@ def sync_sequences(
     import json as _json
 
     from pg_emigrant.db import discover_databases
+    from pg_emigrant.replication import run_new_table_sync_loop
     from pg_emigrant.sequence_sync import run_sequence_sync_loop, sync_sequences_once
 
     cfg = load_config(config)
@@ -187,9 +188,27 @@ def sync_sequences(
         dbs = [database] if database else await discover_databases(cfg)
 
         if loop:
+            # --loop is the documented "keep this running for the whole
+            # replication window" process, so it also picks up tables
+            # created on the source after bootstrap (ALTER PUBLICATION /
+            # new-table creation on target / subscription refresh) — see
+            # sync_new_tables(). This needs no separate command or manual
+            # step from the user.
             tasks = [run_sequence_sync_loop(cfg, db) for db in dbs]
+            tasks += [run_new_table_sync_loop(cfg, db) for db in dbs]
             await asyncio.gather(*tasks)
             return
+
+        # One-shot mode also reconciles newly created tables — including
+        # right before a final cutover sync, where leaving a just-created
+        # table unreplicated would be worse than catching it up.
+        from pg_emigrant.replication import sync_new_tables
+        new_table_actions = await asyncio.gather(
+            *[sync_new_tables(cfg, db) for db in dbs]
+        )
+        for db, actions in zip(dbs, new_table_actions):
+            for action in actions:
+                console.print(f"  [{db}] {action}")
 
         reports = await asyncio.gather(
             *[sync_sequences_once(cfg, db, margin=margin) for db in dbs]

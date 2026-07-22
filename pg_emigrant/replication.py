@@ -328,6 +328,63 @@ async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
         )
 
 
+async def _publishable_tables(
+    conn: asyncpg.Connection, schemas: list[str]
+) -> set[tuple[str, str]]:
+    """(schema, table) pairs in *schemas* eligible for direct publication
+    membership: ordinary tables and partitioned parents.  Partition children
+    are excluded — they replicate through their root and would duplicate
+    (or conflict with) it if published individually."""
+    rows = await conn.fetch(
+        """
+        SELECT n.nspname, c.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY($1::text[])
+          AND c.relkind IN ('r', 'p')
+          AND NOT c.relispartition
+        """,
+        schemas,
+    )
+    return {(r["nspname"], r["relname"]) for r in rows}
+
+
+async def _create_publication_on(
+    conn, pub: str, schemas: list[str], dbname: str
+) -> None:
+    """CREATE PUBLICATION for all tables in *schemas*, source-version-aware.
+
+    PostgreSQL 15+ supports ``FOR TABLES IN SCHEMA`` (which auto-includes
+    tables created later).  PG 13/14 predate that syntax, so there the
+    current tables are enumerated with ``FOR TABLE`` instead. Either way,
+    tables (and, on <15, schemas) created after this point are picked up
+    automatically by :func:`sync_new_tables`, which runs on every tick of
+    ``sync-sequences --loop`` — no manual ``ALTER PUBLICATION`` needed.
+    """
+    major = conn.get_server_version().major
+    if major >= 15:
+        schema_list = ", ".join(qi(s) for s in schemas)
+        await conn.execute(
+            f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
+        )
+        return
+
+    table_set = await _publishable_tables(conn, schemas)
+    if table_set:
+        table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in sorted(table_set))
+        await conn.execute(f"CREATE PUBLICATION {qi(pub)} FOR TABLE {table_list};")
+    else:
+        await conn.execute(f"CREATE PUBLICATION {qi(pub)};")
+    log.info(
+        "Source database %s is PostgreSQL %d (< 15): publication %s enumerates "
+        "the %d current top-level tables (FOR TABLES IN SCHEMA is unavailable "
+        "before PG15). Tables and schemas created later are picked up "
+        "automatically by the 'sync-sequences --loop' process — no manual "
+        "action needed as long as that loop is running.",
+        dbname, major, pub, len(table_set),
+    )
+
+
 async def create_publication(
     cfg: ReplicatorConfig,
     dbname: str,
@@ -348,11 +405,7 @@ async def create_publication(
             log.info("Publication %s already exists in %s", pub, dbname)
             return
 
-        # Publication for all tables in the listed schemas
-        schema_list = ", ".join(qi(s) for s in resolved_schemas)
-        await conn.execute(
-            f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
-        )
+        await _create_publication_on(conn, pub, resolved_schemas, dbname)
         log.info("Created publication %s in %s for schemas %s", pub, dbname, resolved_schemas)
 
 
@@ -620,6 +673,208 @@ async def refresh_subscription(
         log.info("Refreshed subscription %s in %s (copy_data=%s)", sub, dbname, copy_data_val)
 
 
+async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
+    """Bring tables created on the source AFTER bootstrap into replication —
+    fully automatically, with no manual ``ALTER PUBLICATION`` / ``detect-ddl
+    --apply`` step required.
+
+    PostgreSQL never auto-publishes a new table in two situations, and never
+    auto-streams a newly published table to an existing subscriber at all:
+
+    * On a **source older than PostgreSQL 15**, ``FOR TABLES IN SCHEMA``
+      doesn't exist, so the publication created at bootstrap is a frozen
+      snapshot of the tables that existed then (see
+      :func:`_create_publication_on`) — a table created afterwards is
+      invisible to the publication until explicitly ``ADD TABLE``'d.
+    * On a **15+ source running in auto-discover mode** (empty
+      ``cfg.schemas``), a schema created after bootstrap is likewise outside
+      the publication's schema list until explicitly ``ADD TABLES IN
+      SCHEMA``'d — ``FOR TABLES IN SCHEMA`` only auto-covers *new tables in
+      an already-published schema*.
+    * On **every** version, even once a table is a publication member,
+      logical replication does not start streaming it to an already-created
+      subscription until ``ALTER SUBSCRIPTION … REFRESH PUBLICATION`` runs —
+      and that table must physically exist on the target first, or the
+      subscription's tablesync worker fails and retries forever.
+
+    This function closes all three gaps in one pass: it adds any new tables
+    (<15) or schemas (auto-discover), creates the physical table on the
+    target for anything the publication now covers that the target
+    subscription doesn't know about yet, and refreshes the subscription with
+    ``copy_data = true`` so PostgreSQL's own tablesync mechanism performs the
+    initial copy — no manually-triggered command needed as long as this runs
+    on a recurring basis, which is why it is folded into
+    ``sync-sequences --loop`` (the process already documented as the one to
+    keep running for the whole replication window).
+
+    A no-op (returns ``[]``) when this database has no publication yet
+    (replication not set up) — callers loop over every database and not all
+    of them may be bootstrapped.
+
+    Returns a list of human-readable action descriptions (empty when there
+    was nothing to do); callers log/display these.
+    """
+    from pg_emigrant.ddl_detector import generate_full_table_ddl
+
+    pub = pub_name(cfg, dbname)
+    sub = sub_name(cfg, dbname)
+    actions: list[str] = []
+
+    async with connect(cfg.source, dbname) as src:
+        pub_exists = await src.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", pub
+        )
+        if not pub_exists:
+            return actions
+
+        schemas = await discover_schemas(src, cfg)
+        major = src.get_server_version().major
+
+        published_rows = await src.fetch(
+            "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1",
+            pub,
+        )
+        published_tables = {(r["schemaname"], r["tablename"]) for r in published_rows}
+
+        if major < 15:
+            current_tables = await _publishable_tables(src, schemas)
+            new_tables = sorted(current_tables - published_tables)
+            if new_tables:
+                table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in new_tables)
+                await src.execute(f"ALTER PUBLICATION {qi(pub)} ADD TABLE {table_list};")
+                actions.append(
+                    f"Added {len(new_tables)} new table(s) to publication {pub}: "
+                    + ", ".join(f"{s}.{t}" for s, t in new_tables)
+                )
+                log.info(
+                    "sync_new_tables [%s]: added %d new table(s) to publication %s "
+                    "(PostgreSQL %d source has no FOR TABLES IN SCHEMA auto-inclusion): %s",
+                    dbname, len(new_tables), pub, major, new_tables,
+                )
+                published_tables |= set(new_tables)
+        else:
+            pub_schema_rows = await src.fetch(
+                """
+                SELECT n.nspname FROM pg_publication_namespace pn
+                JOIN pg_namespace n ON n.oid = pn.pnnspid
+                JOIN pg_publication p ON p.oid = pn.pnpubid
+                WHERE p.pubname = $1
+                """,
+                pub,
+            )
+            published_schemas = {r["nspname"] for r in pub_schema_rows}
+            new_schemas = sorted(set(schemas) - published_schemas)
+            if new_schemas:
+                schema_list = ", ".join(qi(s) for s in new_schemas)
+                await src.execute(
+                    f"ALTER PUBLICATION {qi(pub)} ADD TABLES IN SCHEMA {schema_list};"
+                )
+                actions.append(f"Added new schema(s) to publication {pub}: {', '.join(new_schemas)}")
+                log.info(
+                    "sync_new_tables [%s]: added schema(s) %s to publication %s (auto-discover mode)",
+                    dbname, new_schemas, pub,
+                )
+                published_rows = await src.fetch(
+                    "SELECT schemaname, tablename FROM pg_publication_tables"
+                    " WHERE pubname = $1",
+                    pub,
+                )
+                published_tables = {(r["schemaname"], r["tablename"]) for r in published_rows}
+            # Tables created later in an already-published schema join the
+            # publication automatically (FOR TABLES IN SCHEMA) — no action.
+
+    # Whatever is now published but not yet known to the target subscription
+    # needs its table created there (if missing) and the subscription
+    # refreshed so PostgreSQL starts its tablesync.
+    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+        tracked_rows = await tgt.fetch(
+            """
+            SELECT n.nspname, c.relname
+            FROM pg_subscription_rel sr
+            JOIN pg_subscription s ON s.oid = sr.srsubid
+            JOIN pg_class c ON c.oid = sr.srrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE s.subname = $1
+            """,
+            sub,
+        )
+        tracked_tables = {(r["nspname"], r["relname"]) for r in tracked_rows}
+        untracked = sorted(published_tables - tracked_tables)
+        if not untracked:
+            return actions
+
+        tgt_schema_rows = await tgt.fetch(
+            "SELECT nspname FROM pg_namespace WHERE nspname = ANY($1::text[])",
+            list({s for s, _ in untracked}),
+        )
+        tgt_schemas = {r["nspname"] for r in tgt_schema_rows}
+        tgt_table_rows = await tgt.fetch(
+            """
+            SELECT n.nspname, c.relname
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY($1::text[]) AND c.relkind IN ('r', 'p')
+            """,
+            list({s for s, _ in untracked}),
+        )
+        tgt_existing = {(r["nspname"], r["relname"]) for r in tgt_table_rows}
+
+        created: list[str] = []
+        for schema, table in untracked:
+            if schema not in tgt_schemas:
+                await tgt.execute(f"CREATE SCHEMA IF NOT EXISTS {qi(schema)};")
+                tgt_schemas.add(schema)
+            if (schema, table) not in tgt_existing:
+                try:
+                    table_ddl = await generate_full_table_ddl(src, schema, table)
+                    await tgt.execute(table_ddl)
+                    created.append(f"{schema}.{table}")
+                except Exception as exc:
+                    log.warning(
+                        "sync_new_tables [%s]: could not create %s.%s on target — %s. "
+                        "Its tablesync will keep failing until this is fixed — inspect "
+                        "and run 'detect-ddl --apply' once resolved.",
+                        dbname, schema, table, exc,
+                    )
+
+        if created:
+            actions.append(f"Created {len(created)} new table(s) on target: {', '.join(created)}")
+            log.info("sync_new_tables [%s]: created new table(s) on target: %s", dbname, created)
+
+    try:
+        await refresh_subscription(cfg, dbname, copy_data=True)
+        actions.append(
+            f"Refreshed subscription {sub} — PostgreSQL will tablesync "
+            f"{len(untracked)} newly published table(s)"
+        )
+        log.info(
+            "sync_new_tables [%s]: refreshed subscription %s for %d new table(s): %s",
+            dbname, sub, len(untracked), untracked,
+        )
+    except Exception as exc:
+        log.warning(
+            "sync_new_tables [%s]: could not refresh subscription %s — %s. Will "
+            "retry on the next loop iteration.",
+            dbname, sub, exc,
+        )
+
+    return actions
+
+
+async def run_new_table_sync_loop(cfg: ReplicatorConfig, dbname: str) -> None:
+    """Continuously pick up newly created source tables at the configured
+    interval — the counterpart of :func:`sync_new_tables` for ``--loop``."""
+    interval = cfg.sequence_sync_interval
+    log.info("Starting new-table sync loop for %s (every %ds)", dbname, interval)
+    while True:
+        try:
+            actions = await sync_new_tables(cfg, dbname)
+            for action in actions:
+                log.info("[%s] %s", dbname, action)
+        except Exception as exc:
+            log.error("New-table sync error for %s: %s", dbname, exc)
+        await asyncio.sleep(interval)
+
+
 async def get_replication_slots(
     cfg: ReplicatorConfig,
     dbname: str,
@@ -709,10 +964,7 @@ async def reinit_sync(
             # in the disaster-recovery path.  Resolve the actual schema list
             # the same way bootstrap does.
             schemas = await discover_schemas(conn, cfg)
-            schema_list = ", ".join(qi(s) for s in schemas)
-            await conn.execute(
-                f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
-            )
+            await _create_publication_on(conn, pub, schemas, dbname)
         actions.append(f"Recreated publication '{pub}' on source")
         log.info("reinit_sync [%s]: recreated publication %s", dbname, pub)
     else:
