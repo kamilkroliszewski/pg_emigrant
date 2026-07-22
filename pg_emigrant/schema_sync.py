@@ -1110,9 +1110,16 @@ async def sync_collations(
     libc collations need the OS locale installed — failures are logged as
     warnings (platform prerequisites, same policy as database locales).
     """
-    # PostgreSQL 17 renamed pg_collation.colliculocale to colllocale.
+    # The ICU locale column moved twice: PG ≤14 stores it in collcollate
+    # (shared with the libc locale), PG15 added colliculocale, PG17 renamed
+    # it to colllocale.  Querying the wrong one is an UndefinedColumnError.
     src_major = source_conn.get_server_version().major
-    loc_col = "c.colllocale" if src_major >= 17 else "c.colliculocale"
+    if src_major >= 17:
+        loc_col = "c.colllocale"
+    elif src_major >= 15:
+        loc_col = "c.colliculocale"
+    else:
+        loc_col = "c.collcollate"
     rows = await source_conn.fetch(
         _COLLATIONS_SQL_TMPL.format(loc_col=loc_col), schemas
     )

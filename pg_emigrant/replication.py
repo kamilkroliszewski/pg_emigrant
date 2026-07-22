@@ -328,6 +328,54 @@ async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
         )
 
 
+async def _create_publication_on(
+    conn, pub: str, schemas: list[str], dbname: str
+) -> None:
+    """CREATE PUBLICATION for all tables in *schemas*, source-version-aware.
+
+    PostgreSQL 15+ supports ``FOR TABLES IN SCHEMA`` (which auto-includes
+    tables created later).  PG 13/14 predate that syntax, so there the
+    current tables are enumerated with ``FOR TABLE`` instead — partitioned
+    parents cover their partitions, classic-inheritance children are listed
+    individually.  Tables created on the source AFTER this point are NOT
+    auto-published on <15 and must be added with ``ALTER PUBLICATION … ADD
+    TABLE`` (a warning is logged).
+    """
+    major = conn.get_server_version().major
+    if major >= 15:
+        schema_list = ", ".join(qi(s) for s in schemas)
+        await conn.execute(
+            f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
+        )
+        return
+
+    rows = await conn.fetch(
+        """
+        SELECT n.nspname, c.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY($1::text[])
+          AND c.relkind IN ('r', 'p')
+          AND NOT c.relispartition
+        ORDER BY 1, 2
+        """,
+        schemas,
+    )
+    if rows:
+        table_list = ", ".join(f"{qi(r['nspname'])}.{qi(r['relname'])}" for r in rows)
+        await conn.execute(f"CREATE PUBLICATION {qi(pub)} FOR TABLE {table_list};")
+    else:
+        await conn.execute(f"CREATE PUBLICATION {qi(pub)};")
+    log.warning(
+        "Source database %s is PostgreSQL %d (< 15): publication %s enumerates "
+        "the %d current top-level tables (FOR TABLES IN SCHEMA is unavailable). "
+        "Tables created on the source AFTER this point are NOT auto-published — "
+        "add them on the source with: ALTER PUBLICATION %s ADD TABLE <table>; "
+        "then run 'detect-ddl --apply' and refresh the subscription.",
+        dbname, major, pub, len(rows), pub,
+    )
+
+
 async def create_publication(
     cfg: ReplicatorConfig,
     dbname: str,
@@ -348,11 +396,7 @@ async def create_publication(
             log.info("Publication %s already exists in %s", pub, dbname)
             return
 
-        # Publication for all tables in the listed schemas
-        schema_list = ", ".join(qi(s) for s in resolved_schemas)
-        await conn.execute(
-            f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
-        )
+        await _create_publication_on(conn, pub, resolved_schemas, dbname)
         log.info("Created publication %s in %s for schemas %s", pub, dbname, resolved_schemas)
 
 
@@ -709,10 +753,7 @@ async def reinit_sync(
             # in the disaster-recovery path.  Resolve the actual schema list
             # the same way bootstrap does.
             schemas = await discover_schemas(conn, cfg)
-            schema_list = ", ".join(qi(s) for s in schemas)
-            await conn.execute(
-                f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
-            )
+            await _create_publication_on(conn, pub, schemas, dbname)
         actions.append(f"Recreated publication '{pub}' on source")
         log.info("reinit_sync [%s]: recreated publication %s", dbname, pub)
     else:

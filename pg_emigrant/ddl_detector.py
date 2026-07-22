@@ -49,6 +49,43 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+async def _renormalize_viewdef(tgt, definition: str) -> str | None:
+    """Re-deparse a view *definition* through the TARGET server's deparser.
+
+    pg_get_viewdef output changes across major versions — e.g. PostgreSQL 16
+    stopped table-qualifying column refs in single-table queries — so
+    comparing a PG14 source deparse against a PG18 target deparse reports
+    'definition differs' for semantically identical views.  Whitespace
+    normalisation cannot fix that class of difference.  Instantiating the
+    source definition as a temporary view on the target and deparsing it
+    there puts BOTH sides of the comparison through the same deparser.
+
+    Returns ``None`` when the definition cannot be instantiated on the target
+    (missing dependencies, …) — callers then fall back to the raw comparison
+    and the drift stays reported.
+    """
+    body = (definition or "").rstrip().rstrip(";")
+    try:
+        await tgt.execute(f"CREATE TEMPORARY VIEW _pgem_viewnorm AS {body}")
+    except Exception:
+        return None
+    try:
+        return await tgt.fetchval(
+            "SELECT pg_get_viewdef('pg_temp._pgem_viewnorm'::regclass)"
+        )
+    finally:
+        await tgt.execute("DROP VIEW IF EXISTS pg_temp._pgem_viewnorm")
+
+
+async def _viewdefs_equal(tgt, src_def: str, tgt_def: str) -> bool:
+    """True when two view definitions are equivalent, tolerating cross-major-
+    version deparse formatting (see :func:`_renormalize_viewdef`)."""
+    if _norm(src_def) == _norm(tgt_def):
+        return True
+    renorm = await _renormalize_viewdef(tgt, src_def)
+    return renorm is not None and _norm(renorm) == _norm(tgt_def)
+
+
 @dataclass
 class DriftItem:
     """A single schema difference."""
@@ -530,7 +567,7 @@ async def detect_drift(
                     detail=f"{obj_type} {vschema}.{vname} missing on target",
                     fix_ddl=fix,
                 ))
-            elif _norm(src_def) != _norm(tgt_view["view_def"]):
+            elif not await _viewdefs_equal(tgt, src_def, tgt_view["view_def"]):
                 if relkind == "v":
                     fix = f"CREATE OR REPLACE VIEW {fqn} AS\n{src_def}"
                 else:

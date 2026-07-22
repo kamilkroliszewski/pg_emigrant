@@ -231,9 +231,18 @@ subscriber would reject it.
 ## Requirements
 
 - **Python 3.11+**
-- **PostgreSQL 15+ on both servers.** The publication uses
-  `CREATE PUBLICATION … FOR TABLES IN SCHEMA`, which requires PostgreSQL 15 or
-  newer. (Schema-level publications are the only mode used.)
+- **PostgreSQL 13+ source, 15+ recommended; any supported version as target.**
+  On a 15+ source the publication uses `CREATE PUBLICATION … FOR TABLES IN
+  SCHEMA`, which automatically includes tables created later. On a 13/14
+  source that syntax doesn't exist, so pg_emigrant enumerates the current
+  tables with `FOR TABLE` instead — **tables created on the source after
+  bootstrap are NOT auto-published** there; add them with
+  `ALTER PUBLICATION … ADD TABLE`, run `detect-ddl --apply`, and refresh the
+  subscription (a warning with these instructions is printed at bootstrap).
+  Version-dependent catalog differences (`daticulocale`/`datlocale`,
+  `colliculocale`/`colllocale`, PG17's builtin locale provider, PG16+ view
+  deparse changes) are handled automatically — verified end-to-end on a
+  PG 14 → PG 18 migration.
 - A migration role on each server with sufficient privileges:
   - **Source:** `REPLICATION` privilege — required for two things: creating the
     publication/replication slot (`CREATE_REPLICATION_SLOT`, issued directly by
