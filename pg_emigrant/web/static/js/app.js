@@ -133,6 +133,10 @@ function initDashboard(databases) {
   });
 
   wireQuickActions();
+  wireConfirm();               // the dashboard has its own confirm modal (bootstrap)
+  const closeBtn = document.getElementById('job-panel-close');
+  if (closeBtn) closeBtn.addEventListener('click', () => document.getElementById('job-panel').classList.add('hidden'));
+
   // Auto-refresh only reloads the light sections; drift stays lazy so enabling
   // it never triggers a scan across every database at once.
   setupAutoRefresh(refreshDashboardLight, () => dashTimer, t => { dashTimer = t; }, DASH_REFRESH_MS);
@@ -147,9 +151,26 @@ async function refreshDashboardLight() {
     statuses = res.statuses || [];
   } catch (e) {
     document.querySelectorAll('.db-card').forEach(card => markCardError(card, e.message));
+    updateStatsSummary();
     return;
   }
   statuses.forEach(data => populateCard(data));
+  updateStatsSummary();
+}
+
+// Fleet summary tiles above the grid — counts the health pill states currently
+// shown on the cards, so they stay truthful as statuses (and lazy drift) arrive.
+function updateStatsSummary() {
+  const counts = { ok: 0, warn: 0, err: 0 };
+  document.querySelectorAll('.db-card .health-pill').forEach(pill => {
+    if (pill.classList.contains('ok')) counts.ok++;
+    else if (pill.classList.contains('warn')) counts.warn++;
+    else if (pill.classList.contains('err')) counts.err++;
+  });
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('stat-ok', counts.ok);
+  set('stat-warn', counts.warn);
+  set('stat-err', counts.err);
 }
 
 /* ── Lazy drift loading ──────────────────────────────────────────────────────
@@ -261,11 +282,19 @@ function setCardMetric(card, name, html) {
   if (el) el.innerHTML = html;
 }
 
+// The card carries a health-* class too, driving the coloured strip along its
+// top edge (see .db-card::before in style.css).
+function setCardHealth(card, cls) {
+  card.classList.remove('health-ok', 'health-warn', 'health-err');
+  if (cls) card.classList.add('health-' + cls);
+}
+
 function markCardError(card, message) {
   const pill = card.querySelector('.health-pill');
   pill.className = 'health-pill err';
   pill.querySelector('.dot').className = 'dot dot-err';
   pill.querySelector('.health-label').textContent = 'error';
+  setCardHealth(card, 'err');
   setCardMetric(card, 'subscription', sectionError(message));
 }
 
@@ -278,6 +307,7 @@ function populateCard(data) {
   pill.className = 'health-pill ' + health.cls;
   pill.querySelector('.dot').className = 'dot dot-' + health.cls;
   pill.querySelector('.health-label').textContent = health.label;
+  setCardHealth(card, health.cls);
 
   const subs = data.subscription || [];
   const slots = data.slots || [];
@@ -307,33 +337,50 @@ function populateDrift(data) {
       pill.className = 'health-pill warn';
       pill.querySelector('.dot').className = 'dot dot-warn';
       pill.querySelector('.health-label').textContent = 'warning';
+      setCardHealth(card, 'warn');
+      updateStatsSummary();
     }
   }
 }
 
 function wireQuickActions() {
   document.querySelectorAll('.quick-actions .btn-action').forEach(btn => {
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', () => {
       const action = btn.dataset.action;
       const db = btn.dataset.db;
-      try {
-        const { job_id } = await fetchJSON('/api/action', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action, database: db })
-        });
-        toast('Started: ' + action + ' → ' + db);
-        watchJob(job_id, {
-          onDone: (job) => {
-            if (job.status === 'success') { toast((job.result && job.result.message) || 'Done', 'ok'); refreshOneCard(db); }
-            else toast('Error: ' + (job.error ? job.error.split('\n').pop() : 'job failed'), 'err');
-          }
-        });
-      } catch (e) {
-        toast(e.message, 'err');
-      }
+      const destructive = btn.dataset.destructive === 'true';
+      const label = btn.dataset.label || action;
+      const run = () => runQuickAction(action, db, label, destructive);
+
+      // Destructive quick actions (bootstrap) go through the same
+      // type-the-database-name confirmation as the detail page.
+      if (destructive) openConfirm(label, db, false, run);
+      else run();
     });
   });
+}
+
+async function runQuickAction(action, db, label, showPanel) {
+  try {
+    const { job_id } = await fetchJSON('/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, database: db })
+    });
+    toast('Started: ' + label + ' → ' + db);
+    // Long-running operations (bootstrap) stream their logs into the panel.
+    if (showPanel) openJobPanel(label + ' — ' + db);
+    watchJob(job_id, {
+      onUpdate: showPanel ? renderJobPanel : undefined,
+      onDone: (job) => {
+        if (showPanel) renderJobPanel(job);
+        if (job.status === 'success') { toast((job.result && job.result.message) || 'Done', 'ok'); refreshOneCard(db); }
+        else toast('Error: ' + (job.error ? job.error.split('\n').pop() : 'job failed'), 'err');
+      }
+    });
+  } catch (e) {
+    toast(e.message, 'err');
+  }
 }
 
 /* ── Database detail ─────────────────────────────────────────────────────── */
@@ -342,9 +389,6 @@ let confirmModal = null;
 let pendingAction = null;
 
 function initDatabaseDetail(db) {
-  const modalEl = document.getElementById('confirm-modal');
-  if (modalEl) confirmModal = M.Modal.getInstance(modalEl) || M.Modal.init(modalEl);
-
   const refresh = () => loadDetail(db);
   refresh();
 
@@ -456,7 +500,31 @@ function renderDrift(drift) {
   return html;
 }
 
-/* ── Actions + confirm modal ─────────────────────────────────────────────── */
+/* ── Actions + confirm modal (shared by dashboard and detail page) ───────── */
+
+// Opens the type-the-database-name confirmation and calls run(opts) once the
+// user confirms.  Both pages carry the same modal markup; on a page without it
+// the action would just run directly (defensive fallback).
+function openConfirm(label, db, hasDropExtra, run) {
+  const modalEl = document.getElementById('confirm-modal');
+  if (!modalEl) { run({}); return; }
+  confirmModal = M.Modal.getInstance(modalEl) || M.Modal.init(modalEl);
+
+  pendingAction = { db, hasDropExtra, run };
+  document.getElementById('confirm-title').textContent = 'Confirm: ' + label;
+  document.getElementById('confirm-text').innerHTML =
+    'The <strong>' + esc(label) + '</strong> operation on database <code>' + esc(db) +
+    '</code> is destructive or long-running and will run in the background.';
+  document.getElementById('confirm-dropextra').classList.toggle('hidden', !hasDropExtra);
+  document.getElementById('opt-dropextra').checked = false;
+  document.getElementById('confirm-dbname').textContent = db;
+  document.getElementById('confirm-input').value = '';
+  const go = document.getElementById('confirm-go');
+  go.classList.add('disabled');
+  document.getElementById('confirm-typebox').classList.remove('hidden');
+  confirmModal.open();
+}
+
 function wireActionButtons(db) {
   document.querySelectorAll('.action-buttons .btn-action').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -466,20 +534,7 @@ function wireActionButtons(db) {
       const hasDropExtra = btn.dataset.dropextra === 'true';
 
       if (!destructive) { runDetailAction(action, db, {}); return; }
-
-      pendingAction = { action, db, hasDropExtra };
-      document.getElementById('confirm-title').textContent = 'Confirm: ' + label;
-      document.getElementById('confirm-text').innerHTML =
-        'The <strong>' + esc(label) + '</strong> operation on database <code>' + esc(db) +
-        '</code> is destructive or long-running and will run in the background.';
-      document.getElementById('confirm-dropextra').classList.toggle('hidden', !hasDropExtra);
-      document.getElementById('opt-dropextra').checked = false;
-      document.getElementById('confirm-dbname').textContent = db;
-      document.getElementById('confirm-input').value = '';
-      const go = document.getElementById('confirm-go');
-      go.classList.add('disabled');
-      document.getElementById('confirm-typebox').classList.remove('hidden');
-      confirmModal.open();
+      openConfirm(label, db, hasDropExtra, (opts) => runDetailAction(action, db, opts));
     });
   });
 }
@@ -497,7 +552,7 @@ function wireConfirm() {
     const opts = {};
     if (pendingAction.hasDropExtra) opts.drop_extra = document.getElementById('opt-dropextra').checked;
     confirmModal.close();
-    runDetailAction(pendingAction.action, pendingAction.db, opts);
+    pendingAction.run(opts);
     pendingAction = null;
   });
 }
@@ -595,7 +650,7 @@ async function loadJobs() {
     const start = (j.started_at || '').replace('T', ' ').replace(/\+.*$/, '');
     const end = (j.finished_at || '').replace('T', ' ').replace(/\+.*$/, '');
     return '<tr class="job-row' + sel + '" data-job="' + esc(j.id) + '">' +
-      '<td><span class="status-' + esc(j.status) + '">' + esc(j.status) + '</span></td>' +
+      '<td><span class="status-chip status-' + esc(j.status) + '">' + esc(j.status) + '</span></td>' +
       '<td>' + esc(j.name) + '</td>' +
       '<td>' + esc(j.database || '—') + '</td>' +
       '<td class="muted small">' + esc(start) + '</td>' +

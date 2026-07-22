@@ -752,7 +752,7 @@ Options: `-c/--config` (config file), `--host` (default `127.0.0.1`),
 
 | Page | What it does |
 |---|---|
-| **Dashboard** (`/`) | One auto-refreshing card per discovered database with a health pill (ok / warning / error) computed from subscription, slot activity, lag, table counts and drift. Quick `start` / `stop` / `sync-sequences` buttons per card. |
+| **Dashboard** (`/`) | Fleet summary tiles (total / healthy / warning / error) above a grid of auto-refreshing cards, one per discovered database, each with a health pill (ok / warning / error) computed from subscription, slot activity, lag, table counts and drift, and a colored strip along the top matching that health. Quick `bootstrap` / `start` / `stop` / `sync-sequences` buttons per card — `bootstrap` requires the same type-the-database-name confirmation as the detail page and streams its progress into the same floating job panel. |
 | **Database** (`/database/<db>`) | Full status sections — subscription, replication slots, lag, tables per schema, sequence sync, and a schema-drift table with proposed fix DDL — plus an **Actions** panel. |
 | **Configuration** (`/config`) | **Read-only** view of the loaded `config.yaml`. Passwords are masked and never sent to the browser. Editing stays in the file / CLI. |
 | **Jobs** (`/jobs`) | List of background jobs with live, per-job captured logs and tracebacks. |
@@ -775,9 +775,10 @@ don't mix), polled live into the **Jobs** page and a floating log panel.
 ### Styling is loaded from a CDN (internet access required)
 
 > **Heads-up for offline / air-gapped environments.** The GUI's look &amp; feel —
-> **Materialize CSS** and the **Material Icons** font — is pulled from a public CDN
-> over HTTP(S) **by your browser** at page load (via the `<link>` / `<script>` tags
-> in `pg_emigrant/web/templates/base.html`). The browser therefore needs outbound
+> **Materialize CSS**, the **Material Icons** font, and the **Inter** / **JetBrains
+> Mono** typefaces — is pulled from a public CDN over HTTP(S) **by your browser**
+> at page load (via the `<link>` / `<script>` tags in
+> `pg_emigrant/web/templates/base.html`). The browser therefore needs outbound
 > internet access for the page to render with styling.
 
 What this does and does **not** affect:
@@ -790,10 +791,12 @@ What this does and does **not** affect:
   by the browser, not by the server.
 
 **To run fully offline,** vendor the assets locally: download
-`materialize.min.css`, `materialize.min.js` and a Material Icons font into
-`pg_emigrant/web/static/`, then point the three CDN tags in `base.html` at those
-local files with `url_for('static', filename=…)`. No other code changes are
-needed.
+`materialize.min.css`, `materialize.min.js`, a Material Icons font, and the
+Inter / JetBrains Mono webfonts into `pg_emigrant/web/static/`, then point the
+CDN tags in `base.html` at those local files with
+`url_for('static', filename=…)`. The CSS already falls back to system fonts
+(`"Segoe UI"`, `Consolas`, …) if a webfont fails to load, so this is a
+cosmetic-only step. No other code changes are needed.
 
 ### Security
 

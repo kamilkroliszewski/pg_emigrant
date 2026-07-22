@@ -11,16 +11,16 @@
       <span class="lever"></span>
       Auto-refresh <span id="autorefresh-state" class="autorefresh-state off">Off</span>
     </label>
-    <a class="btn-small waves-effect blue darken-2" id="refresh-all">
+    <a class="btn-small waves-effect btn-primary-grad" id="refresh-all">
       <i class="material-icons left">refresh</i>Refresh
     </a>
   </div>
 </div>
 
 {% if discover_error %}
-<div class="card-panel orange lighten-4 orange-text text-darken-4">
-  <i class="material-icons left">warning</i>
-  Could not query the source server for the database list: {{ discover_error }}
+<div class="alert-panel alert-warn">
+  <i class="material-icons">warning</i>
+  <span class="alert-body">Could not query the source server for the database list: {{ discover_error }}</span>
 </div>
 {% endif %}
 
@@ -32,6 +32,38 @@
 {% endif %}
 
 {% if databases %}
+<!-- Fleet summary — counters update as statuses stream in -->
+<div class="stats-row">
+  <div class="stat-tile stat-total">
+    <span class="stat-icon"><i class="material-icons">storage</i></span>
+    <div>
+      <div class="stat-num" id="stat-total">{{ databases | length }}</div>
+      <div class="stat-label">Databases</div>
+    </div>
+  </div>
+  <div class="stat-tile stat-ok">
+    <span class="stat-icon"><i class="material-icons">check_circle</i></span>
+    <div>
+      <div class="stat-num" id="stat-ok">—</div>
+      <div class="stat-label">Healthy</div>
+    </div>
+  </div>
+  <div class="stat-tile stat-warn">
+    <span class="stat-icon"><i class="material-icons">warning</i></span>
+    <div>
+      <div class="stat-num" id="stat-warn">—</div>
+      <div class="stat-label">Warnings</div>
+    </div>
+  </div>
+  <div class="stat-tile stat-err">
+    <span class="stat-icon"><i class="material-icons">error</i></span>
+    <div>
+      <div class="stat-num" id="stat-err">—</div>
+      <div class="stat-label">Errors</div>
+    </div>
+  </div>
+</div>
+
 <div class="db-search-bar">
   <i class="material-icons db-search-icon">search</i>
   <input type="text" id="db-search" placeholder="Filter databases…" autocomplete="off" spellcheck="false" aria-label="Filter databases">
@@ -52,15 +84,16 @@
   <div class="card db-card" data-db="{{ db }}">
     <div class="card-content">
       <div class="db-card-head">
-        <span class="health-pill" title="Replication health"><span class="dot dot-unknown"></span><span class="health-label">…</span></span>
         <span class="db-name">{{ db }}</span>
+        <span style="flex:1"></span>
+        <span class="health-pill" title="Replication health"><span class="dot dot-unknown"></span><span class="health-label">…</span></span>
       </div>
       <ul class="db-metrics">
-        <li><i class="material-icons tiny">sync_alt</i><span class="metric-label">Subscription</span><span class="metric-value" data-metric="subscription">—</span></li>
-        <li><i class="material-icons tiny">speed</i><span class="metric-label">Lag</span><span class="metric-value" data-metric="lag">—</span></li>
-        <li><i class="material-icons tiny">power</i><span class="metric-label">Slot</span><span class="metric-value" data-metric="slot">—</span></li>
-        <li><i class="material-icons tiny">table_chart</i><span class="metric-label">Tables (src/tgt)</span><span class="metric-value" data-metric="tables">—</span></li>
-        <li><i class="material-icons tiny">rule</i><span class="metric-label">Drift</span><span class="metric-value" data-metric="drift">—</span></li>
+        <li class="m-sub"><span class="metric-ico"><i class="material-icons">sync_alt</i></span><span class="metric-label">Subscription</span><span class="metric-value" data-metric="subscription">—</span></li>
+        <li class="m-lag"><span class="metric-ico"><i class="material-icons">speed</i></span><span class="metric-label">Lag</span><span class="metric-value" data-metric="lag">—</span></li>
+        <li class="m-slot"><span class="metric-ico"><i class="material-icons">power</i></span><span class="metric-label">Slot</span><span class="metric-value" data-metric="slot">—</span></li>
+        <li class="m-tables"><span class="metric-ico"><i class="material-icons">table_chart</i></span><span class="metric-label">Tables (src/tgt)</span><span class="metric-value" data-metric="tables">—</span></li>
+        <li class="m-drift"><span class="metric-ico"><i class="material-icons">rule</i></span><span class="metric-label">Drift</span><span class="metric-value" data-metric="drift">—</span></li>
       </ul>
     </div>
     <div class="card-action">
@@ -68,6 +101,10 @@
         <i class="material-icons left tiny">open_in_new</i>Details
       </a>
       <span class="quick-actions">
+        <a class="btn-flat btn-action btn-bootstrap waves-effect" data-action="bootstrap" data-db="{{ db }}"
+           data-label="Bootstrap" data-destructive="true" title="Bootstrap this database (full copy + replication setup)">
+          <i class="material-icons">rocket_launch</i>
+        </a>
         <a class="btn-flat btn-action waves-effect" data-action="start" data-db="{{ db }}" title="Start replication"><i class="material-icons">play_arrow</i></a>
         <a class="btn-flat btn-action waves-effect" data-action="stop" data-db="{{ db }}" title="Stop replication"><i class="material-icons">pause</i></a>
         <a class="btn-flat btn-action waves-effect" data-action="sync-sequences" data-db="{{ db }}" title="Sync sequences"><i class="material-icons">tag</i></a>
@@ -75,6 +112,40 @@
     </div>
   </div>
   {% endfor %}
+</div>
+
+<!-- Confirm modal for destructive quick actions (bootstrap) -->
+<div id="confirm-modal" class="modal">
+  <div class="modal-content">
+    <h5><i class="material-icons left red-text">warning</i><span id="confirm-title">Confirm</span></h5>
+    <p id="confirm-text"></p>
+    <div id="confirm-dropextra" class="hidden">
+      <label>
+        <input type="checkbox" id="opt-dropextra" class="filled-in" />
+        <span><code>--drop-extra</code> — also drop objects that exist only on the target (destructive!)</span>
+      </label>
+    </div>
+    <div id="confirm-typebox" class="hidden">
+      <p class="muted small">To confirm, type the database name: <code id="confirm-dbname"></code></p>
+      <div class="input-field">
+        <input type="text" id="confirm-input" autocomplete="off">
+        <label for="confirm-input">Database name</label>
+      </div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <a class="modal-close btn-flat waves-effect">Cancel</a>
+    <a id="confirm-go" class="btn red darken-1 waves-effect disabled">Run</a>
+  </div>
+</div>
+
+<!-- Live job panel (streams bootstrap logs) -->
+<div id="job-panel" class="job-panel hidden">
+  <div class="job-panel-head">
+    <span><i class="material-icons left tiny">terminal</i><span id="job-panel-title">Job</span></span>
+    <a id="job-panel-close" class="btn-flat btn-small"><i class="material-icons">close</i></a>
+  </div>
+  <pre id="job-panel-log" class="job-log"></pre>
 </div>
 {% endblock %}
 

@@ -15,10 +15,14 @@
     })();
   </script>
 
-  <!-- Material Design: Materialize CSS + Material Icons (CDN) -->
+  <!-- Material Design: Materialize CSS + Material Icons + fonts (CDN) -->
   <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css">
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
@@ -64,9 +68,9 @@
 
     <main class="content">
       {% if cfg_error %}
-      <div class="card-panel red lighten-4 red-text text-darken-4">
-        <i class="material-icons left">error_outline</i>
-        <strong>Failed to load configuration:</strong> {{ cfg_error }}
+      <div class="alert-panel alert-err">
+        <i class="material-icons">error_outline</i>
+        <span><strong>Failed to load configuration:</strong> <span class="alert-body">{{ cfg_error }}</span></span>
       </div>
       {% endif %}
 
