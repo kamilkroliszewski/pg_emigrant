@@ -255,24 +255,53 @@ subscriber would reject it.
     objects.
   - **Target:** ability to `CREATE DATABASE`, create schema objects, and
     `CREATE SUBSCRIPTION` (superuser, or the relevant privileges).
-- **`source.host` (and `target.host`) must resolve to the SAME physical
-  instance for every connection pg_emigrant opens over the whole bootstrap.**
-  If it's a Patroni cluster, point it at the leader-only endpoint (Patroni's
-  own REST API-driven VIP/HAProxy port, or a direct connection to the current
-  primary) — **never** a load-balanced or read-replica endpoint that can
-  round-robin across nodes. The replication slot is created on whichever
-  instance the very first connection reaches; if a later connection (e.g. the
-  one issuing `CREATE SUBSCRIPTION`) reaches a *different* node — because of a
-  failover/switchover mid-bootstrap, or because the endpoint balances reads
-  across replicas — the publication is still visible there (ordinary catalog
-  rows, carried by physical streaming) but the slot is not (slots are local
-  storage on one instance). `CREATE SUBSCRIPTION` itself does **not** validate
-  that the slot exists — PostgreSQL only discovers this later, when the apply
-  worker tries to start streaming in the background, logging a bare
-  `replication slot "..." does not exist` in the *source's* own log with
-  nothing on the client that issued the DDL. pg_emigrant detects this
-  specific case immediately after creating the subscription and fails
-  bootstrap loudly instead — see [Special handling](#special-handling--edge-cases).
+- **`source.host` (and `target.host`) must be a fixed address that means
+  the SAME thing to every machine that might ever resolve it — never
+  `localhost` or `127.0.0.1`, and never a load-balanced/read-replica
+  endpoint.** On a Patroni/HA cluster, point it at the cluster's
+  leader-only VIP/HAProxy endpoint — the one Patroni itself keeps repointed
+  at whichever node is currently the primary.
+  >
+  > **Confirmed and reproduced directly:** running pg_emigrant on the
+  > source's own database host with `host: localhost` in `config.yaml`
+  > causes exactly this failure — with no failover needed at all.
+  > `CREATE SUBSCRIPTION`'s `CONNECTION` string is stored **verbatim** in
+  > `pg_subscription.subconninfo` and is resolved **later**, by the
+  > **target's own background apply worker process**, using the target
+  > machine's own network stack — not by wherever pg_emigrant itself runs.
+  > pg_emigrant's own connections (slot creation, schema sync, data copy)
+  > correctly resolve `localhost` to the real source, because pg_emigrant's
+  > process shares that machine's network namespace — everything looks
+  > fine. But the target machine is a *different* machine: when its apply
+  > worker resolves the same literal string `localhost`, it means "connect
+  > to myself". Reproduced directly against two isolated PostgreSQL
+  > instances: `subconninfo` showed `host='localhost'`, and the target's
+  > apply worker tried to stream from itself, failing forever with a bare
+  > `replication slot "..." does not exist` — the target genuinely has no
+  > such slot (slots are per-instance local storage; this one only ever
+  > existed on the real, remote source) — logged only on the target,
+  > invisible to pg_emigrant, and **not** fixed by repeated `reinit-sync`
+  > runs (each one bakes in the same wrong literal string again). Switching
+  > `source.host` to the cluster's real address resolved it completely, on
+  > the first try, for every database. pg_emigrant now logs a warning at
+  > the start of `bootstrap` and `reinit-sync` whenever `source.host`/
+  > `target.host` is a loopback address, and verifies — from the TARGET's
+  > own point of view, immune to this exact class of mismatch — that the
+  > apply worker is actually streaming before declaring success.
+  >
+  A load-balanced/failover endpoint causes the same class of failure
+  through a different path: the slot is created on whichever instance the
+  first connection reaches, and if a later connection (e.g. the apply
+  worker's) reaches a *different* node, the publication is visible there
+  too (ordinary catalog rows, carried by physical streaming) but the slot
+  is not (local storage on one instance). Either way, `CREATE SUBSCRIPTION`
+  itself does **not** validate that the referenced slot exists or that the
+  connection info actually works — PostgreSQL only discovers this later, in
+  the background. pg_emigrant polls the target's own `pg_stat_subscription`
+  immediately after every `CREATE SUBSCRIPTION` and fails loudly if the
+  apply worker never starts actually streaming, instead of leaving a
+  subscription that fails forever, invisibly — see
+  [Special handling](#special-handling--edge-cases).
 - **Source** `postgresql.conf`:
   ```ini
   wal_level = logical
@@ -811,39 +840,49 @@ the same way a new row does. Nothing to remember, nothing to run by hand.
 
 pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
 
-- **A subscription attached to a slot that turns out to be missing fails
-  immediately, instead of silently.** `CREATE SUBSCRIPTION` — both with
-  `create_slot = true` (`reinit-sync`'s from-scratch path) and with
-  `create_slot = false, slot_name = X` (bootstrap's attach-to-an-
-  already-created-slot path) — does **not** validate that the referenced
-  slot actually exists; PostgreSQL only discovers a missing slot later, when
-  the apply worker tries to start streaming, in the background, and logs a
-  bare `replication slot "X" does not exist` on the **source**, invisible to
-  whatever issued the `CREATE SUBSCRIPTION` (verified directly against a
-  live server: the statement returns success even when the slot has already
-  been dropped). This can happen when `source.host` (or `target.host`)
-  resolves to a load-balanced/failover endpoint that reached a *different*
-  physical node than the one the slot lives on — a Patroni failover/
-  switchover in between, reads routed to a replica, or any other
-  multi-node routing (see [Requirements](#requirements)). pg_emigrant
-  re-checks `pg_replication_slots` on the source immediately after every
-  `CREATE SUBSCRIPTION` and raises immediately if the slot isn't there,
-  quoting exactly which node the verifying connection reached (primary or
-  standby, and its address) so the failure carries hard evidence instead of
-  requiring guesswork. If this happens: `pg_emigrant status --database <db>`
-  to confirm, then either `pg_emigrant reinit-sync --database <db>`
-  (recreates the subscription with a fresh slot — data committed since the
-  original slot's last confirmed LSN is not recoverable, since the slot
-  never streamed anything) or, if nothing depends on this subscription yet,
+- **A subscription that can't actually stream fails immediately, instead of
+  silently.** `CREATE SUBSCRIPTION` succeeding proves nothing: PostgreSQL
+  does not validate at DDL time that the referenced slot exists, or that the
+  stored `CONNECTION` info actually reaches the source (verified directly
+  against a live server — the statement returns success even when the slot
+  has already been dropped, or the connection string is simply wrong).
+  Worse, the `CONNECTION` string is stored **verbatim** in
+  `pg_subscription.subconninfo` and resolved **later**, by the **target's
+  own background apply worker**, on the **target machine** — not by
+  wherever pg_emigrant itself runs. A check that just re-opens `cfg.source`
+  from pg_emigrant's own process is therefore not reliable: if pg_emigrant
+  runs on the source's own host with `source.host: localhost`,
+  pg_emigrant's own connections resolve `localhost` correctly (looks fine!)
+  while the target's apply worker resolves the identical string to *itself*
+  — silently breaking replication forever with a bare
+  `replication slot "..." does not exist`, logged only on the target,
+  invisible to pg_emigrant (confirmed and reproduced directly — see
+  [Requirements](#requirements) for the full mechanism). A load-balanced or
+  failover source endpoint that routes different connections to different
+  physical nodes causes the same class of failure through a different path.
+  pg_emigrant closes this by polling the **target's own**
+  `pg_stat_subscription` (and, on PG15+, `pg_stat_subscription_stats`)
+  immediately after every `CREATE SUBSCRIPTION`, waiting for the apply
+  worker to actually start streaming — the one check that reflects reality
+  regardless of which machine misresolved what — and raises immediately,
+  quoting the subscription's stored `subconninfo`, if it never does. If
+  this happens: `pg_emigrant status --database <db>` to confirm, then
+  either `pg_emigrant reinit-sync --database <db>` (recreates the
+  subscription with a fresh slot — data committed since the original slot's
+  last confirmed LSN is not recoverable, since the slot never streamed
+  anything) or, if nothing depends on this subscription yet,
   `pg_emigrant teardown --database <db>` followed by a clean re-`bootstrap`.
-  **If this keeps recurring even across `reinit-sync` attempts**, the
-  endpoint itself is the problem, not a one-off failover: confirm
-  `source.host:port` in `config.yaml` is a single fixed address that always
-  reaches the SAME physical instance (run
-  `SELECT pg_is_in_recovery(), inet_server_addr();` against it several times
-  in a row — it must return identically every time), and rule out a
-  connection pooler (PgBouncer, …) sitting in front of it in a pooling mode
-  that doesn't support the replication protocol.
+  **If this keeps recurring even across `reinit-sync` attempts**, fixing the
+  connection alone won't help until `config.yaml` itself is corrected —
+  check, in this order: (1) is `source.host`/`target.host` set to
+  `localhost` or `127.0.0.1`? This is the confirmed production cause above
+  — pg_emigrant now warns about it at startup; point it at the cluster's
+  real (VIP) address instead. (2) If it's already a proper address, confirm
+  it's a single fixed endpoint that always reaches the SAME physical
+  instance (run `SELECT pg_is_in_recovery(), inet_server_addr();` against
+  it several times in a row — it must return identically every time), and
+  rule out a connection pooler (PgBouncer, …) sitting in front of it in a
+  pooling mode that doesn't support the replication protocol.
 - **Bootstrap refuses to run twice.** If the target already has this
   database's subscription, `bootstrap` aborts that database with a clear
   message instead of proceeding — a re-run would otherwise terminate the live

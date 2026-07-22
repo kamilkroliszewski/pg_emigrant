@@ -98,6 +98,133 @@ async def _node_fingerprint(conn: asyncpg.Connection) -> str:
     return f"{role} at {row['addr'] or 'local socket'}:{row['port']}"
 
 
+_UNSTABLE_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def warn_if_unstable_host(cfg: ReplicatorConfig) -> None:
+    """Warn when ``source``/``target`` is configured as ``localhost`` (or an
+    equivalent loopback address) — root-caused and reproduced directly
+    against a real production incident.
+
+    The trap: running pg_emigrant directly on the source's own database
+    host, for network locality, with ``host: localhost`` in config.yaml.
+    pg_emigrant's OWN connections (slot creation, schema sync, data copy,
+    even a naive post-creation check) correctly resolve "localhost" to the
+    real source, because pg_emigrant's process shares that machine's network
+    namespace — everything LOOKS like it works. But ``CREATE SUBSCRIPTION``'s
+    ``CONNECTION`` string is stored VERBATIM in ``pg_subscription.subconninfo``
+    and is resolved LATER by the TARGET's own background apply worker
+    process, using the TARGET MACHINE's own network stack — a completely
+    different machine. "localhost" there means "connect to myself". The
+    result, reproduced directly: `subconninfo` shows `host='localhost'`, the
+    target's apply worker tries to stream from itself, and fails forever
+    with a bare ``replication slot "..." does not exist`` — logged only on
+    the target, invisible to pg_emigrant, and NOT fixed by repeated
+    ``reinit-sync`` runs (each one bakes in the same wrong literal string
+    again). A single-node, non-HA setup where source/target genuinely both
+    run wherever "localhost" is evaluated is fine; this is a warning, not a
+    hard error, because pg_emigrant cannot tell the two situations apart
+    from the config alone.
+    """
+    for label, side in (("source", cfg.source), ("target", cfg.target)):
+        if side.host.strip().lower() in _UNSTABLE_HOSTS:
+            log.warning(
+                "%s.host is %r. This string is stored verbatim in the "
+                "subscription's CONNECTION info and later resolved by the "
+                "TARGET's own apply worker process, on the TARGET machine — "
+                "NOT by wherever pg_emigrant itself runs. If pg_emigrant runs "
+                "on the source's own database host, its OWN connections "
+                "resolve '%s' correctly (looks fine!) but the target's apply "
+                "worker resolves the same literal string to ITSELF, silently "
+                "breaking replication forever (a confirmed, reproduced "
+                "production failure mode — see README 'Special handling & "
+                "edge cases'). Point '%s' at a fixed address that means the "
+                "SAME thing from every machine that might evaluate it — the "
+                "cluster's real (VIP/HAProxy leader-only) address — never "
+                "'localhost'/'127.0.0.1'. Harmless to ignore only if '%s' "
+                "truly has no other machine ever resolving this string.",
+                label, side.host, label, label, label,
+            )
+
+
+async def _verify_apply_worker_streaming(
+    cfg: ReplicatorConfig,
+    dbname: str,
+    sub: str,
+    *,
+    attempts: int = 15,
+    delay: float = 1.0,
+) -> tuple[bool, str]:
+    """Confirm the subscription's apply worker is ACTUALLY connected and
+    streaming, by polling the TARGET's own view of it — the only check that
+    is immune to the ``CONNECTION`` string embedded in the subscription
+    being resolved differently by the target machine than by whatever
+    machine pg_emigrant itself runs on.
+
+    This distinction is not academic — it was root-caused against a real
+    production incident. ``CREATE SUBSCRIPTION``'s ``CONNECTION`` string is
+    stored verbatim in ``pg_subscription.subconninfo`` and is later resolved
+    by the TARGET's own background apply worker process, using the TARGET
+    MACHINE's own network stack — NOT by whatever process issued the DDL.
+    If pg_emigrant runs directly on the source's own database host with
+    ``source.host: localhost`` in config.yaml (tempting for network
+    locality), pg_emigrant's OWN connections correctly resolve "localhost"
+    to the real source (since pg_emigrant's process shares that machine's
+    network namespace) — creating the slot and copying data all work fine,
+    and a naive verification that also connects via `cfg.source` from
+    pg_emigrant's own process would ALSO see the slot and report success.
+    But the literal string "localhost" is what ends up in `subconninfo` —
+    and when the TARGET's apply worker (running on the completely different
+    target machine) resolves it, "localhost" means "connect to myself".
+    Reproduced directly: `subconninfo` showed `host='localhost'`, the
+    target's own apply worker tried to stream from itself, and failed with
+    exactly the observed `replication slot "..." does not exist` (the target
+    has no such slot — slots are per-instance local storage, and this one
+    only ever existed on the real, remote source).
+
+    Returns ``(ok, detail)``: `ok=True` once the main apply worker
+    (``relid IS NULL`` in ``pg_stat_subscription``) is running and has
+    advanced `received_lsn` past NULL; `ok=False` with a diagnostic message
+    after exhausting ``attempts`` polls without that ever happening.
+    """
+    last_err_count: int | None = None
+    detail = "no data collected"
+    for attempt in range(attempts):
+        async with connect(cfg.target, dbname) as conn:
+            worker = await conn.fetchrow(
+                "SELECT pid, received_lsn FROM pg_stat_subscription"
+                " WHERE subname = $1 AND relid IS NULL",
+                sub,
+            )
+            target_major = conn.get_server_version().major
+            err_count = None
+            if target_major >= 15:
+                err_count = await conn.fetchval(
+                    "SELECT apply_error_count FROM pg_stat_subscription_stats"
+                    " WHERE subname = $1",
+                    sub,
+                )
+        if worker is not None and worker["received_lsn"] is not None:
+            return True, (
+                f"apply worker running (pid={worker['pid']}, "
+                f"received_lsn={worker['received_lsn']})"
+            )
+        if err_count is not None and last_err_count is not None and err_count > last_err_count:
+            return False, (
+                f"apply worker is failing repeatedly on the TARGET "
+                f"(apply_error_count rising: {last_err_count} → {err_count} "
+                f"over {attempt} attempt(s))"
+            )
+        last_err_count = err_count
+        detail = (
+            f"no successful stream after {attempt + 1}/{attempts} attempts"
+            + (f" (apply_error_count={err_count})" if err_count else "")
+        )
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay)
+    return False, detail
+
+
 async def _drop_slot_if_present(conn: asyncpg.Connection, slot_name: str) -> bool:
     """Terminate the holding backend (if any) and drop *slot_name* if it exists.
 
@@ -560,60 +687,64 @@ async def create_subscription(
             ) from exc
         log.info("Created subscription %s in %s", sub, dbname)
 
-        # CREATE SUBSCRIPTION succeeding proves nothing about the slot it
-        # references: PostgreSQL does NOT validate slot existence as part of
-        # this DDL (verified directly against a live server — the statement
+        # CREATE SUBSCRIPTION succeeding proves NOTHING about whether
+        # replication actually works: PostgreSQL does not validate slot
+        # existence as part of this DDL (verified directly — the statement
         # returns success even when the referenced slot has already been
-        # dropped). The actual slot lives on whatever server "cfg.source"
-        # resolves to for THIS particular connection, opened separately from
-        # (and, for create_slot=False, well after) the one that created the
-        # slot in the first place. If "cfg.source" is a load-balanced
-        # endpoint (Patroni VIP / HAProxy / DNS round-robin / a pooler) that
-        # can route different TCP connections to different physical nodes —
-        # via a failover/switchover in between, or by routing reads to a
-        # replica — the two connections can land on DIFFERENT instances: the
-        # PUBLICATION is visible on both (ordinary catalog rows, carried by
-        # physical streaming), but a logical replication slot is local
-        # storage on ONE instance only. The apply worker would then fail
-        # forever in the background with a bare "replication slot ... does
-        # not exist" — visible only in the source's own postgres/Patroni
-        # log, never surfaced to whatever issued the CREATE SUBSCRIPTION.
-        # Verify right now, on both the create_slot=True (reinit-sync's
-        # from-scratch path) and create_slot=False (bootstrap's attach-to-
-        # existing-slot path) branches — this class of routing problem can
-        # hit either — while we can still fail loudly and specifically
-        # instead of leaving that ticking time bomb.
-        async with connect(cfg.source, dbname) as verify_conn:
-            fp = await _node_fingerprint(verify_conn)
-            slot_row = await verify_conn.fetchrow(
-                "SELECT active, active_pid, wal_status FROM pg_replication_slots"
-                " WHERE slot_name = $1",
-                sub,
-            )
-        if slot_row is None:
+        # dropped), and — root-caused against a real production incident —
+        # a naive check from pg_emigrant's OWN connection to "cfg.source" is
+        # NOT a reliable proxy for what the target's apply worker actually
+        # experiences: the CONNECTION string embedded in CREATE SUBSCRIPTION
+        # is stored in pg_subscription.subconninfo and resolved LATER by the
+        # target's own background apply worker, using the TARGET MACHINE's
+        # own network stack — not by whatever process (pg_emigrant) issued
+        # the DDL. If "cfg.source" is e.g. "localhost" because pg_emigrant
+        # runs directly on the source's own database host, pg_emigrant's own
+        # connections (including a naive post-creation check) correctly
+        # resolve "localhost" to the real source — but the target's apply
+        # worker, running on a DIFFERENT machine, resolves the same literal
+        # string to ITSELF, and fails with a bare "replication slot ... does
+        # not exist" that is only ever logged on the target, invisible here.
+        # (The same failure mode also results from a load-balanced/failover
+        # source endpoint routing different connections to different nodes.)
+        #
+        # The only check immune to all of the above: ask the TARGET what its
+        # OWN apply worker is actually doing, via pg_stat_subscription —
+        # this reflects reality regardless of which machine misresolved
+        # what. Runs for both create_slot=True (reinit-sync's from-scratch
+        # path) and create_slot=False (bootstrap's attach-to-existing-slot
+        # path) — this class of problem can hit either.
+        ok, worker_detail = await _verify_apply_worker_streaming(cfg, dbname, sub)
+        if not ok:
+            async with connect(cfg.target, dbname) as conn2:
+                subconninfo = await conn2.fetchval(
+                    "SELECT subconninfo FROM pg_subscription WHERE subname = $1", sub
+                )
             raise RuntimeError(
-                f"Subscription {sub} was created in {dbname}, but its replication "
-                f"slot is NOT visible on the source right now (this connection to "
-                f"'source' reached: {fp}). The apply worker would fail indefinitely "
-                f"in the background with 'replication slot \"{sub}\" does not "
-                f"exist' — visible only in the SOURCE's own postgres/Patroni log, "
-                f"not here. Most likely cause: 'source' in config.yaml resolves to "
-                f"a load-balanced endpoint (VIP / HAProxy / DNS round-robin / a "
-                f"pooler) and this connection landed on a DIFFERENT physical node "
-                f"than the one the slot lives on — e.g. a Patroni failover/"
-                f"switchover in between, or reads being routed to a replica. Run, "
-                f"right now, against the EXACT host:port configured as 'source': "
-                f"'SELECT pg_is_in_recovery(), inet_server_addr();' — if this ever "
-                f"returns a different answer across repeated connections, 'source' "
-                f"is not a stable single endpoint and must be pointed at a fixed "
-                f"connection to the current primary (Patroni's leader-only port, "
-                f"never a load-balanced/read-replica one) before retrying. Then run "
+                f"Subscription {sub} was created in {dbname}, but its apply worker "
+                f"on the TARGET is not actually streaming ({worker_detail}). This "
+                f"almost always means the CONNECTION string stored in the "
+                f"subscription cannot reach the real source FROM THE TARGET "
+                f"MACHINE's OWN point of view — even though pg_emigrant's own "
+                f"connections to 'source' work fine. Two confirmed causes: (1) "
+                f"'source.host' is 'localhost'/'127.0.0.1' — this resolves "
+                f"correctly ONLY when pg_emigrant runs on the exact same machine "
+                f"as the source, but the TARGET's apply worker resolves the same "
+                f"literal string to ITSELF, not to the source; (2) 'source' is a "
+                f"load-balanced endpoint that routed pg_emigrant's own "
+                f"connections and the apply worker's connection to different "
+                f"physical nodes. The stored connection string is: {subconninfo!r} "
+                f"— log into the TARGET machine itself and confirm THIS EXACT "
+                f"string, from there, reaches the real source (not the target "
+                f"itself, not a different node). 'source.host' must be a fixed "
+                f"address that means the same thing from every machine that "
+                f"might evaluate it — never 'localhost', never a load-balanced "
+                f"endpoint. Fix config.yaml, then run "
                 f"'pg_emigrant teardown --database {dbname}' and re-run bootstrap."
             )
         log.info(
-            "Verified slot %s exists on source after subscribing (connection "
-            "reached: %s; active=%s, active_pid=%s, wal_status=%s)",
-            sub, fp, slot_row["active"], slot_row["active_pid"], slot_row["wal_status"],
+            "Verified subscription %s is actually streaming in %s (%s)",
+            sub, dbname, worker_detail,
         )
 
 

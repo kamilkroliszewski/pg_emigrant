@@ -398,8 +398,10 @@ def reinit_sync(
     """
     from pg_emigrant.db import discover_databases
     from pg_emigrant.replication import reinit_sync as do_reinit
+    from pg_emigrant.replication import warn_if_unstable_host
 
     cfg = load_config(config)
+    warn_if_unstable_host(cfg)
 
     async def _reinit():
         dbs = [database] if database else await discover_databases(cfg)
