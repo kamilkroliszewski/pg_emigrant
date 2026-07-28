@@ -9,15 +9,22 @@ from rich.logging import RichHandler
 
 console = Console()
 
+# Log records go to STDERR, not stdout.  stdout is reserved for command output
+# a caller may want to parse — `--format json` / `--format simple` are designed
+# to be piped into jq or a CI gate, and an INFO line interleaved into them makes
+# the payload unparseable.  Keeping diagnostics on stderr is also just the Unix
+# convention, and it leaves them visible on an interactive terminal either way.
+_log_console = Console(stderr=True)
+
 
 def setup_logging(verbose: bool = False) -> None:
-    """Configure structured logging with rich output."""
+    """Configure structured logging with rich output (on stderr)."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(console=console, rich_tracebacks=True)],
+        handlers=[RichHandler(console=_log_console, rich_tracebacks=True)],
     )
 
 

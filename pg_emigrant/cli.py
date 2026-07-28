@@ -30,14 +30,127 @@ def main(verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable deb
 
 
 @app.command()
+def preflight(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file"),
+    database: Optional[str] = typer.Option(None, "--database", "-d", help="Check only this database (default: all discovered)"),
+    format: str = typer.Option("rich", "--format", "-f", help="Output format: rich (default), simple, json"),
+    strict: bool = typer.Option(False, "--strict", help="Exit non-zero on warnings too, not just errors"),
+):
+    """Verify a migration will work — WITHOUT changing anything.
+
+    Runs read-only catalog checks against both clusters: same-cluster/standby
+    detection, wal_level and slot/worker headroom, role privileges, name
+    collisions, extension availability, missing roles, unreadable or unlogged
+    tables, and column/type compatibility with any pre-existing target schema.
+
+    Only SELECTs against pg_catalog are issued — nothing is created, altered or
+    dropped — so it is safe to run against production at any time, including
+    during an in-flight migration.
+
+    Exit code is 1 when any check fails (or, with --strict, also on warnings),
+    which makes it usable as a CI / runbook gate before 'bootstrap'.
+    """
+    import json as _json
+
+    from pg_emigrant.preflight import ERROR, OK, SKIP, WARN, run_preflight
+
+    cfg = load_config(config)
+    report = _run(run_preflight(cfg, database=database))
+
+    if format == "json":
+        print(_json.dumps(report.to_dict(), indent=2))
+    elif format == "simple":
+        for c in report.checks:
+            db = c.database or "-"
+            print(f"db={db} check={c.name} category={c.category} status={c.status} summary={c.summary!r}")
+        print(f"passed={report.passed} summary={report.summary!r}")
+    else:
+        _STYLE = {ERROR: "bold red", WARN: "yellow", OK: "green", SKIP: "dim"}
+        _ICON = {ERROR: "✗", WARN: "⚠", OK: "✓", SKIP: "–"}
+
+        console.rule("[bold green]pg_emigrant preflight")
+        console.print(
+            f"[dim]Source[/dim] {cfg.source.host}:{cfg.source.port}   "
+            f"[dim]Target[/dim] {cfg.target.host}:{cfg.target.port}   "
+            f"[dim](read-only — nothing is modified)[/dim]\n"
+        )
+
+        tbl = Table(show_lines=False, expand=True)
+        tbl.add_column("", width=1, no_wrap=True)
+        tbl.add_column("Database", style="cyan", no_wrap=True)
+        tbl.add_column("Check", no_wrap=True)
+        tbl.add_column("Result")
+        for c in report.checks:
+            tbl.add_row(
+                f"[{_STYLE[c.status]}]{_ICON[c.status]}[/{_STYLE[c.status]}]",
+                c.database or "—",
+                c.name,
+                f"[{_STYLE[c.status]}]{c.summary}[/{_STYLE[c.status]}]",
+            )
+        console.print(tbl)
+
+        # Only failures/warnings get their remediation text printed — a clean
+        # run stays short enough to read at a glance.
+        for c in report.checks:
+            if c.status in (ERROR, WARN, SKIP) and c.detail:
+                label = f"{c.database}: " if c.database else ""
+                console.print(
+                    f"\n[{_STYLE[c.status]}]{_ICON[c.status]} {label}{c.name}[/{_STYLE[c.status]}] — {c.summary}"
+                )
+                console.print(f"  [dim]{c.detail}[/dim]")
+
+        console.print()
+        if report.passed and not report.warnings:
+            console.rule(f"[bold green]Preflight PASSED — {report.summary}")
+        elif report.passed:
+            console.rule(f"[bold yellow]Preflight passed with warnings — {report.summary}")
+        else:
+            console.rule(f"[bold red]Preflight FAILED — {report.summary}")
+
+    if not report.passed or (strict and report.warnings):
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def bootstrap(
     config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file"),
     database: Optional[str] = typer.Option(None, "--database", "-d", help="Bootstrap only this database (default: all discovered)"),
+    skip_preflight: bool = typer.Option(
+        False, "--skip-preflight",
+        help="Do not run the read-only preflight checks before migrating (not recommended)",
+    ),
 ):
     """Run full bootstrap migration: discover → schema sync → data copy → replication setup."""
     from pg_emigrant.bootstrap import bootstrap as do_bootstrap
+    from pg_emigrant.preflight import run_preflight
 
     cfg = load_config(config)
+
+    # Gate the irreversible part behind the read-only checks: almost everything
+    # that makes a bootstrap fail halfway (missing extension/role on the target,
+    # exhausted slots, wrong wal_level, a name collision, source and target being
+    # the same cluster) is knowable up front — and far cheaper to fix before a
+    # slot exists on the production source and data has been copied.
+    if not skip_preflight:
+        report = _run(run_preflight(cfg, database=database))
+        if not report.passed:
+            console.rule("[bold red]Preflight FAILED — bootstrap not started")
+            for c in report.errors:
+                label = f"{c.database}: " if c.database else ""
+                console.print(f"  [bold red]✗ {label}{c.summary}[/bold red]")
+                if c.detail:
+                    console.print(f"    [dim]{c.detail}[/dim]")
+            console.print(
+                "\n[dim]Nothing was modified. Run 'pg_emigrant preflight' for the full "
+                "report, or re-run with --skip-preflight to override.[/dim]"
+            )
+            raise typer.Exit(code=1)
+        if report.warnings:
+            console.print(
+                f"[yellow]⚠ Preflight passed with {len(report.warnings)} warning(s)[/yellow] "
+                f"[dim]— run 'pg_emigrant preflight' for details[/dim]"
+            )
+
     try:
         _run(do_bootstrap(cfg, database=database))
     except RuntimeError as exc:

@@ -32,6 +32,7 @@ Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [CLI reference](#cli-reference)
+  - [`preflight`](#pg_emigrant-preflight)
   - [`bootstrap`](#pg_emigrant-bootstrap)
   - [`start` / `stop`](#pg_emigrant-start--pg_emigrant-stop)
   - [`teardown`](#pg_emigrant-teardown)
@@ -494,16 +495,55 @@ Every command accepts:
 -d, --database NAME      Operate on a single database instead of all discovered.
 ```
 
+### `pg_emigrant preflight`
+
+**Verifies a migration will work — without changing anything.** Every statement
+it issues is a `SELECT` against `pg_catalog`: nothing is created, altered or
+dropped, no slot is taken, no temp object is made. Safe to run against
+production at any time, including during an in-flight migration.
+
+```bash
+pg_emigrant preflight                          # all discovered databases
+pg_emigrant preflight --database myapp
+pg_emigrant preflight -f json | jq .passed     # CI / runbook gate
+pg_emigrant preflight --strict                 # exit 1 on warnings too
+```
+
+Exit code is **1** when any check fails (with `--strict`, also on warnings), so
+it drops straight into a pipeline or a change-approval runbook.
+
+| Category | What it checks |
+|---|---|
+| **Cluster** | Source and target are genuinely different clusters — compared by `system_identifier`, so it also catches a target that is a **physical standby of the source** (same identifier, different address, and read-only). Source is a primary, target is writable. Source major ≤ target major. `source.host` is an address the **target** can actually reach. |
+| **Config** | `wal_level = logical`; enough free `max_replication_slots` and `max_wal_senders` on the source for the databases in scope; `max_logical_replication_workers` / `max_worker_processes` / origin-tracking slots on the target; a bounded `max_slot_wal_keep_size`. |
+| **Privileges** | The migration role can create replication slots (REPLICATION or superuser), can `CREATE DATABASE` and `CREATE SUBSCRIPTION` on the target (superuser, or `pg_create_subscription` + CREATEDB on PG16+), has CREATE on each source database for the publication, and can `SELECT` **every** table that will be copied. |
+| **Naming** | The per-database publication / slot / subscription names are free — catching an already-bootstrapped database before a re-run gets anywhere near its live slot. |
+| **Extensions** | Every extension used on the source is in the target's `pg_available_extensions` (missing ⇒ error, different version ⇒ warning). |
+| **Schema** | Every configured database exists on the source; object-owner roles exist on the target (pg_emigrant never creates roles); columns and types match for tables that already exist on **both** sides; unlogged tables (silently never replicated) and tables with no primary key (bootstrap would take `ACCESS EXCLUSIVE` on the production source to set `REPLICA IDENTITY FULL`) are flagged. |
+
+`bootstrap` runs these checks automatically and **refuses to start** if any of
+them fail, so the irreversible part never begins against a cluster that can't
+support it. Override with `--skip-preflight` if you really mean to.
+
 ### `pg_emigrant bootstrap`
 
 Runs the full one-shot migration pipeline described
 [above](#the-bootstrap-pipeline-step-by-step) for every discovered database (or
 just `--database`).
 
+Before touching anything it runs the read-only
+[`preflight`](#pg_emigrant-preflight) checks and aborts — having modified
+nothing — if any of them fail. Almost every way a bootstrap can die halfway
+(missing extension or role on the target, exhausted slots, wrong `wal_level`, a
+name collision, source and target being the same cluster) is knowable up front,
+and far cheaper to fix before a slot exists on the production source and data
+has been copied.
+
 ```bash
 pg_emigrant bootstrap
 pg_emigrant bootstrap --config /etc/pg_emigrant/prod.yaml
 pg_emigrant bootstrap --database myapp
+pg_emigrant bootstrap --skip-preflight     # run the checks yourself / override
 pg_emigrant --verbose bootstrap
 ```
 
@@ -1011,7 +1051,11 @@ pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
 cp config.yaml.example config.yaml
 $EDITOR config.yaml            # fill in source/target, schemas, etc.
 
-# 2. Bootstrap (schema + data + replication), with live progress
+# 1b. Verify everything BEFORE touching production — changes nothing
+pg_emigrant preflight --config config.yaml
+
+# 2. Bootstrap (schema + data + replication), with live progress.
+#    Re-runs the preflight checks itself and refuses to start if they fail.
 pg_emigrant bootstrap --config config.yaml --verbose
 
 # 3. Keep sequences in step continuously (separate terminal / service)
@@ -1112,6 +1156,7 @@ pg_emigrant/
     ├── schema_sync.py      # introspection + schema/type/function/view/ownership sync
     ├── data_copy.py        # parallel, snapshot-consistent COPY
     ├── replication.py      # publications, subscriptions, slots, reinit-sync
+    ├── preflight.py        # read-only pre-migration verification
     ├── sequence_sync.py    # source→target sequence synchronisation
     ├── ddl_detector.py     # schema drift detection & repair
     ├── monitor.py          # read-only status dashboard (rich/simple/json)
@@ -1130,9 +1175,10 @@ pg_emigrant/
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | Defines the `pg_emigrant` Typer app and its commands: `bootstrap`, `start`, `stop`, `teardown`, `status`, `sync-sequences`, `detect-ddl`, `reinit-sync`. Handles output formatting for the reporting commands. |
+| `cli.py` | Defines the `pg_emigrant` Typer app and its commands: `preflight`, `bootstrap`, `start`, `stop`, `teardown`, `status`, `sync-sequences`, `detect-ddl`, `reinit-sync`. Handles output formatting for the reporting commands. |
 | `config.py` | `DatabaseConfig` and `ReplicatorConfig` Pydantic models and `load_config()` (YAML → validated config; defaults to `config.yaml`, raises if missing). |
 | `db.py` | DSN building and async `connect()` context manager; `discover_databases()` and `discover_schemas()` with the system-schema exclusion set. |
+| `preflight.py` | `run_preflight()` — strictly read-only production readiness checks (cluster identity, capacity, privileges, naming, extensions, schema compatibility) returning a `PreflightReport`. Gates `bootstrap`. |
 | `bootstrap.py` | `bootstrap()` — drives the entire per-database pipeline and the live progress display; `ensure_database_exists()`. |
 | `schema_sync.py` | All schema introspection queries and the sync routines: tables/columns, constraints, indexes (with deferred non-unique build), sequences, enum & composite types, functions/procedures, triggers, views/matviews, extensions, `REPLICA IDENTITY FULL`, and ownership (`sync_ownership`, `make_owner_fix_ddl`). |
 | `data_copy.py` | `copy_all_tables()` (snapshot export, truncation, parallel orchestration) and `copy_table_data_pipe()` (streaming CSV copy with optional `ctid` chunking). |
