@@ -1163,6 +1163,8 @@ async def get_all_replication_slots(cfg: ReplicatorConfig) -> list[dict]:
 async def reinit_sync(
     cfg: ReplicatorConfig,
     dbname: str,
+    *,
+    allow_data_gap: bool = False,
 ) -> dict:
     """Verify and restore replication components for *dbname* after a Patroni switchover/failover.
 
@@ -1172,19 +1174,41 @@ async def reinit_sync(
     3. Subscription exists on target and matches slot health:
        - Slot OK, subscription disabled  → re-enable.
        - Slot OK, subscription enabled but apply worker not running → refresh publication.
-       - Slot missing/lost OR subscription missing → drop subscription (if present) + drop
-         orphaned slot (if present) + recreate subscription (which creates a fresh slot).
+       - Slot OK, subscription missing/broken → recreate it attached to the
+         SURVIVING slot, which resumes from its confirmed LSN with no gap.
+       - Slot missing or ``wal_status='lost'`` → **refused by default**, see below.
+
+    Data-gap refusal
+    ----------------
+    A logical slot is the *only* thing holding the WAL that has not been
+    replayed yet.  Once it is gone (the usual outcome of a pre-PG17 Patroni
+    promotion) or its WAL has been recycled (``wal_status='lost'``), every
+    transaction committed between its last confirmed LSN and now exists
+    nowhere the target can still reach.  A fresh slot streams only from the
+    moment it is created, so recreating the subscription produces a target
+    that is *silently and permanently* missing those rows — and looks
+    perfectly healthy while doing it.
+
+    Logical replication cannot repair that; only re-copying the data can.  So
+    this function refuses that path unless the caller passes
+    ``allow_data_gap=True``, and — critically — it decides *before* dropping
+    anything, so a refusal leaves the existing (broken but inspectable) state
+    exactly as it found it rather than making things worse.
 
     Returns a dict with:
         database      – the database name processed
         issues_found  – list of problems detected
         actions_taken – list of corrective actions executed
         was_healthy   – True when no issues were found (nothing needed fixing)
+        blocked       – True when a repair was refused and NOTHING was changed
+        data_gap      – True when the completed repair did lose data
+                        (only possible with allow_data_gap=True)
     """
     pub = pub_name(cfg, dbname)
     sub = sub_name(cfg, dbname)
     issues: list[str] = []
     actions: list[str] = []
+    data_gap = False
 
     # ── 1. Publication ────────────────────────────────────────────────────────
     async with connect(cfg.source, dbname) as conn:
@@ -1278,9 +1302,56 @@ async def reinit_sync(
         if sub_row is None:
             issues.append(f"Subscription '{sub}' not found on target")
         else:
+            # Deliberately does NOT promise a recreation here — whether one
+            # happens depends on the data-gap decision below, and claiming it
+            # up front is exactly the kind of premature "repaired" reporting
+            # that hides permanent data loss.
             issues.append(
-                f"Subscription '{sub}' exists but replication slot is missing/unhealthy — will recreate"
+                f"Subscription '{sub}' exists but its replication slot is missing/unhealthy"
             )
+
+        resumable = slot_ok and slot_row is not None
+
+        # ── Refuse the data-losing path BEFORE touching anything ─────────────
+        # This check must come before the subscription is dropped: refusing
+        # afterwards would leave the database strictly worse off (no
+        # subscription, no slot, nothing recreated) than when we started.
+        if not resumable and not allow_data_gap:
+            old_flush = slot_row["confirmed_flush_lsn"] if slot_row else None
+            gap_start = (
+                f"the old slot's last confirmed LSN ({old_flush})"
+                if old_flush is not None
+                else "an unknown point (the slot is gone entirely)"
+            )
+            log.error(
+                "reinit_sync [%s]: REFUSING to recreate the subscription. The "
+                "replication slot is gone or its WAL was recycled, so everything "
+                "committed on the source since %s can no longer be streamed to "
+                "the target. Recreating the subscription now would produce a "
+                "target that is silently and permanently missing those rows "
+                "while reporting itself healthy. Nothing was changed. The only "
+                "repair that restores consistency is a re-copy: "
+                "'pg_emigrant teardown --database %s' then "
+                "'pg_emigrant bootstrap --database %s'. If you have verified "
+                "out-of-band that the gap is acceptable (e.g. the source took "
+                "no writes in that window), re-run with --allow-data-gap.",
+                dbname, gap_start, dbname, dbname,
+            )
+            issues.append(
+                "DATA-GAP REFUSED: the replication slot is gone/lost, so writes "
+                f"since {gap_start} can never reach the target. Nothing was "
+                f"changed. Re-copy to restore consistency ('teardown --database "
+                f"{dbname}' + 'bootstrap --database {dbname}'), or re-run with "
+                f"--allow-data-gap to accept permanent data loss."
+            )
+            return {
+                "database": dbname,
+                "issues_found": issues,
+                "actions_taken": actions,
+                "was_healthy": False,
+                "blocked": True,
+                "data_gap": False,
+            }
 
         # Gracefully drop the subscription if it still exists on target.
         # (slot_name = NONE detaches it first, so a surviving slot on the
@@ -1292,7 +1363,7 @@ async def reinit_sync(
                 await conn.execute(f"DROP SUBSCRIPTION IF EXISTS {qi(sub)};")
             log.info("reinit_sync [%s]: dropped broken subscription %s", dbname, sub)
 
-        if slot_ok and slot_row is not None:
+        if resumable:
             # The slot survived (only the subscription is gone/broken).
             # Attach a new subscription to it instead of dropping it: the
             # slot has retained WAL since its last confirmed LSN, so
@@ -1314,15 +1385,14 @@ async def reinit_sync(
                 dbname, sub, slot_row["confirmed_flush_lsn"],
             )
         else:
-            # ── DATA-LOSS WINDOW ──────────────────────────────────────────
-            # The old slot is gone or its WAL was already recycled — the
-            # usual outcome of a Patroni promotion, since logical slots do
-            # not survive failover before PostgreSQL 17 failover slots.  A
-            # fresh slot only streams changes from the moment it is created:
-            # everything committed on the source between the old slot's last
-            # confirmed LSN and now was never streamed and will NOT be
-            # replayed.  That gap cannot be repaired here without a re-copy
-            # — make it impossible to miss.
+            # ── DATA-LOSS WINDOW, EXPLICITLY CONSENTED TO ─────────────────
+            # Only reachable with allow_data_gap=True — the refusal above is
+            # the default.  The old slot is gone or its WAL was recycled, so a
+            # fresh slot streams only from now: everything committed between
+            # the old slot's last confirmed LSN and this moment was never
+            # streamed and will NOT be replayed.  The caller has accepted
+            # that; record it unambiguously in the result so no downstream
+            # report can present this as a clean repair.
             old_flush = slot_row["confirmed_flush_lsn"] if slot_row else None
             gap_start = (
                 f"the old slot's last confirmed LSN ({old_flush})"
@@ -1330,23 +1400,22 @@ async def reinit_sync(
                 else "an unknown point (the old slot is gone entirely)"
             )
             log.warning(
-                "reinit_sync [%s]: recreating subscription '%s' with a FRESH "
-                "replication slot. The new slot starts at the CURRENT WAL "
-                "position — any write committed on the source between %s and "
-                "now was never streamed and is PERMANENTLY MISSING on the "
-                "target. Verify data consistency (row counts / checksums on "
-                "recently-written tables) before trusting this target for "
-                "cutover, and re-copy affected tables if needed. On "
-                "PostgreSQL 17+ consider failover slots "
-                "(sync_replication_slots = on) so a switchover no longer "
-                "loses the slot.",
+                "reinit_sync [%s]: --allow-data-gap given — recreating "
+                "subscription '%s' with a FRESH replication slot. The new slot "
+                "starts at the CURRENT WAL position, so any write committed on "
+                "the source between %s and now is PERMANENTLY MISSING on the "
+                "target. This target is NOT a faithful copy until you re-copy "
+                "the affected tables. Verify row counts / checksums on "
+                "recently-written tables before any cutover. On PostgreSQL 17+ "
+                "enable failover slots (sync_replication_slots = on) so a "
+                "switchover stops losing the slot in the first place.",
                 dbname, sub, gap_start,
             )
             issues.append(
-                "DATA-LOSS WINDOW: the fresh slot starts at the current LSN — "
-                f"writes since {gap_start} were never streamed to the target. "
-                "Verify affected tables (row counts / checksums) and re-copy "
-                "them if needed before cutover."
+                "DATA LOSS ACCEPTED (--allow-data-gap): the fresh slot starts at "
+                f"the current LSN — writes since {gap_start} were never streamed "
+                "and are permanently missing on the target. Re-copy the affected "
+                "tables before trusting this target for cutover."
             )
 
             # Drop the dead/lost slot that might still linger on source.
@@ -1355,19 +1424,21 @@ async def reinit_sync(
                     log.info("reinit_sync [%s]: dropped orphaned slot %s", dbname, sub)
 
             # Create a fresh subscription — PostgreSQL will also create the
-            # slot.  (reinit-sync never re-copies data, so there is no
-            # snapshot/slot consistency window to worry about here — unlike
-            # bootstrap — but see the data-gap warning above.)
+            # slot.  Replication resumes from here on, but the historical gap
+            # above is not recoverable by any amount of streaming.
             await create_subscription(cfg, dbname, create_slot=True)
             actions.append(
                 f"Recreated subscription '{sub}' with a fresh replication slot "
-                f"(⚠ data gap — see issues)"
+                f"— ⚠ DATA WAS LOST, target is incomplete until re-copied"
             )
             log.info("reinit_sync [%s]: recreated subscription %s", dbname, sub)
+            data_gap = True
 
     return {
         "database": dbname,
         "issues_found": issues,
         "actions_taken": actions,
         "was_healthy": len(issues) == 0,
+        "blocked": False,
+        "data_gap": data_gap,
     }
