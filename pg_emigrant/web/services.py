@@ -227,17 +227,44 @@ def _build_reinit_sync(cfg: ReplicatorConfig, db: str, _opts: dict) -> CoroFacto
     log = get_logger("pg_emigrant.web")
 
     async def _coro() -> Any:
+        # allow_data_gap is deliberately NOT exposed here. Accepting permanent
+        # data loss must never be a one-click action from a dashboard — the GUI
+        # runs reinit-sync without a confirmation dialog. When the repair would
+        # lose data, reinit_sync() refuses and changes nothing; we surface that
+        # as a FAILED job (rather than a quiet "repaired") so it cannot be
+        # mistaken for success, and point at the CLI for the deliberate path.
         result = await reinit_sync(cfg, db)
         for issue in result.get("issues_found", []):
             log.warning("⚠ %s", issue)
         for action in result.get("actions_taken", []):
             log.info("✓ %s", action)
+
+        if result.get("blocked"):
+            log.error(
+                "Reinit REFUSED for %s — nothing was changed. The replication slot "
+                "is gone, so the transactions it still held cannot reach the target; "
+                "recreating the subscription would leave it silently incomplete. "
+                "Restore consistency with a re-copy (teardown + bootstrap for this "
+                "database), or run 'pg_emigrant reinit-sync --database %s "
+                "--allow-data-gap' from the CLI to deliberately accept the loss.",
+                db, db,
+            )
+            raise RuntimeError(
+                f"reinit-sync refused for '{db}': the replication slot is gone, so "
+                f"repairing it here would permanently lose every transaction "
+                f"committed since it was lost. Nothing was changed. Re-copy the "
+                f"database (teardown + bootstrap), or use the CLI's "
+                f"--allow-data-gap to accept the loss deliberately."
+            )
+
         if result.get("was_healthy"):
             log.info("Replication for %s is healthy — nothing to do", db)
         return {
             "message": "healthy" if result.get("was_healthy") else "repaired",
             "issues_found": result.get("issues_found", []),
             "actions_taken": result.get("actions_taken", []),
+            "blocked": bool(result.get("blocked")),
+            "data_gap": bool(result.get("data_gap")),
         }
 
     return _coro

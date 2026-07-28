@@ -73,7 +73,9 @@ use `pg_emigrant status` to watch lag, and optionally `pg_emigrant detect-ddl` t
 catch and repair other schema changes (columns, indexes, functions, …) made on
 the source after bootstrap. If the source is a Patroni cluster and a
 failover/switchover happens, `pg_emigrant reinit-sync` repairs the broken
-slot/subscription without re-copying data.
+slot/subscription — losslessly when the slot survived, and refusing outright
+(changing nothing) when the slot is gone and only a re-copy could restore
+consistency.
 
 At cutover you stop replication, run a final sequence sync, point the application
 at the target, and (optionally) tear the replication objects down.
@@ -707,9 +709,22 @@ copy would cause.
 
 ### `pg_emigrant reinit-sync`
 
-Repairs replication after a **Patroni switchover/failover**, when the old slot or
-subscription may have become stale or broken — **without re-copying data**. Safe
-to run any time; it only touches what's missing or unhealthy.
+Repairs replication after a **Patroni switchover/failover**, when the slot or
+subscription has become stale or broken.
+
+> **It cannot always repair without re-copying — and it will refuse rather than
+> pretend.** A logical slot is the only thing holding WAL that hasn't been
+> replayed yet. Once the slot is gone (the normal outcome of a pre-PG17
+> promotion) or its WAL has been recycled, every transaction committed since
+> its last confirmed LSN is unreachable for the target, and **no amount of
+> streaming can bring it back** — only a re-copy can. Recreating the
+> subscription in that state produces a target that is silently and
+> permanently missing rows *while reporting itself healthy*, so `reinit-sync`
+> **refuses that repair by default and changes nothing**, exiting non-zero
+> with the re-copy commands to run. Pass `--allow-data-gap` to override it
+> deliberately.
+>
+> Every other repair below is genuinely lossless and needs no flag.
 
 Checks, in order:
 
@@ -727,23 +742,42 @@ Checks, in order:
      rather than silent loss; resolve with `ALTER SUBSCRIPTION … SKIP`.)
    - slot **missing or `lost`** (the usual outcome of a Patroni promotion —
      logical slots don't survive failover before PostgreSQL 17 failover
-     slots) → drop what's left and create a fresh subscription with a fresh
-     slot — and print a **loud `DATA-LOSS WINDOW` warning**: the new slot
-     starts at the *current* LSN, so anything committed on the source between
-     the old slot's last confirmed LSN and the reinit was never streamed and
-     is permanently missing on the target. Verify affected tables (row
-     counts / checksums) and re-copy them if needed before cutover. On
-     PostgreSQL 17+ consider `sync_replication_slots = on` so a switchover
-     no longer loses the slot in the first place.
+     slots) → **REFUSED by default. Nothing is changed**, and the command
+     exits non-zero. A fresh slot would start at the *current* LSN, so
+     everything committed between the old slot's last confirmed LSN and now
+     was never streamed and cannot be recovered by replication. The refusal
+     happens *before* the broken subscription is dropped, so the database is
+     left exactly as it was found — inspectable, and no worse off. Restore
+     consistency with a re-copy:
+     `pg_emigrant teardown --database <db> && pg_emigrant bootstrap --database <db>`.
+     On PostgreSQL 17+ enable `sync_replication_slots = on` so a switchover
+     stops losing the slot in the first place.
+
+     Passing `--allow-data-gap` performs the repair anyway, **accepting
+     permanent data loss**: replication resumes for new writes, the missing
+     historical rows stay missing, the result is reported as data loss (not
+     as a clean repair), and the exit code is still non-zero. Only reasonable
+     when you have verified out-of-band that the window is empty — e.g. the
+     source took no writes while the slot was gone.
 
 ```bash
 pg_emigrant reinit-sync
 pg_emigrant reinit-sync --database myapp
 pg_emigrant reinit-sync --config /etc/pg_emigrant/prod.yaml
+pg_emigrant reinit-sync --database myapp --allow-data-gap   # accept data loss
 ```
 
 It reports, per database, the issues found (`⚠`), the actions taken (`✓`), or a
 "healthy — nothing to do" line, and a final summary rule.
+
+**Exit code** is `0` only when every database ended healthy or was repaired
+losslessly; it is `1` if any database was refused or repaired with a data gap —
+so a runbook or CI step can't mistake either outcome for success.
+
+In the **web GUI**, `--allow-data-gap` is deliberately not exposed: accepting
+permanent data loss must never be one click on a dashboard. A refused repair
+surfaces there as a **failed job** with the same guidance, and the deliberate
+override remains a CLI-only action.
 
 ---
 
@@ -922,11 +956,13 @@ pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
   regardless of which machine misresolved what — and raises immediately,
   quoting the subscription's stored `subconninfo`, if it never does. If
   this happens: `pg_emigrant status --database <db>` to confirm, then
-  either `pg_emigrant reinit-sync --database <db>` (recreates the
-  subscription with a fresh slot — data committed since the original slot's
-  last confirmed LSN is not recoverable, since the slot never streamed
-  anything) or, if nothing depends on this subscription yet,
-  `pg_emigrant teardown --database <db>` followed by a clean re-`bootstrap`.
+  either `pg_emigrant reinit-sync --database <db>` (which repairs it
+  losslessly if the slot survived, and otherwise **refuses and changes
+  nothing** — since a fresh slot cannot recover what the old one never
+  streamed) or, the reliable option here, `pg_emigrant teardown --database
+  <db>` followed by a clean re-`bootstrap`. In this particular failure the
+  subscription never streamed anything at all, so a re-copy is the correct
+  fix regardless.
   **If this keeps recurring even across `reinit-sync` attempts**, fixing the
   connection alone won't help until `config.yaml` itself is corrected —
   check, in this order: (1) is `source.host`/`target.host` set to
@@ -1037,7 +1073,8 @@ pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
   the source (missing `pg_hba.conf` replication entry, exhausted
   `max_wal_senders`, etc.), a clear error is raised — and, for `reinit-sync`'s
   from-scratch recovery path (the only caller that still lets `CREATE
-  SUBSCRIPTION` create its own slot), the resulting orphaned slot is cleaned up
+  SUBSCRIPTION` create its own slot, and only under `--allow-data-gap`), the
+  resulting orphaned slot is cleaned up
   automatically. Orphaned slots left by a previous interrupted run are also
   dropped (terminating the holding backend and waiting for the slot to go
   inactive) before a new one is created.
@@ -1070,6 +1107,8 @@ pg_emigrant detect-ddl --config config.yaml --apply
 
 # 6. (If source is Patroni and a failover happens) repair without re-copying
 pg_emigrant reinit-sync --config config.yaml
+#    Lossless if the slot survived. If the slot is gone it REFUSES and changes
+#    nothing (exit 1) — re-copy that database instead: teardown + bootstrap.
 
 # 7. Cutover
 pg_emigrant stop --config config.yaml                       # pause replication

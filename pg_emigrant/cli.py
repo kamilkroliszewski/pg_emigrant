@@ -500,14 +500,32 @@ def reinit_sync(
         None, "--database", "-d",
         help="Reinit only this database (default: all discovered)",
     ),
+    allow_data_gap: bool = typer.Option(
+        False, "--allow-data-gap",
+        help=(
+            "Recreate the subscription even when the replication slot is gone, "
+            "ACCEPTING PERMANENT DATA LOSS for everything committed since the old "
+            "slot's last confirmed LSN. Without this, such a repair is refused and "
+            "nothing is changed."
+        ),
+    ),
 ):
     """Re-initialize replication after a Patroni switchover/failover.
 
-    Checks each database for missing or broken publications, replication slots,
-    and subscriptions, then repairs them without re-copying data.
+    Repairs what can be repaired without re-copying data: a missing publication,
+    a disabled subscription, a stalled apply worker, or a subscription that was
+    lost while its replication slot survived (which resumes from the slot's
+    confirmed LSN — no gap).
 
-    Safe to run at any time — it only creates/enables/refreshes components
-    that are missing or not working.
+    NOT always safe to complete: if the replication slot itself is gone or its
+    WAL was recycled, the transactions it still held can no longer reach the
+    target, and no amount of streaming will bring them back. That repair is
+    REFUSED by default (nothing is changed) because completing it would leave a
+    silently incomplete target that reports itself healthy. Restore consistency
+    with 'teardown --database X' + 'bootstrap --database X', or override with
+    --allow-data-gap if you have verified the gap is acceptable.
+
+    Exits non-zero if any database was refused or repaired with data loss.
     """
     from pg_emigrant.db import discover_databases
     from pg_emigrant.replication import reinit_sync as do_reinit
@@ -516,13 +534,15 @@ def reinit_sync(
     cfg = load_config(config)
     warn_if_unstable_host(cfg)
 
-    async def _reinit():
+    async def _reinit() -> int:
         dbs = [database] if database else await discover_databases(cfg)
         all_healthy = True
+        blocked: list[str] = []
+        lossy: list[str] = []
 
         for db in dbs:
             console.rule(f"[bold cyan]Reinit Sync — {db}")
-            result = await do_reinit(cfg, db)
+            result = await do_reinit(cfg, db, allow_data_gap=allow_data_gap)
 
             if result["issues_found"]:
                 all_healthy = False
@@ -534,12 +554,44 @@ def reinit_sync(
             if result["was_healthy"]:
                 console.print(f"  [green]Replication for '{db}' is healthy — nothing to do")
 
+            if result.get("blocked"):
+                blocked.append(db)
+                console.print(
+                    f"  [bold red]✗  REFUSED for '{db}' — nothing was changed.[/bold red]\n"
+                    f"     [dim]The slot is gone, so the un-replayed transactions it held "
+                    f"cannot reach the target. Re-copy to restore consistency:[/dim]\n"
+                    f"     [bold]pg_emigrant teardown --database {db} && "
+                    f"pg_emigrant bootstrap --database {db}[/bold]\n"
+                    f"     [dim]Or re-run with --allow-data-gap to accept permanent loss.[/dim]"
+                )
+            if result.get("data_gap"):
+                lossy.append(db)
+                console.print(
+                    f"  [bold red]⚠  DATA WAS LOST for '{db}'[/bold red] "
+                    f"[dim]— replication runs again, but the target is missing rows "
+                    f"until you re-copy the affected tables. Do not cut over on it.[/dim]"
+                )
+
+        if blocked or lossy:
+            if blocked:
+                console.rule(
+                    f"[bold red]Reinit REFUSED for {len(blocked)} database(s): "
+                    f"{', '.join(blocked)} — nothing was changed"
+                )
+            if lossy:
+                console.rule(
+                    f"[bold red]Reinit completed WITH DATA LOSS for {len(lossy)} "
+                    f"database(s): {', '.join(lossy)} — re-copy before cutover"
+                )
+            return 1
         if all_healthy:
             console.rule("[bold green]All databases are healthy")
         else:
-            console.rule("[bold yellow]Reinit complete — issues were detected and repaired")
+            console.rule("[bold green]Reinit complete — issues repaired with no data loss")
+        return 0
 
-    _run(_reinit())
+    if _run(_reinit()) != 0:
+        raise typer.Exit(code=1)
 
 
 @app.command()
