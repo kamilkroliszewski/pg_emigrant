@@ -12,7 +12,7 @@ authentication — do not expose it publicly without a reverse proxy + auth.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from flask import (
     Flask,
@@ -21,11 +21,28 @@ from flask import (
     render_template,
     request,
 )
+from flask.json.provider import DefaultJSONProvider
 
 from pg_emigrant.config import ReplicatorConfig, load_config
 from pg_emigrant.utils import setup_logging
 from pg_emigrant.web import services
 from pg_emigrant.web.jobs import JobManager
+
+
+class _EmigrantJSONProvider(DefaultJSONProvider):
+    """JSON provider that falls back to ``str()`` for otherwise-unserialisable
+    types (e.g. ``datetime.timedelta`` from interval columns such as
+    ``pg_stat_replication.write_lag``), mirroring the CLI's
+    ``json.dumps(..., default=str)`` behaviour so the API never 500s on data
+    the dashboard can otherwise render just fine as text.
+    """
+
+    @staticmethod
+    def default(o: Any) -> Any:
+        try:
+            return DefaultJSONProvider.default(o)
+        except TypeError:
+            return str(o)
 
 
 def create_app(config_path: str = "config.yaml") -> Flask:
@@ -38,6 +55,7 @@ def create_app(config_path: str = "config.yaml") -> Flask:
     setup_logging(False)  # ensure INFO-level logging so jobs can capture output
 
     app = Flask(__name__)
+    app.json = _EmigrantJSONProvider(app)
     app.config["EMIGRANT_CONFIG_PATH"] = config_path
     app.config["EMIGRANT_JOBS"] = JobManager()
 
