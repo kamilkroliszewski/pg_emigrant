@@ -652,6 +652,10 @@ def reinit_sync(
             "nothing is changed."
         ),
     ),
+    format: str = typer.Option(
+        "rich", "--format", "-f",
+        help="Output format: rich (default) or json (machine-readable result on stdout)",
+    ),
 ):
     """Re-initialize replication after a Patroni switchover/failover.
 
@@ -674,8 +678,12 @@ def reinit_sync(
     from pg_emigrant.replication import reinit_sync as do_reinit
     from pg_emigrant.replication import warn_if_unstable_host
 
+    import json as _json
+
+    format = _resolve_format(format)
     cfg = _load(config)
     warn_if_unstable_host(cfg)
+    results: list[dict] = []
 
     async def _reinit() -> int:
         dbs = [database] if database else await discover_databases(cfg)
@@ -686,6 +694,7 @@ def reinit_sync(
         for db in dbs:
             console.rule(f"[bold cyan]Reinit Sync — {db}")
             result = await do_reinit(cfg, db, allow_data_gap=allow_data_gap)
+            results.append(result)
 
             if result["issues_found"]:
                 all_healthy = False
@@ -733,8 +742,27 @@ def reinit_sync(
             console.rule("[bold green]Reinit complete — issues repaired with no data loss")
         return 0
 
-    if _run(_reinit()) != 0:
-        raise typer.Exit(code=1)
+    code = _run(_reinit())
+
+    if format == "json":
+        blocked = [r for r in results if r.get("blocked")]
+        lossy = [r for r in results if r.get("data_gap")]
+        print(_json.dumps({
+            "repaired": code == 0,
+            # 'blocked' is the one an automated caller must never treat as a
+            # transient failure to retry: the repair is impossible, not slow.
+            "blocked": [r["database"] for r in blocked],
+            "data_gap": [r["database"] for r in lossy],
+            "databases": results,
+        }, indent=2, default=str))
+
+    if code != 0:
+        # A refusal is not the same failure as a completed-but-lossy repair:
+        # the first means 'this cannot be fixed by streaming', the second
+        # means 'it was fixed and the target is now incomplete'.
+        if any(r.get("blocked") for r in results):
+            raise typer.Exit(code=exits.RECOVERY_IMPOSSIBLE)
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
 
 
 @app.command(name="cutover-check")

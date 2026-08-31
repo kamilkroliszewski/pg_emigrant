@@ -18,7 +18,7 @@ import psycopg2.extras
 from pg_emigrant.config import DatabaseConfig, ReplicatorConfig
 from pg_emigrant.db import connect, discover_schemas
 from pg_emigrant.scope import filter_pairs
-from pg_emigrant.utils import get_logger, qi, ql
+from pg_emigrant.utils import get_logger, qi, ql, redact_conninfo
 
 log = get_logger(__name__)
 
@@ -346,11 +346,19 @@ async def create_replication_slot_with_snapshot(
         await _warn_replication_slot_blockers(probe)
 
     conninfo = _libpq_conninfo(cfg.source, dbname, replication=True)
-    conn = await asyncio.to_thread(
-        psycopg2.connect,
-        conninfo,
-        connection_factory=psycopg2.extras.LogicalReplicationConnection,
-    )
+    try:
+        conn = await asyncio.to_thread(
+            psycopg2.connect,
+            conninfo,
+            connection_factory=psycopg2.extras.LogicalReplicationConnection,
+        )
+    except Exception as exc:
+        # psycopg2 can quote the connection string it was given, password and
+        # all, back into the error text.
+        raise RuntimeError(
+            f"could not open a replication connection to the source for "
+            f"{dbname}: {redact_conninfo(str(exc))}"
+        ) from None
     try:
         cur = conn.cursor()
         # asyncio.shield: on timeout we still want to await the (now-cancelled)
@@ -695,6 +703,11 @@ async def create_subscription(
             # the WAL receiver cannot reach the source (e.g. pg_hba.conf replication
             # entry missing for the target host, max_wal_senders exhausted, or network
             # change).
+            #
+            # The statement embeds the source password (that is what CONNECTION
+            # is), and a server error can carry the failing statement back in
+            # its context — so anything raised from here is re-raised with the
+            # text redacted rather than allowed to reach a log or the GUI.
             await conn.execute(sql, timeout=60)
         except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError) as exc:
             log.error(
@@ -714,7 +727,12 @@ async def create_subscription(
                 f"CREATE SUBSCRIPTION {sub} timed out — verify that the source "
                 f"pg_hba.conf has a 'replication' entry for the target host "
                 f"and that max_wal_senders is not exhausted"
-            ) from exc
+            ) from None
+        except Exception as exc:
+            raise RuntimeError(
+                f"CREATE SUBSCRIPTION {sub} failed in {dbname}: "
+                f"{redact_conninfo(str(exc))}"
+            ) from None
         log.info("Created subscription %s in %s", sub, dbname)
 
         # CREATE SUBSCRIPTION succeeding proves NOTHING about whether
@@ -763,7 +781,8 @@ async def create_subscription(
                 f"literal string to ITSELF, not to the source; (2) 'source' is a "
                 f"load-balanced endpoint that routed pg_emigrant's own "
                 f"connections and the apply worker's connection to different "
-                f"physical nodes. The stored connection string is: {subconninfo!r} "
+                f"physical nodes. The stored connection string is: "
+                f"{redact_conninfo(subconninfo)!r} "
                 f"— log into the TARGET machine itself and confirm THIS EXACT "
                 f"string, from there, reaches the real source (not the target "
                 f"itself, not a different node). 'source.host' must be a fixed "
