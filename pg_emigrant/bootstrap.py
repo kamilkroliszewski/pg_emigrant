@@ -80,6 +80,7 @@ from pg_emigrant.ddl_detector import detect_drift
 from pg_emigrant.guards import assert_distinct_clusters
 from pg_emigrant.report import BootstrapIncomplete, BootstrapReport
 from pg_emigrant.replication import (
+    SlotInUse,
     create_publication,
     create_replication_slot_with_snapshot,
     create_subscription,
@@ -258,9 +259,11 @@ async def bootstrap(
             result = report.add(dbname)
             task = progress.add_task(f"Migrating {dbname}…", total=None)
             # Tracks whether the publication/slot for this database have been
-            # created yet, so the except-handler below knows what it needs to
-            # clean up on any failure (from here on, this database owns
-            # server-side replication state that must not be left orphaned).
+            # Tracks what THIS run created on the source, so the except-handler
+            # below rolls back only its own work.  Both are deliberately about
+            # authorship, not existence: rolling back an object another
+            # migration owns is how a failed run takes a healthy one down with
+            # it.
             slot = None
             pub_created = False
 
@@ -375,8 +378,12 @@ async def bootstrap(
                 # data copy, so the copy can use the slot's own exported snapshot.
                 progress.update(task, description=f"[{dbname}] Creating publication…")
                 maybe_fail("publication_create")
-                await create_publication(cfg, dbname, schemas=schemas)
-                pub_created = True
+                # Only True when THIS run created it.  A publication that was
+                # already there belongs to something else — most plausibly
+                # another migration configured with the same names — and
+                # dropping it during this run's rollback would stop that
+                # migration's subscription dead.
+                pub_created = await create_publication(cfg, dbname, schemas=schemas)
 
                 progress.update(task, description=f"[{dbname}] Creating replication slot…")
                 maybe_fail("slot_create")
@@ -652,6 +659,7 @@ async def bootstrap(
                             TdeNotAvailable,
                             IncompatibleTargetColumns,
                             UnsafeTruncate,
+                            SlotInUse,
                         ))
                         else repr(exc)
                     )
@@ -735,9 +743,30 @@ async def _rollback_replication_state(
     # can land between CREATE_REPLICATION_SLOT returning on the server and the
     # handle being assigned here, and that orphan is the one that quietly
     # retains WAL.  Drop by name, which covers both cases.
-    slot_name = slot.slot_name if slot is not None else sub_name(cfg, dbname)
+    if slot is not None:
+        # Release the snapshot-holding replication connection first: it is what
+        # keeps this run's own slot ACTIVE, and an active slot cannot be
+        # dropped.  Harmless if the caller already closed it.
+        try:
+            await slot.aclose()
+        except Exception:
+            pass
+
+    # force is deliberately tied to provable ownership.  With a handle, this run
+    # created the slot and may remove it.  Without one — an interrupt landing
+    # between CREATE_REPLICATION_SLOT returning on the server and the handle
+    # being assigned here — the name is all we have, so an INACTIVE slot is
+    # dropped as the orphan it is, while an active one is left alone: at that
+    # point it is something else's, and taking it would break that migration.
+    own_slot = slot is not None
+    slot_name = slot.slot_name if own_slot else sub_name(cfg, dbname)
     try:
-        await drop_replication_slot(cfg, dbname, slot_name)
+        await drop_replication_slot(cfg, dbname, slot_name, force=own_slot)
+    except SlotInUse as exc:
+        log.warning(
+            "[%s] Not dropping replication slot %s during rollback: %s",
+            dbname, slot_name, exc,
+        )
     except Exception as cleanup_exc:
         log.warning("Could not clean up slot %s for %s: %s", slot_name, dbname, cleanup_exc)
     if pub_created:

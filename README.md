@@ -971,6 +971,18 @@ cleared. CSV `COPY` will happily load a `bigint` into a `text` column, so
 without this the run would report success while the target quietly stopped
 being the same data.
 
+**It will not take over another migration's replication objects.** Slots are
+cluster-wide and named from the configuration, so two migrations that were
+never told about each other can collide on one. A slot that is **active** —
+something is streaming from it right now — is never reclaimed implicitly:
+doing so terminates that walsender, drops the slot, and leaves the other
+migration's target silently missing every subsequent change while continuing to
+report itself healthy. Same for a slot belonging to a different database, and
+for a publication this run did not create: a failed run rolls back only its own
+work. Reclaiming an *inactive* orphan — what an interrupted run leaves behind —
+still happens automatically. `teardown` is the explicit way to remove a live
+one.
+
 **It will not claim replication was repaired when it was not.** If the
 replication slot is gone or its WAL was recycled, everything committed since
 its last confirmed LSN is unreachable. `reinit-sync` decides this **before**
