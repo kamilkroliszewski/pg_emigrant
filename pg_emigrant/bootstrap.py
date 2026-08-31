@@ -64,6 +64,8 @@ default alone.  See :mod:`pg_emigrant.tde`.
 
 from __future__ import annotations
 
+import asyncio
+
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from pg_emigrant.config import ReplicatorConfig
@@ -75,6 +77,7 @@ from pg_emigrant.data_copy import (
 )
 from pg_emigrant.db import connect, discover_databases, discover_schemas
 from pg_emigrant.ddl_detector import detect_drift
+from pg_emigrant.guards import assert_distinct_clusters
 from pg_emigrant.report import BootstrapIncomplete, BootstrapReport, DatabaseResult
 from pg_emigrant.replication import (
     create_publication,
@@ -229,6 +232,13 @@ async def bootstrap(
     access_method = TDE_ACCESS_METHOD if use_pg_tde else None
 
     warn_if_unstable_host(cfg)
+
+    # Before anything is discovered, created or truncated.  Deliberately here
+    # and not only in the (skippable, CLI-only) preflight: the initial copy
+    # TRUNCATEs its target tables, so a target that is really the source
+    # destroys production data — and the web GUI and library callers never run
+    # preflight at all.
+    await assert_distinct_clusters(cfg)
 
     # Step 1: discover databases
     if database:
@@ -615,72 +625,71 @@ async def bootstrap(
 
                 progress.update(task, description=f"[{dbname}] ✓ Done")
 
-            except Exception as exc:
-                # Both of these carry a message written to be read by a human;
-                # anything else is an unexpected exception whose repr() (type
-                # included) is the more useful thing to show.
-                reason = (
-                    str(exc)
-                    if isinstance(exc, (
-                        _DatabaseBootstrapFailed,
-                        TdeNotAvailable,
-                        IncompatibleTargetColumns,
-                        UnsafeTruncate,
-                    ))
-                    else repr(exc)
-                )
-                console.print(
-                    f"  [bold red]✗ [{dbname}] Bootstrap FAILED: {reason}[/bold red]"
-                )
-                console.print(
-                    f"  [bold red]  Cleaning up and aborting {dbname} before replication "
-                    f"setup — fix the cause and re-run bootstrap for this database.[/bold red]"
-                )
-                log.error("Bootstrap failed for %s: %s", dbname, reason)
-
-                # Only safe to roll back the slot/publication we created if no
-                # subscription ended up depending on them.  Check the actual
-                # server state rather than "did we reach that line" — a late
-                # error (e.g. a timeout) could in principle fire right after
-                # CREATE SUBSCRIPTION actually succeeded server-side, and
-                # dropping the slot out from under a working subscription
-                # would be worse than the original error.
-                sub_exists = False
-                try:
-                    async with connect(cfg.target, dbname) as probe:
-                        sub_exists = bool(await probe.fetchval(
-                            "SELECT 1 FROM pg_subscription WHERE subname = $1"
-                            " AND subdbid = (SELECT oid FROM pg_database"
-                            " WHERE datname = current_database())",
-                            sub_name(cfg, dbname),
-                        ))
-                except Exception:
-                    pass  # can't verify — err on the side of NOT auto-dropping
-
-                if sub_exists:
-                    log.warning(
-                        "[%s] A subscription already exists despite the error above — "
-                        "NOT auto-dropping its slot/publication. Investigate with "
-                        "'pg_emigrant status --database %s' and 'reinit-sync' if needed.",
-                        dbname, dbname,
+            except BaseException as exc:
+                # BaseException, not Exception: Ctrl-C (KeyboardInterrupt) and
+                # a cancelled task (which is how SIGTERM arrives — see
+                # cli._run) are exactly the moments a half-created replication
+                # slot is most likely to exist, and they are not Exceptions.
+                # Letting them skip this handler is what left an orphaned
+                # logical slot retaining WAL on the production source after
+                # every interrupted run.
+                interrupted = isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError))
+                if interrupted:
+                    reason = "interrupted before replication was configured"
+                    console.print(
+                        f"\n  [bold yellow]Interrupted — rolling back {dbname}'s "
+                        f"replication objects on the source. Do not kill this "
+                        f"process; an abandoned slot retains WAL.[/bold yellow]"
                     )
                 else:
-                    if slot is not None:
-                        try:
-                            await drop_replication_slot(cfg, dbname, slot.slot_name)
-                        except Exception as cleanup_exc:
-                            log.warning(
-                                "Could not clean up slot %s for %s: %s",
-                                slot.slot_name, dbname, cleanup_exc,
-                            )
-                    if pub_created:
-                        try:
-                            await drop_publication(cfg, dbname)
-                        except Exception as cleanup_exc:
-                            log.warning(
-                                "Could not clean up publication for %s: %s", dbname, cleanup_exc,
-                            )
+                    # Both of these carry a message written to be read by a human;
+                    # anything else is an unexpected exception whose repr() (type
+                    # included) is the more useful thing to show.
+                    reason = (
+                        str(exc)
+                        if isinstance(exc, (
+                            _DatabaseBootstrapFailed,
+                            TdeNotAvailable,
+                            IncompatibleTargetColumns,
+                            UnsafeTruncate,
+                        ))
+                        else repr(exc)
+                    )
+                    console.print(
+                        f"  [bold red]✗ [{dbname}] Bootstrap FAILED: {reason}[/bold red]"
+                    )
+                    console.print(
+                        f"  [bold red]  Cleaning up and aborting {dbname} before replication "
+                        f"setup — fix the cause and re-run bootstrap for this database.[/bold red]"
+                    )
+                log.error("Bootstrap failed for %s: %s", dbname, reason)
+
+                try:
+                    # Bounded: an unreachable source must not turn an interrupt
+                    # into a hang.  If it does time out, the orphan is left
+                    # behind deliberately and named in the message below — the
+                    # next bootstrap run adopts it (and 'teardown' removes it).
+                    await asyncio.wait_for(
+                        _rollback_replication_state(cfg, dbname, slot, pub_created),
+                        timeout=60,
+                    )
+                except (asyncio.TimeoutError, Exception) as cleanup_exc:
+                    log.error(
+                        "[%s] Could not roll back replication state: %s. If a "
+                        "replication slot named %r still exists on the source it "
+                        "is retaining WAL — re-run bootstrap for this database "
+                        "(which adopts it) or drop it with 'pg_emigrant teardown "
+                        "--database %s'.",
+                        dbname, cleanup_exc, sub_name(cfg, dbname), dbname,
+                    )
+
                 result.fail(reason)
+                if interrupted:
+                    # The operator asked for this to stop, so stop — but only
+                    # after the rollback above, and with the report intact so
+                    # the caller still reports a non-zero, explained outcome.
+                    _print_summary(report)
+                    raise BootstrapIncomplete(report) from exc
             finally:
                 progress.remove_task(task)
 
@@ -688,6 +697,54 @@ async def bootstrap(
     if not report.passed:
         raise BootstrapIncomplete(report)
     return report
+
+
+async def _rollback_replication_state(
+    cfg: ReplicatorConfig, dbname: str, slot, pub_created: bool
+) -> None:
+    """Undo the source-side objects this database's run created.
+
+    Only safe when no subscription ended up depending on them, so the actual
+    server state is checked rather than "did we reach that line" — a late error
+    (a timeout, an interrupt) can fire right after CREATE SUBSCRIPTION
+    succeeded server-side, and dropping the slot out from under a working
+    subscription would be worse than the error that got us here.
+    """
+    sub_exists = False
+    try:
+        async with connect(cfg.target, dbname) as probe:
+            sub_exists = bool(await probe.fetchval(
+                "SELECT 1 FROM pg_subscription WHERE subname = $1"
+                " AND subdbid = (SELECT oid FROM pg_database"
+                " WHERE datname = current_database())",
+                sub_name(cfg, dbname),
+            ))
+    except Exception:
+        pass  # can't verify — err on the side of NOT auto-dropping
+
+    if sub_exists:
+        log.warning(
+            "[%s] A subscription already exists despite the error above — "
+            "NOT auto-dropping its slot/publication. Investigate with "
+            "'pg_emigrant status --database %s' and 'reinit-sync' if needed.",
+            dbname, dbname,
+        )
+        return
+
+    # The slot may exist even when this run has no handle on it: an interrupt
+    # can land between CREATE_REPLICATION_SLOT returning on the server and the
+    # handle being assigned here, and that orphan is the one that quietly
+    # retains WAL.  Drop by name, which covers both cases.
+    slot_name = slot.slot_name if slot is not None else sub_name(cfg, dbname)
+    try:
+        await drop_replication_slot(cfg, dbname, slot_name)
+    except Exception as cleanup_exc:
+        log.warning("Could not clean up slot %s for %s: %s", slot_name, dbname, cleanup_exc)
+    if pub_created:
+        try:
+            await drop_publication(cfg, dbname)
+        except Exception as cleanup_exc:
+            log.warning("Could not clean up publication for %s: %s", dbname, cleanup_exc)
 
 
 def _print_summary(report: BootstrapReport) -> None:

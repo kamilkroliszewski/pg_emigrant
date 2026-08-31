@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 from typing import Optional
 
 import typer
@@ -10,7 +11,7 @@ from rich.table import Table
 
 from pg_emigrant import exits
 from pg_emigrant.config import load_config
-from pg_emigrant.utils import console, setup_logging
+from pg_emigrant.utils import console, route_console_to_stderr, setup_logging
 
 app = typer.Typer(
     name="pg_emigrant",
@@ -20,8 +21,78 @@ app = typer.Typer(
 
 
 def _run(coro):
-    """Run an async coroutine from the synchronous CLI layer."""
-    return asyncio.run(coro)
+    """Run an async coroutine from the synchronous CLI layer.
+
+    SIGINT and SIGTERM cancel the running task rather than tearing the process
+    down where it stands.  That matters because the dangerous moment to be
+    killed is the one where a replication slot exists on the production source
+    and nothing is attached to it yet: an abandoned logical slot retains WAL
+    until somebody drops it, which is how an interrupted migration fills a
+    primary's disk days later.  Cancellation gives the orchestrators a chance
+    to roll that back (see bootstrap's handler); SIGKILL by definition does
+    not, so the recovery path there is the next run adopting the orphan.
+    """
+    async def _cancellable():
+        task = asyncio.ensure_future(coro)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, task.cancel)
+            except (NotImplementedError, RuntimeError):
+                # Windows, or a non-main thread: fall back to the default
+                # behaviour rather than failing to run at all.
+                pass
+        return await task
+
+    return asyncio.run(_cancellable())
+
+
+_FORMATS = ("rich", "simple", "json")
+
+
+def _resolve_format(fmt: str) -> str:
+    """Validate ``--format`` and, for JSON, get everything else off stdout.
+
+    An unrecognised value used to fall through to the rich renderer, so a
+    typo in a CI pipeline's ``--format jsom`` produced a coloured table that
+    the pipeline then failed to parse, blaming the data.
+    """
+    fmt = fmt.strip().lower()
+    if fmt not in _FORMATS:
+        console.print(
+            f"[bold red]Configuration error:[/bold red] unknown --format "
+            f"{fmt!r}; expected one of {', '.join(_FORMATS)}"
+        )
+        raise typer.Exit(code=exits.CONFIG_ERROR)
+    if fmt == "json":
+        route_console_to_stderr()
+    return fmt
+
+
+def _load(config: str):
+    """Load the configuration, turning any problem with it into exit 2.
+
+    A missing file, invalid YAML or a rejected setting is a *configuration*
+    error, not a migration failure — a runbook needs to tell "fix your config"
+    apart from "the migration went wrong", and an unhandled traceback tells it
+    neither.
+    """
+    from pydantic import ValidationError
+
+    try:
+        return load_config(config)
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        raise typer.Exit(code=exits.CONFIG_ERROR)
+    except ValidationError as exc:
+        console.print("[bold red]Configuration error:[/bold red]")
+        for err in exc.errors():
+            location = ".".join(str(p) for p in err["loc"]) or "(root)"
+            console.print(f"  [red]{location}: {err['msg']}[/red]")
+        raise typer.Exit(code=exits.CONFIG_ERROR)
+    except Exception as exc:  # malformed YAML, unreadable file, …
+        console.print(f"[bold red]Configuration error:[/bold red] {exc!s}")
+        raise typer.Exit(code=exits.CONFIG_ERROR)
 
 
 @app.callback()
@@ -63,7 +134,8 @@ def preflight(
 
     from pg_emigrant.preflight import ERROR, OK, SKIP, WARN, run_preflight
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
     report = _run(run_preflight(cfg, database=database, use_pg_tde=using_pg_tde))
 
     if format == "json":
@@ -117,7 +189,7 @@ def preflight(
             console.rule(f"[bold red]Preflight FAILED — {report.summary}")
 
     if not report.passed or (strict and report.warnings):
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exits.PREFLIGHT_FAILED)
 
 
 @app.command()
@@ -154,10 +226,12 @@ def bootstrap(
     import json as _json
 
     from pg_emigrant.bootstrap import bootstrap as do_bootstrap
+    from pg_emigrant.guards import UnsafeOperation
     from pg_emigrant.preflight import run_preflight
     from pg_emigrant.report import BootstrapIncomplete
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     # Gate the irreversible part behind the read-only checks: almost everything
     # that makes a bootstrap fail halfway (missing extension/role on the target,
@@ -186,10 +260,18 @@ def bootstrap(
 
     try:
         result = _run(do_bootstrap(cfg, database=database, use_pg_tde=using_pg_tde))
+    except UnsafeOperation as exc:
+        console.print(f"[bold red]Refusing to start the migration:[/bold red] {exc}")
+        raise typer.Exit(code=exits.UNSAFE_REFUSED)
     except BootstrapIncomplete as exc:
         if format == "json":
             print(_json.dumps(exc.report.to_dict(), indent=2))
         raise typer.Exit(code=exc.report.exit_code)
+    except asyncio.CancelledError:
+        # An interrupt that reached here without a report: the run was
+        # cancelled before it had per-database state to summarise.
+        console.print("[bold yellow]Interrupted — nothing further was changed.[/bold yellow]")
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
     except RuntimeError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=exits.MIGRATION_FAILED)
@@ -207,7 +289,7 @@ def start(
     from pg_emigrant.db import discover_databases
     from pg_emigrant.replication import enable_subscription
 
-    cfg = load_config(config)
+    cfg = _load(config)
 
     async def _start():
         dbs = [database] if database else await discover_databases(cfg)
@@ -227,7 +309,7 @@ def stop(
     from pg_emigrant.db import discover_databases
     from pg_emigrant.replication import disable_subscription
 
-    cfg = load_config(config)
+    cfg = _load(config)
 
     async def _stop():
         dbs = [database] if database else await discover_databases(cfg)
@@ -245,18 +327,27 @@ def teardown(
 ):
     """Remove subscriptions, publications, and replication slots."""
     from pg_emigrant.db import discover_databases
+    from pg_emigrant.guards import UnsafeOperation, assert_distinct_clusters
     from pg_emigrant.replication import drop_publication, drop_subscription
 
-    cfg = load_config(config)
+    cfg = _load(config)
 
     async def _teardown():
+        # Teardown drops publications and replication slots on the SOURCE; if
+        # 'target' is really the source, the subscription lookup and the drop
+        # both land on production.
+        await assert_distinct_clusters(cfg)
         dbs = [database] if database else await discover_databases(cfg)
         for db in dbs:
             await drop_subscription(cfg, db)
             await drop_publication(cfg, db)
             console.print(f"[red]Torn down replication for {db}")
 
-    _run(_teardown())
+    try:
+        _run(_teardown())
+    except UnsafeOperation as exc:
+        console.print(f"[bold red]Refusing to tear down:[/bold red] {exc}")
+        raise typer.Exit(code=exits.UNSAFE_REFUSED)
 
 
 @app.command()
@@ -274,7 +365,8 @@ def status(
     """Display replication status, lag, sequence sync, and drift for all databases."""
     from pg_emigrant.monitor import _ALL_SECTIONS, build_status
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     selected: set[str] = set()
     if show_subscription:
@@ -327,7 +419,8 @@ def sync_sequences(
     from pg_emigrant.replication import run_new_table_sync_loop
     from pg_emigrant.sequence_sync import run_sequence_sync_loop, sync_sequences_once
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     def _kv_quote(s: object) -> str:
         v = str(s) if s is not None else ""
@@ -428,7 +521,8 @@ def detect_ddl(
     from pg_emigrant.db import discover_databases
     from pg_emigrant.ddl_detector import apply_drift_fixes, detect_drift
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     def _kv_quote(s: object) -> str:
         v = str(s) if s is not None else ""
@@ -571,7 +665,7 @@ def reinit_sync(
     from pg_emigrant.replication import reinit_sync as do_reinit
     from pg_emigrant.replication import warn_if_unstable_host
 
-    cfg = load_config(config)
+    cfg = _load(config)
     warn_if_unstable_host(cfg)
 
     async def _reinit() -> int:

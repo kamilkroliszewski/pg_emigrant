@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -15,6 +16,20 @@ console = Console()
 # the payload unparseable.  Keeping diagnostics on stderr is also just the Unix
 # convention, and it leaves them visible on an interactive terminal either way.
 _log_console = Console(stderr=True)
+
+
+def route_console_to_stderr() -> None:
+    """Send every human-facing console write to stderr.
+
+    Called whenever a command is asked for machine-readable output.  Log
+    records already go to stderr, but the Rich ``console`` — progress spinners,
+    rules, per-table copy lines, the final summary — writes to stdout, and a
+    single one of those interleaved into a JSON document makes it unparseable
+    for the caller that asked for JSON precisely so it would not have to parse
+    prose.  Keeping the diagnostics is the point: they still appear on the
+    terminal, just not in the payload.
+    """
+    console.file = sys.stderr
 
 
 def setup_logging(verbose: bool = False) -> None:
