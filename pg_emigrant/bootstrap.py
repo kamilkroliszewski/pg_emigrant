@@ -674,14 +674,15 @@ async def bootstrap(
 
                 try:
                     # Bounded: an unreachable source must not turn an interrupt
-                    # into a hang.  If it does time out, the orphan is left
-                    # behind deliberately and named in the message below — the
-                    # next bootstrap run adopts it (and 'teardown' removes it).
+                    # into a hang.  Timing out — or a SECOND interrupt, which
+                    # cancels this too — leaves the orphan behind deliberately,
+                    # named in the message below; the next bootstrap run adopts
+                    # it, and 'teardown' removes it.
                     await asyncio.wait_for(
                         _rollback_replication_state(cfg, dbname, slot, pub_created),
                         timeout=60,
                     )
-                except (asyncio.TimeoutError, Exception) as cleanup_exc:
+                except Exception as cleanup_exc:  # TimeoutError included
                     log.error(
                         "[%s] Could not roll back replication state: %s. If a "
                         "replication slot named %r still exists on the source it "
