@@ -23,6 +23,8 @@ dependencies = [
 [project.optional-dependencies]
 # Web GUI (pg_emigrant web). Install with: pip install -e ".[web]"
 web = ["flask>=3.0"]
+# Test suite. The integration half needs Docker on the machine running it.
+test = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 pg_emigrant = "pg_emigrant.cli:app"
@@ -32,3 +34,14 @@ include = ["pg_emigrant*"]
 
 [tool.setuptools.package-data]
 "pg_emigrant.web" = ["templates/*.html", "static/css/*.css", "static/js/*.js", "static/img/*"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs a real PostgreSQL in Docker",
+    "slow: takes more than a few seconds",
+]
+filterwarnings = ["error::DeprecationWarning:pg_emigrant.*"]
