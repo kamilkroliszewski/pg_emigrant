@@ -355,6 +355,13 @@ def status(
     config: str = typer.Option("config.yaml", "--config", "-c"),
     database: Optional[str] = typer.Option(None, "--database", "-d", help="Show status for a specific database only"),
     format: str = typer.Option("rich", "--format", "-f", help="Output format: rich (default), simple (grep-friendly), json"),
+    show_health: bool = typer.Option(
+        False, "--health",
+        help=(
+            "Show the replication health state (HEALTHY/LAGGING/CRITICAL/BROKEN), "
+            "unapplied-WAL lag, and how much WAL the slot is retaining on the source"
+        ),
+    ),
     show_subscription: bool = typer.Option(False, "--subscription", help="Show subscription status"),
     show_slots: bool = typer.Option(False, "--slots", help="Show replication slots"),
     show_lag: bool = typer.Option(False, "--lag", help="Show replication lag"),
@@ -369,6 +376,8 @@ def status(
     cfg = _load(config)
 
     selected: set[str] = set()
+    if show_health:
+        selected.add("health")
     if show_subscription:
         selected.add("subscription")
     if show_slots:
@@ -726,6 +735,90 @@ def reinit_sync(
 
     if _run(_reinit()) != 0:
         raise typer.Exit(code=1)
+
+
+@app.command(name="cutover-check")
+def cutover_check(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file"),
+    database: Optional[str] = typer.Option(
+        None, "--database", "-d", help="Check only this database (default: all discovered)"
+    ),
+    max_lag_bytes: int = typer.Option(
+        None, "--max-lag-bytes",
+        help=(
+            "How far behind the target may be and still count as caught up "
+            "(default 8 MiB). Not zero: a live source keeps committing, so the "
+            "gap is never exactly nothing while the application is running."
+        ),
+    ),
+    accept_drift: bool = typer.Option(
+        False, "--accept-drift",
+        help=(
+            "Treat existing schema drift as a deliberate decision rather than a "
+            "blocker. Use only after reviewing 'detect-ddl' output."
+        ),
+    ),
+    format: str = typer.Option("rich", "--format", "-f", help="Output format: rich (default), simple, json"),
+):
+    """Answer one question, read-only: is it safe to cut over yet?
+
+    Checks that replication is healthy and caught up, that sequences are at or
+    ahead of the source, that there is no unresolved schema drift, that the
+    target is reachable and writable, and that source and target really are
+    different clusters. Anything that cannot be verified counts against
+    readiness — a green light on missing evidence is worse than a red one.
+
+    Changes nothing. It will not stop the application, disable the
+    subscription, or move any traffic: when to move traffic involves load
+    balancers, DNS, connection pools and people, none of which this tool can
+    see. Exit code 0 means SAFE TO CUT OVER, 5 means DO NOT CUT OVER.
+    """
+    import json as _json
+
+    from pg_emigrant.cutover import DEFAULT_MAX_LAG_BYTES, check_cutover_readiness
+
+    format = _resolve_format(format)
+    cfg = _load(config)
+    report = _run(check_cutover_readiness(
+        cfg, database=database,
+        max_lag_bytes=max_lag_bytes if max_lag_bytes is not None else DEFAULT_MAX_LAG_BYTES,
+        accept_drift=accept_drift,
+    ))
+
+    if format == "json":
+        print(_json.dumps(report.to_dict(), indent=2))
+    elif format == "simple":
+        for db in report.databases:
+            for c in db.checks:
+                print(
+                    f"db={db.database} check={c.name} "
+                    f"ready={'yes' if c.ready else 'no'} summary={c.summary!r}"
+                )
+        print(f"ready={'yes' if report.ready else 'no'} summary={report.summary!r}")
+    else:
+        console.rule("[bold]pg_emigrant cutover readiness")
+        for db in report.databases:
+            tbl = Table(title=f"Database: {db.database}", show_lines=False, expand=True)
+            tbl.add_column("", width=1, no_wrap=True)
+            tbl.add_column("Check", no_wrap=True)
+            tbl.add_column("Result")
+            for c in db.checks:
+                mark = "[green]✓[/green]" if c.ready else "[bold red]✗[/bold red]"
+                style = "" if c.ready else "red"
+                tbl.add_row(mark, c.name,
+                            f"[{style}]{c.summary}[/{style}]" if style else c.summary)
+            console.print(tbl)
+            for c in db.blockers:
+                if c.detail:
+                    console.print(f"  [red]✗ {c.name}[/red] — {c.detail}")
+        console.print()
+        if report.ready:
+            console.rule(f"[bold green]{report.summary}")
+        else:
+            console.rule(f"[bold red]{report.summary}")
+
+    if not report.ready:
+        raise typer.Exit(code=exits.REPLICATION_UNHEALTHY)
 
 
 @app.command()

@@ -18,6 +18,7 @@ from pg_emigrant.replication import (
     get_subscription_status,
     sub_name,
 )
+from pg_emigrant.health import human_bytes, replication_health
 from pg_emigrant.schema_sync import get_tables
 from pg_emigrant.sequence_sync import get_sequence_status
 from pg_emigrant.utils import console, get_logger
@@ -26,14 +27,16 @@ log = get_logger(__name__)
 
 T = TypeVar("T")
 
-_ALL_SECTIONS = frozenset({"subscription", "slots", "lag", "tables", "sequences", "drift"})
+_ALL_SECTIONS = frozenset(
+    {"health", "subscription", "slots", "lag", "tables", "sequences", "drift"}
+)
 
 # Sections backed by cluster-wide catalogs/views — one query returns every
 # database's data at once (no per-database connection needed).
 _GLOBAL_SECTIONS = frozenset({"subscription", "slots", "lag"})
 # Sections whose data lives inside each database and therefore require a
 # connection to that specific database.
-_LOCAL_SECTIONS = frozenset({"tables", "sequences", "drift"})
+_LOCAL_SECTIONS = frozenset({"health", "tables", "sequences", "drift"})
 
 # How many databases to inspect concurrently when gathering the per-database
 # sections.  Bounded so a large cluster doesn't open an unbounded number of
@@ -189,6 +192,11 @@ async def _safe_global(
         return [], str(exc)
 
 
+async def _collect_health(cfg: ReplicatorConfig, dbname: str) -> dict[str, Any]:
+    health = await replication_health(cfg, dbname)
+    return health.to_dict()
+
+
 async def _collect_db_local(
     cfg: ReplicatorConfig,
     dbname: str,
@@ -206,7 +214,23 @@ async def _collect_db_local(
         return data
 
     def _empty(section: str) -> Any:
-        return {"has_drift": False, "summary": "", "items": []} if section == "drift" else []
+        if section == "drift":
+            return {"has_drift": False, "summary": "", "items": []}
+        if section == "health":
+            return {"database": dbname, "state": "unknown", "reasons": []}
+        return []
+
+    if "health" in sections:
+        # Deliberately outside the shared connection pair below: health has to
+        # be reportable even when the source or target database cannot be
+        # opened at all, which is precisely the state it exists to describe.
+        try:
+            data["health"] = await _collect_health(cfg, dbname)
+        except Exception as exc:
+            data["health"] = _empty("health")
+            data["errors"]["health"] = str(exc)
+        if wanted == {"health"}:
+            return data
 
     try:
         async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
@@ -262,7 +286,7 @@ async def _collect_db_local(
     except Exception as exc:
         # Could not open the connection pair at all — surface the failure on
         # every requested local section so the dashboard shows it clearly.
-        for section in wanted:
+        for section in wanted - {"health"}:
             data.setdefault(section, _empty(section))
             data["errors"][section] = str(exc)
 
@@ -345,6 +369,34 @@ def _render_rich(data: dict[str, Any], sections: frozenset[str]) -> None:
 
     for section_name, err in data.get("errors", {}).items():
         console.print(f"[red]Cannot query {section_name}: {err}")
+
+    if "health" in sections and data.get("health"):
+        h = data["health"]
+        _STATE_STYLE = {
+            "healthy": "green", "lagging": "yellow", "critical": "bold red",
+            "broken": "bold red", "absent": "dim", "unknown": "bold red",
+        }
+        style = _STATE_STYLE.get(h.get("state", "unknown"), "")
+        health_table = Table(title="Replication Health", show_lines=False)
+        health_table.add_column("Metric", no_wrap=True)
+        health_table.add_column("Value")
+        health_table.add_row("State", f"[{style}]{h.get('state', '?').upper()}[/{style}]")
+        health_table.add_row("Lag (unapplied WAL)", human_bytes(h.get("lag_bytes")))
+        health_table.add_row("WAL retained by slot", human_bytes(h.get("retained_wal_bytes")))
+        health_table.add_row("Slot", (
+            f"{'active' if h.get('slot_active') else 'INACTIVE'}, "
+            f"wal_status={h.get('slot_wal_status')}"
+        ) if h.get("slot_exists") else "[bold red]MISSING[/bold red]")
+        health_table.add_row("Apply worker", (
+            "running" if h.get("apply_worker_running") else "[bold red]not running[/bold red]"
+        ))
+        if h.get("apply_error_count"):
+            health_table.add_row("Apply errors", str(h["apply_error_count"]))
+        health_table.add_row("Confirmed flush LSN", str(h.get("confirmed_flush_lsn") or "—"))
+        health_table.add_row("Source LSN", str(h.get("source_lsn") or "—"))
+        console.print(health_table)
+        for reason in h.get("reasons", []):
+            console.print(f"  [{style or 'yellow'}]• {reason}[/{style or 'yellow'}]")
 
     if "subscription" in sections:
         sub_table = Table(title="Subscription Status", show_lines=True)
@@ -462,6 +514,20 @@ def _render_simple(data: dict[str, Any], sections: frozenset[str]) -> None:
 
     for section_name, err in data.get("errors", {}).items():
         print(f"{p} section={section_name} error={_kv_quote(err)}")
+
+    if "health" in sections and data.get("health"):
+        h = data["health"]
+        print(
+            f"{p} section=health"
+            f" state={h.get('state')}"
+            f" lag_bytes={h.get('lag_bytes')}"
+            f" retained_wal_bytes={h.get('retained_wal_bytes')}"
+            f" slot_exists={str(h.get('slot_exists')).lower()}"
+            f" slot_active={str(h.get('slot_active')).lower()}"
+            f" wal_status={_kv_quote(h.get('slot_wal_status'))}"
+            f" apply_worker_running={str(h.get('apply_worker_running')).lower()}"
+            f" apply_error_count={h.get('apply_error_count')}"
+        )
 
     if "subscription" in sections:
         for r in data.get("subscription", []):
