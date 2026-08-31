@@ -395,7 +395,7 @@ async def copy_all_tables(
             if on_table_start:
                 on_table_start(key)
             try:
-                maybe_fail("data_copy")
+                await maybe_fail("data_copy")
                 count = await copy_table_data_pipe(
                     cfg.source, cfg.target, dbname, schema, table, snapshot_id,
                     table_workers=cfg.table_parallel_workers,

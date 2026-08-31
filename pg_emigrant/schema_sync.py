@@ -2132,7 +2132,7 @@ async def sync_schemas(
     await sync_collations(source_conn, target_conn, schemas)
 
     # Sync enum types BEFORE tables so columns with enum types can be created
-    maybe_fail("type_create")
+    await maybe_fail("type_create")
     await sync_enum_types(source_conn, target_conn, schemas)
 
     # Sync composite types BEFORE tables — table columns may use them as their data type
@@ -2197,7 +2197,7 @@ async def sync_schemas(
     # Create tables with PK + UNIQUE + CHECK constraints.
     # FK constraints are intentionally deferred to sync_post_copy_constraints.
     tables = await get_tables(source_conn, schemas, exclude_tables)
-    maybe_fail("table_create")
+    await maybe_fail("table_create")
     for t in tables:
         await _sync_table_structure(
             source_conn, target_conn, t["schema_name"], t["table_name"],
@@ -2270,17 +2270,17 @@ async def sync_post_copy_constraints(
     await sync_functions(source_conn, target_conn, schemas, silent=True)
 
     # Views depend on tables and functions; create them after both exist.
-    maybe_fail("view_create")
+    await maybe_fail("view_create")
     view_failures = await sync_views(source_conn, target_conn, schemas)
 
     # Final function pass — functions referencing views or other post-copy objects.
-    maybe_fail("function_create")
+    await maybe_fail("function_create")
     func_failures = await sync_functions(source_conn, target_conn, schemas)
 
     # Triggers — created after COPY to avoid side-effects during bulk
     # insert, and after every function pass so their functions already exist.
     # (Triggers with ENABLE ALWAYS fire even under session_replication_role=replica.)
-    maybe_fail("trigger_create")
+    await maybe_fail("trigger_create")
     trigger_failures = await sync_triggers(
         source_conn, target_conn, schemas, exclude_tables=exclude_tables
     )

@@ -31,8 +31,8 @@ environments.
 
 from __future__ import annotations
 
+import asyncio
 import os
-import time
 
 from pg_emigrant.utils import get_logger
 
@@ -106,22 +106,25 @@ def active_phase(var: str = PHASE_VAR) -> str | None:
     return phase
 
 
-def maybe_fail(phase: str) -> None:
-    """Raise, or block, when *phase* is armed.
+async def maybe_fail(phase: str) -> None:
+    """Raise, or wait, when *phase* is armed.
 
     Call sites are no-ops (one or two environment lookups) whenever injection
     is off, which is every run that is not this repository's own test suite.
 
-    The blocking form is deliberately a plain ``time.sleep`` rather than an
-    ``await``: it holds the whole event loop, so the run really is stopped at
-    this phase and nothing else advances past it while the test does its work.
-    A signal still lands, because Python delivers it between bytecodes.
+    Awaitable, and the waiting form is ``asyncio.sleep`` rather than
+    ``time.sleep``, because the tests this exists for send the process a
+    signal.  Signals are delivered to the asyncio loop through a handler that
+    only runs while the loop does; a synchronous sleep holds the loop and the
+    handler never fires, so the process ignores SIGTERM until the sleep ends.
+    Yielding keeps the run genuinely parked at this phase *and* keeps
+    cancellation deliverable — which is the whole point of pausing here.
     """
     if active_phase(PAUSE_VAR) == phase:
         log.error(
             "TEST HOOK: pausing at phase %r for up to %ds", phase, PAUSE_SECONDS
         )
-        time.sleep(PAUSE_SECONDS)
+        await asyncio.sleep(PAUSE_SECONDS)
         return
     if active_phase() == phase:
         log.error("TEST HOOK: injecting a failure at phase %r", phase)

@@ -270,7 +270,7 @@ async def bootstrap(
             try:
                 # Step 2: ensure database exists on target
                 progress.update(task, description=f"[{dbname}] Creating database…")
-                maybe_fail("database_create")
+                await maybe_fail("database_create")
                 await ensure_database_exists(cfg, dbname)
 
                 # Step 2b: refuse to re-bootstrap a database that is already
@@ -321,7 +321,7 @@ async def bootstrap(
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                     schemas = await discover_schemas(src, cfg)
                     console.print(f"  [{dbname}] Schemas: {schemas}")
-                    maybe_fail("schema_create")
+                    await maybe_fail("schema_create")
                     await sync_schemas(
                         src, tgt, schemas,
                         access_method=access_method,
@@ -352,7 +352,7 @@ async def bootstrap(
                 # ordering is required (REPLICA IDENTITY is evaluated at WAL-write
                 # time, not at slot-creation time).
                 progress.update(task, description=f"[{dbname}] Setting replica identity…")
-                maybe_fail("replica_identity")
+                await maybe_fail("replica_identity")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                     ri_failures = await sync_replica_identity(
                         src, tgt, schemas, exclude_tables=cfg.exclude_tables
@@ -377,7 +377,7 @@ async def bootstrap(
                 # Step 3c/3d: publication, then the replication slot — BEFORE the
                 # data copy, so the copy can use the slot's own exported snapshot.
                 progress.update(task, description=f"[{dbname}] Creating publication…")
-                maybe_fail("publication_create")
+                await maybe_fail("publication_create")
                 # Only True when THIS run created it.  A publication that was
                 # already there belongs to something else — most plausibly
                 # another migration configured with the same names — and
@@ -386,7 +386,7 @@ async def bootstrap(
                 pub_created = await create_publication(cfg, dbname, schemas=schemas)
 
                 progress.update(task, description=f"[{dbname}] Creating replication slot…")
-                maybe_fail("slot_create")
+                await maybe_fail("slot_create")
                 slot = await create_replication_slot_with_snapshot(cfg, dbname)
 
                 # Step 4: copy initial data, using the slot's exported snapshot
@@ -479,7 +479,7 @@ async def bootstrap(
 
                 # Step 4b: create non-unique indexes after COPY (faster than during insert)
                 progress.update(task, description=f"[{dbname}] Creating indexes…")
-                maybe_fail("index_create")
+                await maybe_fail("index_create")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                     await sync_deferred_indexes(
                         src, tgt, schemas, exclude_tables=cfg.exclude_tables
@@ -491,7 +491,7 @@ async def bootstrap(
                 # final function pass, so they never fail on a not-yet-created
                 # function.
                 progress.update(task, description=f"[{dbname}] Applying constraints…")
-                maybe_fail("foreign_key")
+                await maybe_fail("foreign_key")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                     obj_failures = await sync_post_copy_constraints(
                         src, tgt, schemas, exclude_tables=cfg.exclude_tables
@@ -513,7 +513,7 @@ async def bootstrap(
                 # Step 4d: synchronize ownership (tables, sequences, views, functions, types, database)
                 progress.update(task, description=f"[{dbname}] Syncing ownership…")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    maybe_fail("ownership_sync")
+                    await maybe_fail("ownership_sync")
                     own_count = await sync_ownership(
                         src, tgt, schemas, dbname=dbname,
                         exclude_tables=cfg.exclude_tables,
@@ -526,7 +526,7 @@ async def bootstrap(
                 # only, never revokes; see sync_privileges() docstring.
                 progress.update(task, description=f"[{dbname}] Syncing privileges…")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    maybe_fail("privilege_sync")
+                    await maybe_fail("privilege_sync")
                     priv_count = await sync_privileges(
                         src, tgt, schemas, dbname=dbname,
                         exclude_tables=cfg.exclude_tables,
@@ -556,7 +556,7 @@ async def bootstrap(
                 # values can only be applied now — and every other sequence may
                 # have advanced on the source while the data was being copied.
                 progress.update(task, description=f"[{dbname}] Syncing sequence values…")
-                maybe_fail("sequence_sync")
+                await maybe_fail("sequence_sync")
                 seq_report = await sync_sequences_once(cfg, dbname)
                 n_seq = sum(
                     1 for r in seq_report if r["status"] in ("updated", "orphaned_fixed")
@@ -585,7 +585,7 @@ async def bootstrap(
                 # Step 5: create the subscription, attached to the slot created
                 # in step 3d — NOT creating a new one (create_slot=False).
                 progress.update(task, description=f"[{dbname}] Setting up replication…")
-                maybe_fail("subscription_create")
+                await maybe_fail("subscription_create")
                 await create_subscription(cfg, dbname, create_slot=False)
 
                 # Step 6: built-in post-bootstrap verification — a full
