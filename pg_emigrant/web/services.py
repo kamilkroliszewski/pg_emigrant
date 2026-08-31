@@ -142,6 +142,18 @@ def masked_config(cfg: ReplicatorConfig) -> dict[str, Any]:
         "parallel_workers": cfg.parallel_workers,
         "table_parallel_workers": cfg.table_parallel_workers,
         "sequence_sync_interval": cfg.sequence_sync_interval,
+        # Status only. The password/hash and the session secret_key are
+        # deliberately never included — this page is rendered in a browser and
+        # is exactly the wrong place for them, masked or not.
+        "web_auth": {
+            "enabled": cfg.web.auth.is_enabled,
+            "username": cfg.web.auth.username if cfg.web.auth.is_enabled else None,
+            "credential": (
+                "password_hash" if cfg.web.auth.password_hash
+                else "password (plaintext)" if cfg.web.auth.password
+                else None
+            ),
+        },
     }
 
 

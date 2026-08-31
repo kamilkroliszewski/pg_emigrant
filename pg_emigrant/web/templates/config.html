@@ -57,6 +57,49 @@
       </table>
     </div>
   </div>
+
+  <div class="card config-card">
+    <div class="card-content">
+      <span class="card-title"><i class="material-icons left">shield</i>GUI access</span>
+      <table class="kv-table">
+        <tr>
+          <th>Authentication</th>
+          <td>
+            {% if config_data.web_auth.enabled %}
+            <span class="badge-status badge-ok">enabled</span>
+            {% else %}
+            <span class="badge-status badge-err">disabled</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr><th>Username</th><td>{{ config_data.web_auth.username or '—' }}</td></tr>
+        <tr>
+          <th>Credential</th>
+          <td>
+            {% if config_data.web_auth.credential %}
+            <code>{{ config_data.web_auth.credential }}</code>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      </table>
+      {% if not config_data.web_auth.enabled %}
+      <div class="alert-panel alert-warn">
+        <i class="material-icons">warning</i>
+        <span class="alert-body">Anyone who can reach this port can read the
+          configuration and run destructive operations. Set
+          <code>web.auth.password_hash</code> in the config file — generate one
+          with <code>pg_emigrant hash-password</code>.</span>
+      </div>
+      {% elif config_data.web_auth.credential == 'password (plaintext)' %}
+      <div class="alert-panel alert-warn">
+        <i class="material-icons">warning</i>
+        <span class="alert-body">The password is stored in plaintext. Prefer
+          <code>web.auth.password_hash</code> — generate one with
+          <code>pg_emigrant hash-password</code>.</span>
+      </div>
+      {% endif %}
+    </div>
+  </div>
 </div>
 
 <div class="alert-panel alert-info">

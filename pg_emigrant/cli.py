@@ -632,12 +632,16 @@ def web(
     plus background-job execution of bootstrap/teardown/start/stop/sync-sequences/
     reinit-sync/detect-ddl. Reuses the same orchestration functions as the CLI.
 
-    Binds to 127.0.0.1 by default and ships without authentication — do not
-    expose it publicly without a reverse proxy + auth (it can run destructive
-    operations and displays the configuration).
+    Binds to 127.0.0.1 by default. Require a login by setting 'web.auth' in the
+    config file (generate the password hash with 'pg_emigrant hash-password');
+    without one the GUI is open to anyone who can reach the port, and it can run
+    destructive operations and displays the configuration. Even with a login,
+    put a TLS-terminating reverse proxy in front of it before exposing it beyond
+    localhost — the password and session cookie travel in clear over plain HTTP.
     """
     try:
         from pg_emigrant.web.app import create_app
+        from pg_emigrant.web.auth import AuthConfigError
     except ImportError:
         console.print(
             '[red]Flask is not installed.[/red] Install the web extra:\n'
@@ -645,9 +649,74 @@ def web(
         )
         raise typer.Exit(1)
 
-    app_ = create_app(config_path=config)
+    try:
+        app_ = create_app(config_path=config)
+    except AuthConfigError as exc:
+        console.print(f"[bold red]Refusing to start the GUI:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    if app_.config.get("EMIGRANT_AUTH_ACTIVE"):
+        console.print("[green]Authentication:[/green] enabled (web.auth)")
+    else:
+        console.print(
+            "[bold yellow]⚠ Authentication is DISABLED[/bold yellow] — anyone who can "
+            "reach this port can read the configuration and run destructive "
+            "operations.\n[dim]  Set web.auth.password_hash in the config file; "
+            "generate one with 'pg_emigrant hash-password'.[/dim]"
+        )
+        # Binding beyond loopback without a login publishes those operations to
+        # the network, which is a different order of mistake from leaving the
+        # localhost default open.
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            console.print(
+                f"[bold red]  You are binding to {host}, not loopback — the GUI will "
+                f"be reachable from the network with NO authentication.[/bold red]"
+            )
+
     console.print(f"[green]pg_emigrant GUI →[/green] http://{host}:{port}")
     app_.run(host=host, port=port, threaded=True, debug=debug)
+
+
+@app.command(name="hash-password")
+def hash_password(
+    password: Optional[str] = typer.Option(
+        None, "--password",
+        help=(
+            "The password to hash. Omit it to be prompted instead — which keeps "
+            "the password out of your shell history and process list."
+        ),
+    ),
+):
+    """Generate a password hash for the web GUI's 'web.auth.password_hash'.
+
+    Prints only the hash, so it can be piped or copied straight into the config
+    file. The hash is salted, so running this twice on the same password gives
+    two different (both valid) results.
+    """
+    try:
+        from pg_emigrant.web.auth import hash_password as _hash
+    except ImportError:
+        console.print(
+            '[red]Flask is not installed.[/red] The password hasher lives in the web extra:\n'
+            '  [bold]pip install -e ".[web]"[/bold]'
+        )
+        raise typer.Exit(1)
+
+    if password is None:
+        password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    if not password:
+        console.print("[bold red]Refusing to hash an empty password.[/bold red]")
+        raise typer.Exit(1)
+
+    # The hash is the only thing on stdout, so `pg_emigrant hash-password > h`
+    # yields exactly the hash and nothing else; the guidance goes to stderr.
+    from rich.console import Console
+
+    print(_hash(password))
+    Console(stderr=True).print(
+        "\n[dim]Add it to your config file as:[/dim]\n"
+        "[bold]web:\n  auth:\n    username: admin\n    password_hash: \"<the line above>\"[/bold]"
+    )
 
 
 if __name__ == "__main__":

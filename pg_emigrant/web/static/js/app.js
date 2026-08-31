@@ -49,6 +49,14 @@ async function fetchJSON(url, opts) {
   const res = await fetch(url, opts);
   let data = null;
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
+  if (res.status === 401) {
+    // The session expired (or the GUI was restarted with a fresh secret key).
+    // The dashboard polls several endpoints at once, so without this every one
+    // of them would raise and bury the user in error toasts instead of simply
+    // asking them to sign in again.
+    window.location.href = (data && data.login_url) || '/login';
+    throw new Error('Authentication required');
+  }
   if (!res.ok) {
     const msg = (data && data.error) ? data.error : (res.statusText || ('HTTP ' + res.status));
     throw new Error(msg);

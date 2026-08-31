@@ -761,3 +761,155 @@ tr.row-err { background: var(--pg-err-soft); }
 .alert-panel.alert-info { background: var(--pg-info-soft); color: var(--pg-primary); border-color: rgba(59, 130, 246, 0.22); }
 .alert-panel strong { font-weight: 700; }
 .alert-panel .alert-body { color: var(--pg-text); }
+
+/* ── Login page ───────────────────────────────────────────────────────────────
+ * Standalone layout: the login template does not extend base.html, so it has
+ * no sidebar and no top nav. It reuses the same variables, which means it
+ * follows the light/dark toggle exactly like every other page.
+ */
+.login-body {
+  background: var(--pg-bg);
+  color: var(--pg-text);
+  min-height: 100vh;
+}
+
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--pg-card);
+  border: 1px solid var(--pg-border);
+  border-radius: 14px;
+  padding: 28px 28px 20px;
+  box-shadow: 0 10px 34px rgba(15, 32, 51, 0.10);
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.login-brand .logo {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  object-fit: cover;
+  flex: 0 0 auto;
+}
+
+.login-title {
+  font-size: 1.22rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.login-sub {
+  font-size: 0.78rem;
+  color: var(--pg-muted);
+}
+
+/* Materialize colours its inputs with hard-coded greys; pin them to the
+   theme variables so the field is legible in dark mode too. */
+.login-card .input-field input[type="text"],
+.login-card .input-field input[type="password"] {
+  color: var(--pg-text);
+  border-bottom: 1px solid var(--pg-border);
+  box-shadow: none;
+}
+
+.login-card .input-field input[type="text"]:focus,
+.login-card .input-field input[type="password"]:focus {
+  border-bottom: 1px solid var(--pg-primary);
+  box-shadow: 0 1px 0 0 var(--pg-primary);
+}
+
+.login-card .input-field label { color: var(--pg-muted); }
+.login-card .input-field input:focus + label,
+.login-card .input-field label.active { color: var(--pg-primary); }
+.login-card .input-field .prefix { color: var(--pg-muted); }
+.login-card .input-field input:focus ~ .prefix { color: var(--pg-primary); }
+
+.login-submit {
+  width: 100%;
+  margin-top: 10px;
+  border-radius: 10px;
+}
+
+.login-foot {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--pg-row-border);
+  font-size: 0.76rem;
+  text-align: center;
+}
+
+.login-card .alert-panel { margin-bottom: 18px; }
+
+/* ── Signed-in user block in the sidebar footer ───────────────────────────── */
+.sidenav .sidenav-user {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 22px 4px;
+  line-height: 1.3;
+}
+
+.sidenav .sidenav-user .user-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.sidenav .sidenav-user .user-id i {
+  font-size: 18px;
+  line-height: 1;
+  margin: 0;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.sidenav .sidenav-user .user-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The logout control is a form button, not a sidenav <a>: keep Materialize's
+   sidebar link styling from swallowing it. */
+.sidenav .sidenav-user form { margin: 0; line-height: 1; }
+
+.sidenav .sidenav-user .logout-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 0;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 0.74rem;
+  font-weight: 600;
+  font-family: inherit;
+}
+
+.sidenav .sidenav-user .logout-btn:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: #fff;
+}
+
+.sidenav .sidenav-user .logout-btn i { font-size: 16px; line-height: 1; }
