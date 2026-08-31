@@ -70,8 +70,14 @@ async def _renormalize_viewdef(tgt, definition: str) -> str | None:
     except Exception:
         return None
     try:
+        # The pretty flag must match the one the definitions being compared
+        # were read with (_VIEWS_SQL uses pg_get_viewdef(oid, true)).  Pretty
+        # and non-pretty differ by more than whitespace — non-pretty
+        # parenthesises expressions that pretty leaves bare — so mixing them
+        # defeats the whole point of re-deparsing and reports every
+        # cross-major-version view as drift.
         return await tgt.fetchval(
-            "SELECT pg_get_viewdef('pg_temp._pgem_viewnorm'::regclass)"
+            "SELECT pg_get_viewdef('pg_temp._pgem_viewnorm'::regclass, true)"
         )
     finally:
         await tgt.execute("DROP VIEW IF EXISTS pg_temp._pgem_viewnorm")
