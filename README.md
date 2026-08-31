@@ -258,7 +258,8 @@ subscriber would reject it.
   see [New tables created after bootstrap](#new-tables-created-after-bootstrap).
   Version-dependent catalog differences (`daticulocale`/`datlocale`,
   `colliculocale`/`colllocale`, PG17's builtin locale provider, PG16+ view
-  deparse changes) are handled automatically — verified end-to-end on a
+  deparse changes, PG18's catalogued `NOT NULL` constraints) are handled
+  automatically — verified end-to-end on a
   PG 14 → PG 18 migration.
 - A migration role on each server with sufficient privileges:
   - **Source:** `REPLICATION` privilege — required for two things: creating the
@@ -1050,6 +1051,30 @@ warning rather than blocking a migration that would have worked.
 ## Special handling & edge cases
 
 pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
+
+- **PostgreSQL 18's `NOT NULL` constraints are reproduced by name, not by
+  re-adding them.** PG18 gave `NOT NULL` real `pg_constraint` rows (`contype =
+  'n'`); before that it was only `pg_attribute.attnotnull`. Those rows must be
+  kept out of the generic `ALTER TABLE … ADD CONSTRAINT` path, because the
+  column definition already carries its `NOT NULL` and PG18 permits a column at
+  most **one** not-null constraint — adding a second one fails outright with
+  `cannot create not-null constraint "…" on column "…" of table "…"`. The
+  failure only appears when the source's constraint name is not the default
+  `<table>_<column>_not_null`, i.e. when it was named explicitly or the column
+  was renamed after the table was created (renaming a column does **not** rename
+  its constraint); every other table survives only because the name the target
+  auto-generates happens to match. pg_emigrant instead **renames** the target's
+  auto-generated constraint to the source's name (`sync_not_null_constraints`) —
+  a catalog-only operation with no table rewrite and no validation scan. On a
+  partitioned parent the rename recurses to its partitions, as PostgreSQL does
+  natively.
+  >
+  > **Known gap:** a `NOT NULL … NOT VALID` constraint (also new in PG18) is
+  > *not* reproduced as `NOT VALID`. Such a constraint still rejects every new
+  > insert while tolerating pre-existing violating rows, so if the source holds
+  > rows that violate it, the initial COPY of that table into the target fails
+  > with a not-null violation. Schema sync logs a warning naming the affected
+  > columns; validate the constraint on the source or clean up the rows first.
 
 - **A subscription that can't actually stream fails immediately, instead of
   silently.** `CREATE SUBSCRIPTION` succeeding proves nothing: PostgreSQL
