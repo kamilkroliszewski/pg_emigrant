@@ -134,7 +134,6 @@ async def test_reinit_sync_refusal_has_its_own_exit_code_and_json(
     A caller that retries on exit 1 would loop forever against a slot that is
     gone; exit 6 says 'streaming cannot fix this — re-copy'.
     """
-    from pg_emigrant.bootstrap import bootstrap
     from pg_emigrant.db import connect
     from pg_emigrant.replication import sub_name
     from tests.helpers.replication import wait_for_catchup

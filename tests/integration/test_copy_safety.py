@@ -15,7 +15,7 @@ import asyncio
 import pytest
 
 from pg_emigrant.bootstrap import bootstrap
-from pg_emigrant.data_copy import copy_all_tables, copy_table_data_pipe, verify_copy_counts
+from pg_emigrant.data_copy import copy_all_tables, verify_copy_counts
 from pg_emigrant.db import connect
 from pg_emigrant.replication import create_replication_slot_with_snapshot
 from pg_emigrant.report import BootstrapIncomplete

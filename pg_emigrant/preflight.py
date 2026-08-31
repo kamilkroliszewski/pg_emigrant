@@ -28,8 +28,8 @@ from typing import Any
 import asyncpg
 
 from pg_emigrant.config import ReplicatorConfig
-from pg_emigrant.db import _SYSTEM_SCHEMAS, connect, discover_databases, discover_schemas
-from pg_emigrant.replication import _UNSTABLE_HOSTS, pub_name, sub_name
+from pg_emigrant.db import connect, discover_databases, discover_schemas
+from pg_emigrant.replication import _UNSTABLE_HOSTS, sub_name
 from pg_emigrant.schema_sync import get_columns, get_tables
 from pg_emigrant.scope import check_exclusions_are_safe, is_excluded, resolve_excluded
 from pg_emigrant.tde import (

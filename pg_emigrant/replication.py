@@ -709,7 +709,7 @@ async def create_subscription(
             # its context — so anything raised from here is re-raised with the
             # text redacted rather than allowed to reach a log or the GUI.
             await conn.execute(sql, timeout=60)
-        except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError) as exc:
+        except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError):
             log.error(
                 "CREATE SUBSCRIPTION %s timed out after 60 s — "
                 "check pg_hba.conf (replication entry for the target host) and "

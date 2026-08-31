@@ -8,7 +8,7 @@ parallel across (and within) tables, snapshot-consistent reads.
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, Sequence
+from typing import Callable
 
 from pg_emigrant.config import ReplicatorConfig
 from pg_emigrant.db import connect

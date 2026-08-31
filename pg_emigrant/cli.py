@@ -370,7 +370,7 @@ def status(
     show_drift: bool = typer.Option(False, "--drift", help="Show schema drift summary"),
 ):
     """Display replication status, lag, sequence sync, and drift for all databases."""
-    from pg_emigrant.monitor import _ALL_SECTIONS, build_status
+    from pg_emigrant.monitor import build_status
 
     format = _resolve_format(format)
     cfg = _load(config)

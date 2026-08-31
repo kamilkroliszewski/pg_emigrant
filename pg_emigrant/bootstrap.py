@@ -78,7 +78,7 @@ from pg_emigrant.data_copy import (
 from pg_emigrant.db import connect, discover_databases, discover_schemas
 from pg_emigrant.ddl_detector import detect_drift
 from pg_emigrant.guards import assert_distinct_clusters
-from pg_emigrant.report import BootstrapIncomplete, BootstrapReport, DatabaseResult
+from pg_emigrant.report import BootstrapIncomplete, BootstrapReport
 from pg_emigrant.replication import (
     create_publication,
     create_replication_slot_with_snapshot,
