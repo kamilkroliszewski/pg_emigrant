@@ -541,9 +541,13 @@ def detect_ddl(
             return '"' + v.replace('"', '\\"') + '"'
         return v
 
-    async def _detect():
+    async def _detect() -> bool:
         dbs = [database] if database else await discover_databases(cfg)
         all_data = []
+        # A repair pass that could not apply half its DDL and reported only
+        # "applied 4 fixes" leaves the operator believing the target is now
+        # correct.  Tracked so the command can exit non-zero.
+        apply_failed = False
 
         for db in dbs:
             report = await detect_drift(cfg, db)
@@ -619,11 +623,25 @@ def detect_ddl(
                         "[bold red]WARNING:[/bold red] --drop-extra will DROP tables on target "
                         "that do not exist on source. This is destructive!"
                     )
-                applied = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
+                fixes = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
+                if not fixes.clean:
+                    apply_failed = True
                 if format == "simple":
-                    print(f"db={_kv_quote(db)} section=apply applied={applied}")
-                elif format != "json":
-                    console.print(f"[green]Applied {applied} fix(es) for {db}")
+                    print(
+                        f"db={_kv_quote(db)} section=apply applied={fixes.applied}"
+                        f" failed={len(fixes.failures)}"
+                    )
+                elif format == "json":
+                    all_data[-1]["apply"] = fixes.to_dict()
+                else:
+                    console.print(f"[green]Applied {fixes.applied} fix(es) for {db}")
+                    for failure in fixes.failures:
+                        console.print(f"  [bold red]✗ could not apply: {failure}[/bold red]")
+                    if not fixes.clean:
+                        console.print(
+                            f"  [bold red]{len(fixes.failures)} fix(es) FAILED for {db} — "
+                            f"the drift they were meant to correct is still there.[/bold red]"
+                        )
             elif format == "rich":
                 console.print(
                     "[dim]Run with [bold]--apply[/bold] to fix missing objects and ownership drift, "
@@ -632,8 +650,10 @@ def detect_ddl(
 
         if format == "json":
             print(_json.dumps(all_data, indent=2))
+        return apply_failed
 
-    _run(_detect())
+    if _run(_detect()):
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
 
 
 @app.command(name="reinit-sync")

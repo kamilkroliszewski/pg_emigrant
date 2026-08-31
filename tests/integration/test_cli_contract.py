@@ -167,3 +167,58 @@ async def test_reinit_sync_refusal_has_its_own_exit_code_and_json(
     assert payload["repaired"] is False
     assert payload["blocked"] == [source_db]
     assert payload["data_gap"] == []
+
+
+async def test_detect_ddl_apply_exits_non_zero_when_a_fix_fails(
+    tmp_path, cfg, source_db, source_pg, target_pg
+):
+    """'Applied 4 fixes' must not be the whole story when two of them failed.
+
+    A repair pass that could not apply half its DDL and reported only a count
+    leaves the operator believing the target is now correct.
+    """
+    from pg_emigrant.bootstrap import bootstrap
+
+    await bootstrap(cfg, database=source_db)
+
+    # Drift that cannot be repaired: a view on the source whose definition
+    # depends on a function the target does not have.
+    source_pg.psql("CREATE SCHEMA hidden", dbname=source_db)
+    source_pg.psql(
+        "CREATE FUNCTION hidden.f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        dbname=source_db,
+    )
+    source_pg.psql(
+        "CREATE VIEW app.broken AS SELECT hidden.f() AS n", dbname=source_db
+    )
+    cfg.schemas = ["app", "reporting"]
+    path = write_config(tmp_path / "config.yaml", cfg)
+
+    result = run_cli("detect-ddl", "-c", str(path), "--apply", "--format", "json")
+
+    assert result.returncode == exits.MIGRATION_FAILED, (
+        f"a failed drift fix exited {result.returncode}; stdout {result.stdout[-800:]}"
+    )
+    payload = result.json()
+    apply_result = payload[0]["apply"]
+    assert apply_result["failed"] >= 1, apply_result
+    assert any("broken" in f for f in apply_result["failures"]), apply_result
+
+
+async def test_detect_ddl_apply_exits_zero_when_every_fix_lands(
+    tmp_path, cfg, source_db, source_pg
+):
+    """The success path must stay a success path."""
+    from pg_emigrant.bootstrap import bootstrap
+
+    await bootstrap(cfg, database=source_db)
+    source_pg.psql(
+        "CREATE TABLE app.added_later (id int PRIMARY KEY, v text)", dbname=source_db
+    )
+    path = write_config(tmp_path / "config.yaml", cfg)
+
+    result = run_cli("detect-ddl", "-c", str(path), "--apply", "--format", "json")
+    assert result.returncode == exits.SUCCESS, result.stdout[-800:]
+    payload = result.json()
+    assert payload[0]["apply"]["failed"] == 0
+    assert payload[0]["apply"]["applied"] >= 1

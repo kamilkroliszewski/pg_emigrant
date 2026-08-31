@@ -1051,7 +1051,7 @@ failure is unaffected.
 | `1` | Generic failure with no more specific code. |
 | `2` | Configuration error — the config file is missing, invalid, or sets a removed option. Nothing was attempted. |
 | `3` | Preflight failed. Nothing was modified. |
-| `4` | Migration failed or finished incomplete. The target is not fit to cut over to. |
+| `4` | Migration failed or finished incomplete, or a `detect-ddl --apply` fix failed. The target is not fit to cut over to. |
 | `5` | Replication unhealthy — also `cutover-check`'s "do not cut over". |
 | `6` | Recovery impossible — `reinit-sync` refused because streaming cannot close the gap. **Do not retry**; re-copy instead. |
 | `7` | Unsafe operation refused up front (e.g. source and target are the same cluster). |

@@ -7,6 +7,7 @@ differences.  Optionally generates and applies corrective DDL.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import asyncpg
 
@@ -782,13 +783,38 @@ async def detect_ownership_drift(
     return items
 
 
+@dataclass
+class DriftFixResult:
+    """Outcome of applying drift fixes.
+
+    Carries the failures as well as the count, because a repair pass that
+    could not apply half its DDL and reported only "applied 4 fixes" leaves the
+    operator believing the target is now correct.  ``detect-ddl --apply`` exits
+    non-zero when this is not clean.
+    """
+
+    applied: int = 0
+    failures: list[str] = field(default_factory=list)
+
+    @property
+    def clean(self) -> bool:
+        return not self.failures
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "failed": len(self.failures),
+            "failures": self.failures,
+        }
+
+
 async def apply_drift_fixes(
     cfg: ReplicatorConfig,
     dbname: str,
     report: DriftReport,
     drop_extra: bool = False,
-) -> int:
-    """Apply corrective DDL for fixable drift items.  Returns count of applied fixes.
+) -> DriftFixResult:
+    """Apply corrective DDL for fixable drift items.
 
     For newly created tables (missing_on_target) the subscription is refreshed
     with ``copy_data = true`` so that PostgreSQL's built-in tablesync mechanism
@@ -801,7 +827,7 @@ async def apply_drift_fixes(
     """
     from pg_emigrant.replication import refresh_subscription
 
-    applied = 0
+    outcome = DriftFixResult()
     new_tables: list[tuple[str, str]] = []  # (schema, table) of tables we just created
 
     # Apply foreign-key constraints last, after every table (including
@@ -824,7 +850,7 @@ async def apply_drift_fixes(
                 try:
                     await tgt.execute(item.fix_ddl)
                     log.info("Applied fix for %s %s.%s", item.object_type, item.schema, item.name)
-                    applied += 1
+                    outcome.applied += 1
                     if item.object_type == "table":
                         new_tables.append((item.schema, item.table))
                 except Exception as exc:
@@ -832,25 +858,34 @@ async def apply_drift_fixes(
                         "Failed to apply DDL for %s %s.%s — %s",
                         item.object_type, item.schema, item.name, exc,
                     )
+                    outcome.failures.append(
+                        f"{item.object_type} {item.schema}.{item.name}: {exc}"
+                    )
             elif item.drift_type == "missing_on_source" and drop_extra:
                 try:
                     await tgt.execute(item.fix_ddl)
                     log.info("Dropped extra %s %s.%s from target", item.object_type, item.schema, item.name)
-                    applied += 1
+                    outcome.applied += 1
                 except Exception as exc:
                     log.error(
                         "Failed to drop %s %s.%s — %s",
                         item.object_type, item.schema, item.name, exc,
                     )
+                    outcome.failures.append(
+                        f"drop {item.object_type} {item.schema}.{item.name}: {exc}"
+                    )
             elif item.drift_type == "different":
                 try:
                     await tgt.execute(item.fix_ddl)
                     log.info("Applied fix for %s %s.%s", item.object_type, item.schema, item.name)
-                    applied += 1
+                    outcome.applied += 1
                 except Exception as exc:
                     log.error(
                         "Failed to apply DDL for %s %s.%s — %s",
                         item.object_type, item.schema, item.name, exc,
+                    )
+                    outcome.failures.append(
+                        f"{item.object_type} {item.schema}.{item.name}: {exc}"
                     )
 
     # Refresh the subscription with copy_data=true so PostgreSQL's tablesync
@@ -866,6 +901,10 @@ async def apply_drift_fixes(
                 ", ".join(f"{s}.{t}" for s, t in new_tables),
             )
         except Exception as exc:
-            log.warning("Could not refresh subscription for %s — %s", dbname, exc)
+            # A table created but never scheduled for tablesync stays empty on
+            # the target while looking present, so this is a failure, not a
+            # warning.
+            log.error("Could not refresh subscription for %s — %s", dbname, exc)
+            outcome.failures.append(f"subscription refresh for new tables: {exc}")
 
-    return applied
+    return outcome

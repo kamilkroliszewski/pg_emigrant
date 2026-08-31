@@ -308,9 +308,23 @@ def _build_detect_ddl_apply(cfg: ReplicatorConfig, db: str, opts: dict) -> CoroF
             log.info("No drift detected for %s — nothing to apply", db)
             return {"message": f"No drift detected for {db}", "applied": 0}
         log.info("Applying drift fixes for %s (%s)", db, report.summary)
-        applied = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
-        log.info("Applied %d fix(es) for %s", applied, db)
-        return {"message": f"Applied {applied} fix(es) for {db}", "applied": applied}
+        fixes = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
+        log.info("Applied %d fix(es) for %s", fixes.applied, db)
+        if not fixes.clean:
+            # Raise, so the job is marked failed in the GUI.  Reporting
+            # "applied 4 fixes" for a pass that could not apply half its DDL
+            # leaves the operator believing the target is now correct.
+            for failure in fixes.failures:
+                log.error("Could not apply: %s", failure)
+            raise RuntimeError(
+                f"{len(fixes.failures)} drift fix(es) FAILED for {db} "
+                f"({fixes.applied} applied) — the drift they were meant to "
+                f"correct is still there: " + "; ".join(fixes.failures)
+            )
+        return {
+            "message": f"Applied {fixes.applied} fix(es) for {db}",
+            "applied": fixes.applied,
+        }
 
     return _coro
 

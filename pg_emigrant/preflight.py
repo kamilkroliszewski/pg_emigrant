@@ -686,13 +686,13 @@ async def _check_naming_collisions(
             )
             if rival:
                 advice = (
-                    f"The slot is ACTIVE but this target has no matching "
-                    f"subscription, so something else is streaming from it — "
-                    f"most likely another pg_emigrant migration from this same "
-                    f"source, configured with the same 'subscription_name'. "
-                    f"Bootstrap will refuse rather than take it over (doing so "
-                    f"would silently break that migration). Give this migration "
-                    f"a distinct 'subscription_name'."
+                    "The slot is ACTIVE but this target has no matching "
+                    "subscription, so something else is streaming from it — "
+                    "most likely another pg_emigrant migration from this same "
+                    "source, configured with the same 'subscription_name'. "
+                    "Bootstrap will refuse rather than take it over (doing so "
+                    "would silently break that migration). Give this migration "
+                    "a distinct 'subscription_name'."
                 )
             else:
                 advice = (
