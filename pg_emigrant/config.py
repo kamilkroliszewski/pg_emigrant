@@ -20,6 +20,60 @@ class DatabaseConfig(BaseModel):
     sslmode: str = "prefer"
 
 
+class WebAuthConfig(BaseModel):
+    """Login credentials for the ``pg_emigrant web`` GUI.
+
+    ``enabled`` is deliberately tri-state.  Left unset (the default) it means
+    "on when a credential is configured": adding a password switches
+    authentication on, and an existing config that has none keeps working
+    exactly as before — but says so loudly at startup.  Setting it explicitly
+    makes the intent unambiguous in both directions, and ``enabled: true`` with
+    no credential is a configuration error the app refuses to start with,
+    rather than quietly serving an unprotected GUI.
+
+    Supply exactly one of ``password_hash`` (preferred — generate it with
+    ``pg_emigrant hash-password``) or ``password``.  Plaintext is accepted
+    because this file already holds database passwords, so a hash here is not
+    the only thing standing between an attacker and the databases; it is still
+    the weaker option, and a hash costs one command.
+    """
+
+    enabled: Optional[bool] = None
+    username: str = "admin"
+    password: str = ""
+    password_hash: str = ""
+    # Signs the session cookie.  Left empty, a random key is generated at
+    # startup — safe, but every restart invalidates existing sessions.  Set it
+    # to keep people logged in across restarts (and across several workers).
+    secret_key: str = ""
+    # How long a session stays valid, refreshed on each request.
+    session_timeout_minutes: int = 720
+    # Set when the GUI is served over HTTPS (behind a TLS-terminating proxy):
+    # marks the session cookie Secure so it is never sent over plain HTTP.
+    cookie_secure: bool = False
+    # Failed logins per client address before that address is refused for
+    # lockout_seconds.  0 disables the throttle.
+    max_attempts: int = 5
+    lockout_seconds: int = 300
+
+    @property
+    def has_credential(self) -> bool:
+        return bool(self.password_hash or self.password)
+
+    @property
+    def is_enabled(self) -> bool:
+        """Resolve the tri-state ``enabled`` against the configured credential."""
+        if self.enabled is None:
+            return self.has_credential
+        return self.enabled
+
+
+class WebConfig(BaseModel):
+    """Settings that apply only to the optional web GUI."""
+
+    auth: WebAuthConfig = Field(default_factory=WebAuthConfig)
+
+
 class ReplicatorConfig(BaseModel):
     """Top-level configuration for pg_emigrant."""
 
@@ -41,6 +95,8 @@ class ReplicatorConfig(BaseModel):
     # says exactly what to migrate and always wins outright.
     exclude_schemas: list[str] = Field(default_factory=list)
     exclude_tables: list[str] = Field(default_factory=list)
+    # Web GUI settings; ignored by every CLI command except `pg_emigrant web`.
+    web: WebConfig = Field(default_factory=WebConfig)
 
 
 def load_config(path: Optional[str] = None) -> ReplicatorConfig:

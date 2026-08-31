@@ -40,6 +40,7 @@ Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
   - [`sync-sequences`](#pg_emigrant-sync-sequences)
   - [`detect-ddl`](#pg_emigrant-detect-ddl)
   - [`reinit-sync`](#pg_emigrant-reinit-sync)
+  - [`hash-password`](#pg_emigrant-hash-password)
 - [Output formats](#output-formats)
 - [Web GUI](#web-gui)
 - [New tables created after bootstrap](#new-tables-created-after-bootstrap)
@@ -799,6 +800,22 @@ override remains a CLI-only action.
 
 ---
 
+### `pg_emigrant hash-password`
+
+Generates a password hash for the web GUI's `web.auth.password_hash`. Prompts
+for the password (with confirmation) so it stays out of your shell history and
+the process list; `--password` is available for scripting.
+
+```bash
+pg_emigrant hash-password
+pg_emigrant hash-password > hash.txt        # only the hash goes to stdout
+```
+
+Needs the web extra (`pip install -e ".[web]"`), since the hasher comes from
+Werkzeug. See [Authentication](#authentication).
+
+---
+
 ## Output formats
 
 `status`, `sync-sequences`, and `detect-ddl` all accept `-f / --format`:
@@ -890,14 +907,69 @@ CDN tags in `base.html` at those local files with
 (`"Segoe UI"`, `Consolas`, …) if a webfont fails to load, so this is a
 cosmetic-only step. No other code changes are needed.
 
-### Security
+### Authentication
 
 The GUI exposes the configuration and can trigger **destructive** database
-operations. It therefore **binds to `127.0.0.1` by default and ships without
-authentication**. Do **not** expose it on a public interface without putting a
-reverse proxy with authentication (and ideally TLS) in front of it. Passwords
-from `config.yaml` are masked in the UI and never transmitted to the browser, but
-the GUI can still act on the configured servers.
+operations, so it can require a login. Credentials live in `config.yaml`:
+
+```yaml
+web:
+  auth:
+    username: admin
+    password_hash: "scrypt:32768:8:1$..."   # pg_emigrant hash-password
+    secret_key: "any long random string"    # optional, see below
+```
+
+Generate the hash (it prompts, so the password never reaches your shell history
+or the process list — `--password` is there for scripts):
+
+```bash
+pg_emigrant hash-password
+```
+
+Only the hash goes to stdout, so `pg_emigrant hash-password > h` gives you
+exactly the line to paste.
+
+**`enabled` is tri-state, and the default does the safe thing.** Omit it and
+authentication switches on as soon as a credential is present — adding a
+password is all it takes, and a config that has none keeps working exactly as
+before while saying so on every start. Set `enabled: true` to make the
+requirement explicit: a missing credential is then a **startup error**, never a
+GUI that reports itself protected while admitting anyone. `enabled: false`
+keeps it open with a credential still in the file.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `username` | `admin` | |
+| `password_hash` | — | Werkzeug hash; **preferred**. An unusable value is rejected at startup, not at the first login. |
+| `password` | — | Plaintext alternative. Accepted because this file already holds database passwords, but a hash costs one command. |
+| `secret_key` | random per start | Signs the session cookie. Leave it empty and every restart logs everyone out. |
+| `session_timeout_minutes` | `720` | Idle timeout, refreshed on each request. |
+| `cookie_secure` | `false` | Set to `true` when serving over HTTPS: marks the cookie `Secure`. |
+| `max_attempts` / `lockout_seconds` | `5` / `300` | Failed logins per client address before it is refused. `0` disables the throttle. |
+
+What the gate actually covers: every page and every `/api/` route (pages
+redirect to `/login`, API routes return a JSON `401` that the dashboard turns
+into a redirect rather than a wall of error toasts); a session cookie that is
+`HttpOnly` and `SameSite=Lax` — the latter is what stops another site from
+driving `POST /api/action` with a visitor's cookie, which is why there is no
+separate CSRF token; constant-time credential comparison, so response timing
+does not reveal whether the username or the password was wrong; a per-address
+failed-login throttle; and a `?next=` redirect restricted to same-site paths.
+Neither the password, the hash, nor the session key is ever sent to the
+browser — the Configuration page shows only *whether* auth is on, the username,
+and which credential form is in use.
+
+**Still put TLS in front of it before exposing it beyond localhost.** Over plain
+HTTP the password and the session cookie travel in clear, and a login does not
+change that. `pg_emigrant web` warns when authentication is off, and warns
+harder when you combine that with a non-loopback `--host`.
+
+The throttle counts by `remote_addr` and deliberately ignores
+`X-Forwarded-For`, which a client can forge freely (a fresh value per attempt
+would make the throttle a no-op). Behind a reverse proxy every request
+therefore shares the proxy's address and the throttle becomes global rather
+than per-client — the safe direction to be wrong in.
 
 ---
 
@@ -1350,6 +1422,7 @@ pg_emigrant/
     ├── utils.py            # logging + SQL identifier quoting
     └── web/                # optional Flask + Material Design GUI (pg_emigrant web)
         ├── app.py          # Flask app factory + routes (delegates to the modules above)
+        ├── auth.py         # optional login gate (web.auth in config.yaml)
         ├── services.py     # sync↔async bridges over config/db/monitor/replication/…
         ├── jobs.py         # in-memory background JobManager (threads + log capture)
         ├── templates/      # base.html + dashboard / database / config / jobs pages
@@ -1375,7 +1448,7 @@ pg_emigrant/
 | `ddl_detector.py` | `detect_drift()` (full object comparison → `DriftReport`/`DriftItem`) and `apply_drift_fixes()` (applies fixes, schedules tablesync for new tables). |
 | `monitor.py` | `build_status()` and the rich/simple/json renderers for the status dashboard. `_collect_db_status()` returns the raw per-database status dict reused by the web GUI. |
 | `utils.py` | Rich `console`, logging setup, and `qi()` / `qt()` SQL-identifier quoting. |
-| `web/` | Optional Flask GUI (`pg_emigrant web`). `app.py` (routes), `services.py` (sync↔async bridges + action registry), `jobs.py` (threaded background `JobManager` with per-thread log capture), `templates/`, `static/`. Reuses the orchestration modules; never duplicates migration logic. |
+| `web/` | Optional Flask GUI (`pg_emigrant web`). `app.py` (routes), `auth.py` (session-cookie login gate driven by `web.auth`), `services.py` (sync↔async bridges + action registry), `jobs.py` (threaded background `JobManager` with per-thread log capture), `templates/`, `static/`. Reuses the orchestration modules; never duplicates migration logic. |
 
 ---
 
@@ -1388,8 +1461,14 @@ pg_emigrant/
 - Grant the migration roles the **least privilege** necessary (see
   [Requirements](#requirements)).
 - The optional [web GUI](#web-gui) exposes the configuration and can run
-  destructive operations; it binds to `127.0.0.1` and has no authentication — see
-  the GUI's [Security](#security) note before exposing it beyond localhost.
+  destructive operations. It binds to `127.0.0.1`, and a login can be required
+  with `web.auth` in `config.yaml` — it is off unless you configure a
+  credential, and the server says so on every start. Set one (and put TLS in
+  front) before exposing it beyond localhost; see
+  [Authentication](#authentication).
+- `web.auth.password_hash` and `web.auth.secret_key` are never sent to the
+  browser — the Configuration page reports only whether auth is on, the
+  username, and which credential form is in use.
 
 ---
 

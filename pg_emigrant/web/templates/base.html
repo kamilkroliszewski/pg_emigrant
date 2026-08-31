@@ -47,6 +47,20 @@
       <a href="{{ url_for('jobs_page') }}"><i class="material-icons">work_history</i>Jobs</a>
     </li>
     <li class="divider"></li>
+    {% if auth_enabled and current_user %}
+    <li class="sidenav-user">
+      <span class="user-id">
+        <i class="material-icons">account_circle</i>
+        <span class="user-name" title="{{ current_user }}">{{ current_user }}</span>
+      </span>
+      <!-- POST, so a stray GET (a prefetch, a crawler) cannot sign anyone out -->
+      <form method="post" action="{{ url_for('logout') }}">
+        <button class="logout-btn" type="submit" title="Sign out">
+          <i class="material-icons">logout</i>Sign out
+        </button>
+      </form>
+    </li>
+    {% endif %}
     <li class="sidenav-footer">
       <span>Logical replication orchestrator</span>
     </li>

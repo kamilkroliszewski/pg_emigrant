@@ -34,3 +34,41 @@ replication_slot_name: pg_emigrant_slot
 
 parallel_workers: 4
 sequence_sync_interval: 10
+
+# ── Web GUI (`pg_emigrant web`) ───────────────────────────────────────────────
+# Ignored by every other command. Remove this whole block to run the GUI with
+# no login, as it behaved before this section existed — it will say so loudly
+# on every start.
+web:
+  auth:
+    # Omit `enabled` and authentication turns itself on as soon as a credential
+    # is set below. Set it to false to keep the GUI open with a credential still
+    # in the file; set it to true to make the requirement explicit — in which
+    # case a missing credential is a startup error, not a silently open GUI.
+    # enabled: true
+
+    username: admin
+
+    # Preferred. Generate with:  pg_emigrant hash-password
+    password_hash: "REPLACE_ME"
+
+    # Plaintext alternative to password_hash. Accepted because this file already
+    # holds database passwords, but a hash costs one command — prefer the above.
+    # password: CHANGE_ME
+
+    # Signs the session cookie. Left empty, a random key is generated at every
+    # start, so restarting the GUI logs everyone out. Set it to any long random
+    # string to keep sessions across restarts.
+    # secret_key: ""
+
+    # Idle timeout, refreshed on each request (default 720 = 12 h).
+    # session_timeout_minutes: 720
+
+    # Set to true when serving over HTTPS behind a TLS-terminating proxy: marks
+    # the session cookie Secure so it is never sent over plain HTTP.
+    # cookie_secure: false
+
+    # Failed logins per client address before that address is refused for
+    # lockout_seconds. Set max_attempts to 0 to disable the throttle.
+    # max_attempts: 5
+    # lockout_seconds: 300

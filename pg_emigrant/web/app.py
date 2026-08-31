@@ -6,8 +6,13 @@ orchestration functions the CLI uses.  Long-running / mutating operations are
 dispatched to a background :class:`~pg_emigrant.web.jobs.JobManager`.
 
 Security: this server exposes the configuration and can trigger destructive
-database operations.  It binds to ``127.0.0.1`` by default and ships without
-authentication — do not expose it publicly without a reverse proxy + auth.
+database operations.  It binds to ``127.0.0.1`` by default, and a login can be
+required by setting ``web.auth`` in the config file — see
+:mod:`pg_emigrant.web.auth`.  Authentication is off unless a credential is
+configured, and the server says so loudly on every start.  Even with a login,
+put a TLS-terminating reverse proxy in front of it before exposing it beyond
+localhost: the session cookie and the password itself travel in clear over
+plain HTTP.
 """
 
 from __future__ import annotations
@@ -23,9 +28,10 @@ from flask import (
 )
 from flask.json.provider import DefaultJSONProvider
 
-from pg_emigrant.config import ReplicatorConfig, load_config
+from pg_emigrant.config import ReplicatorConfig, WebAuthConfig, load_config
 from pg_emigrant.utils import setup_logging
 from pg_emigrant.web import services
+from pg_emigrant.web.auth import init_auth
 from pg_emigrant.web.jobs import JobManager
 
 
@@ -51,6 +57,11 @@ def create_app(config_path: str = "config.yaml") -> Flask:
     The config is loaded once at startup.  If it cannot be loaded the app still
     starts (so the user gets a readable error in the browser) but mutating
     actions are refused.
+
+    Authentication is installed from ``web.auth``.  A config that asks for a
+    login it cannot enforce raises
+    :class:`~pg_emigrant.web.auth.AuthConfigError` here rather than starting an
+    unprotected server.
     """
     setup_logging(False)  # ensure INFO-level logging so jobs can capture output
 
@@ -67,6 +78,15 @@ def create_app(config_path: str = "config.yaml") -> Flask:
         app.config["EMIGRANT_CFG_ERROR"] = str(exc)
 
     _register_routes(app)
+
+    # Auth last, so its before_request hook guards every route registered
+    # above.  When the config itself failed to load there is no web.auth to
+    # read: the app then starts with the login off, but it is inert — every
+    # endpoint that touches a database refuses via _require_cfg().
+    cfg = app.config["EMIGRANT_CFG"]
+    auth_cfg = cfg.web.auth if cfg is not None else WebAuthConfig()
+    app.config["EMIGRANT_AUTH_ACTIVE"] = init_auth(app, auth_cfg)
+
     return app
 
 
@@ -191,6 +211,7 @@ def _register_routes(app: Flask) -> None:
 
     # ── Error handling: return JSON for API routes ────────────────────────────
     @app.errorhandler(400)
+    @app.errorhandler(401)
     @app.errorhandler(404)
     def _json_errors(err):
         if request.path.startswith("/api/"):
