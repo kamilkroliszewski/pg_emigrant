@@ -84,8 +84,17 @@ slot/subscription — losslessly when the slot survived, and refusing outright
 (changing nothing) when the slot is gone and only a re-copy could restore
 consistency.
 
-At cutover you stop replication, run a final sequence sync, point the application
-at the target, and (optionally) tear the replication objects down.
+**3. Cutover (irreversible).** You stop replication, run a final sequence sync,
+and ask `pg_emigrant cutover-check` whether the target is actually ready —
+replication healthy and caught up, sequences ahead of the source, no unresolved
+drift. It answers; it does not act. Then you point the application at the target
+and tear the replication objects down.
+
+Everything before step 3 is reversible: tear down and bootstrap again. Once the
+application is writing to the target, source and target have diverged and there
+is no going back to a single source of truth without downtime and
+reconciliation. That is why the readiness check is a separate, read-only
+command and why it treats anything it cannot verify as a reason to say no.
 
 Each database is handled **independently** and gets its own publication,
 subscription and replication slot (PostgreSQL logical replication is scoped to a
@@ -1770,16 +1779,16 @@ about the slot, which is the part that determines whether data is recoverable.
   tablespace placement is ignored.
 - **Row-level filtering**: no per-table `WHERE` filter for copy or publication —
   whole tables are replicated.
-- **Resumable bootstrap**: an interrupted bootstrap restarts the affected database
-  from scratch (no checkpointing).
-- **Built-in observability**: no Prometheus/Grafana exporter; monitoring is via
-  the `status` command.
+- **Resumable bootstrap**: an interrupted bootstrap re-copies the affected
+  database from scratch; there is no per-table checkpointing. The re-run is
+  safe (it adopts the orphaned slot and reloads the target), just not cheap.
+- **Built-in observability**: no Prometheus/Grafana exporter. `status --health
+  --format json` is the integration point — it carries the replication state,
+  lag and WAL-retention figures an exporter would need.
 - **Automated cutover**: redirecting application traffic (DNS, pooler config, …)
   is manual and deliberately so. `cutover-check` answers *whether* it is safe;
   moving traffic involves load balancers, DNS, connection pools and people that
   this tool cannot see, so it does not act.
-- **Resumable copy**: an interrupted bootstrap re-copies the affected database
-  from scratch; there is no per-table checkpointing.
 - **Ordered-set / hypothetical-set aggregates** (`WITHIN GROUP` syntax) are
   detected but not reproduced — reported with a warning. Normal aggregates
   are fully supported.
