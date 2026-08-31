@@ -1822,6 +1822,20 @@ replication test fail for the wrong reason.
 | Interrupts | `SIGINT`/`SIGTERM` must strand no slot; `SIGKILL` must leave a state the next run recovers from |
 | Security | No command prints the database password on either stream, including the diagnostics that quote a connection string |
 
+### Docker environments
+
+The suite needs nothing set up: it starts and stops its own containers, labelled
+`pg_emigrant_test=1` so an interrupted run can be tidied with
+`docker rm -f $(docker ps -aq --filter label=pg_emigrant_test=1)`.
+
+`docker/docker-compose.yml` is a separate thing — long-lived servers, one per
+supported major version, for pointing a real `config.yaml` at while working on
+the tool by hand. See [`docker/README.md`](docker/README.md).
+
+CI runs the unit tests, then each version pair as its own job, then a
+correctness-only lint (`ruff check --select F,E9`) — see
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml).
+
 ### Failure injection
 
 Bootstrap phases can be failed deliberately, but arming it takes **two**
@@ -1846,6 +1860,8 @@ pg_emigrant/
 ├── config.yaml.example     # sample configuration
 ├── LICENSE                 # MIT
 ├── README.md
+├── docker/                 # long-lived clusters for hand testing (not used by the suite)
+├── .github/workflows/      # unit + per-version-pair integration + lint
 ├── tests/
 │   ├── unit/               # pure logic: pattern matching, config, exit codes
 │   ├── integration/        # real PostgreSQL in Docker
