@@ -30,6 +30,23 @@ start of replication the exact same consistent point.
 Object-sync failures (functions/views/triggers) are collected and summarized
 in red at the end of the run; databases with an incomplete data copy make the
 whole command fail with a non-zero exit code.
+
+``use_pg_tde`` (``--using-pg-tde``) adds three steps to the sequence above,
+and changes nothing when it is off:
+
+  * 2c — verify the target database can encrypt at all (extension installed,
+    ``tde_heap`` registered, principal key configured) and set the database's
+    ``default_table_access_method``.  Deliberately BEFORE (c)/(d): a target
+    that cannot encrypt should be rejected before a replication slot exists on
+    the production source.
+  * 3a-tde — convert any pre-existing target table to ``tde_heap``, while it
+    is still empty (the data copy TRUNCATEs it moments later, so the rewrite
+    costs nothing here and would cost a full second rewrite afterwards).
+  * 6b — verify, report-only, that nothing in scope was left unencrypted.
+
+Tables created by the run itself carry an explicit ``USING tde_heap`` from
+the CREATE TABLE generator, so encryption never depends on the database
+default alone.  See :mod:`pg_emigrant.tde`.
 """
 
 from __future__ import annotations
@@ -60,6 +77,14 @@ from pg_emigrant.schema_sync import (
     sync_schemas,
 )
 from pg_emigrant.sequence_sync import sync_sequences_once
+from pg_emigrant.tde import (
+    TDE_ACCESS_METHOD,
+    TdeNotAvailable,
+    enforce_access_method,
+    ensure_tde_ready,
+    set_database_default_access_method,
+    verify_encrypted,
+)
 from pg_emigrant.utils import console, get_logger, ql
 
 log = get_logger(__name__)
@@ -154,9 +179,29 @@ async def ensure_database_exists(cfg: ReplicatorConfig, dbname: str) -> None:
             log.debug("Database %s already exists on target", dbname)
 
 
-async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
-    """Run the full bootstrap migration."""
+async def bootstrap(
+    cfg: ReplicatorConfig,
+    database: str | None = None,
+    *,
+    use_pg_tde: bool = False,
+) -> None:
+    """Run the full bootstrap migration.
+
+    ``use_pg_tde`` migrates into pg_tde-encrypted storage on the target: every
+    table is created ``USING tde_heap``, pre-existing target tables are
+    converted, and a target that cannot encrypt aborts the database before
+    anything is created on the source.  See the module docstring.
+    """
     console.rule("[bold green]pg_emigrant bootstrap")
+    if use_pg_tde:
+        console.print(
+            f"[cyan]pg_tde enabled[/cyan] — target tables will be created "
+            f"[bold]USING {TDE_ACCESS_METHOD}[/bold]"
+        )
+
+    # Passed to the CREATE TABLE generator; None leaves the emitted DDL exactly
+    # as it is for an ordinary migration.
+    access_method = TDE_ACCESS_METHOD if use_pg_tde else None
 
     warn_if_unstable_host(cfg)
 
@@ -175,6 +220,8 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
     object_warnings: dict[str, dict[str, list[str]]] = {}
     # Per-database schema drift found by the built-in post-bootstrap check.
     drift_warnings: dict[str, str] = {}
+    # Per-database relations left unencrypted despite --using-pg-tde.
+    tde_warnings: dict[str, list[str]] = {}
 
     with Progress(
         SpinnerColumn(),
@@ -219,12 +266,50 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
                         f"you really want to re-bootstrap it."
                     )
 
+                # Step 2c: pg_tde readiness — deliberately BEFORE the publication
+                # and the replication slot.  A target that cannot encrypt must be
+                # rejected while nothing has been created on the production source
+                # yet; discovering it at the first CREATE TABLE would mean tearing
+                # a live slot back down.  Raises TdeNotAvailable, which the
+                # per-database handler below reports and cleans up after.
+                if use_pg_tde:
+                    progress.update(task, description=f"[{dbname}] Checking pg_tde…")
+                    tde_status = await ensure_tde_ready(cfg, dbname)
+                    console.print(
+                        f"  [{dbname}] pg_tde {tde_status.version} ready — "
+                        f"tables will use {TDE_ACCESS_METHOD}"
+                    )
+                    # Database-level default, so that relation-creating paths
+                    # that never see `access_method` (materialized views,
+                    # detect-ddl --apply, post-cutover application DDL) encrypt
+                    # too.  Re-asserted after sync_db_settings in step 4d-3.
+                    await set_database_default_access_method(cfg, dbname)
+
                 # Step 3: discover schemas for this database, then synchronize them
                 progress.update(task, description=f"[{dbname}] Syncing schemas…")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                     schemas = await discover_schemas(src, cfg)
                     console.print(f"  [{dbname}] Schemas: {schemas}")
-                    await sync_schemas(src, tgt, schemas)
+                    await sync_schemas(src, tgt, schemas, access_method=access_method)
+
+                # Step 3a-tde: convert relations that already existed on the
+                # target (a pre-created schema, or a re-run) — CREATE TABLE IF
+                # NOT EXISTS leaves those with whatever storage they had.  Here
+                # they are still empty, so SET ACCESS METHOD's rewrite is free;
+                # after the copy it would rewrite the loaded table all over again.
+                if use_pg_tde:
+                    progress.update(task, description=f"[{dbname}] Applying {TDE_ACCESS_METHOD}…")
+                    converted, conv_failed = await enforce_access_method(cfg, dbname, schemas)
+                    if converted:
+                        console.print(
+                            f"  [{dbname}] Converted {len(converted)} pre-existing "
+                            f"relation(s) to {TDE_ACCESS_METHOD}"
+                        )
+                    if conv_failed:
+                        raise _DatabaseBootstrapFailed(
+                            f"could not convert {len(conv_failed)} relation(s) to "
+                            f"{TDE_ACCESS_METHOD}: {'; '.join(conv_failed)}"
+                        )
 
                 # Step 3b: REPLICA IDENTITY FULL for PK-less tables, on the SOURCE
                 # before the slot exists — see the module docstring for why this
@@ -378,6 +463,12 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
                     set_count = await sync_db_settings(src, tgt, dbname)
                     if set_count:
                         console.print(f"  [{dbname}] Applied {set_count} per-database setting(s)")
+                # sync_db_settings copies the SOURCE's per-database settings, so a
+                # source that pins default_table_access_method (to plain 'heap',
+                # typically) has just overwritten the value set in step 2c.  The
+                # encrypted target's own storage default has to win.
+                if use_pg_tde:
+                    await set_database_default_access_method(cfg, dbname)
 
                 # Step 4e: final sequence value sync.  Identity-backed sequences
                 # are not pre-created (their tables create them), so their
@@ -412,10 +503,36 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
                 else:
                     console.print(f"  [{dbname}] Post-bootstrap drift check: clean")
 
+                # Step 6b: report-only encryption check.  Report-only because
+                # converting here would rewrite fully-loaded tables at the worst
+                # possible moment — a migration that asked for encryption and
+                # did not fully get it has to say so, not quietly paper over it.
+                if use_pg_tde:
+                    progress.update(task, description=f"[{dbname}] Verifying encryption…")
+                    unencrypted = await verify_encrypted(cfg, dbname, schemas)
+                    if unencrypted:
+                        tde_warnings[dbname] = unencrypted
+                        console.print(
+                            f"  [bold yellow]⚠ [{dbname}] {len(unencrypted)} relation(s) "
+                            f"are NOT stored as {TDE_ACCESS_METHOD}[/bold yellow]"
+                        )
+                    else:
+                        console.print(
+                            f"  [{dbname}] Encryption check: all relations use "
+                            f"{TDE_ACCESS_METHOD}"
+                        )
+
                 progress.update(task, description=f"[{dbname}] ✓ Done")
 
             except Exception as exc:
-                reason = str(exc) if isinstance(exc, _DatabaseBootstrapFailed) else repr(exc)
+                # Both of these carry a message written to be read by a human;
+                # anything else is an unexpected exception whose repr() (type
+                # included) is the more useful thing to show.
+                reason = (
+                    str(exc)
+                    if isinstance(exc, (_DatabaseBootstrapFailed, TdeNotAvailable))
+                    else repr(exc)
+                )
                 console.print(
                     f"  [bold red]✗ [{dbname}] Bootstrap FAILED: {reason}[/bold red]"
                 )
@@ -493,6 +610,17 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             "cutover.[/yellow]"
         )
 
+    if tde_warnings:
+        console.rule(f"[bold yellow]Relations not encrypted with {TDE_ACCESS_METHOD}")
+        for db, rels in tde_warnings.items():
+            for rel in rels:
+                console.print(f"  [yellow]{db}: {rel}[/yellow]")
+        console.print(
+            f"[yellow]These relations are readable on disk without the pg_tde key. "
+            f"Convert them with  ALTER TABLE <name> SET ACCESS METHOD {TDE_ACCESS_METHOD};  "
+            f"(a full rewrite, so schedule it) before cutover.[/yellow]"
+        )
+
     if failed_dbs:
         console.rule("[bold red]Bootstrap FAILED")
         raise RuntimeError(
@@ -502,7 +630,7 @@ async def bootstrap(cfg: ReplicatorConfig, database: str | None = None) -> None:
             "for them. Fix the cause and re-run bootstrap."
         )
 
-    if object_warnings or drift_warnings:
+    if object_warnings or drift_warnings or tde_warnings:
         console.rule("[bold yellow]Bootstrap complete — with warnings")
     else:
         console.rule("[bold green]Bootstrap complete")

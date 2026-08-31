@@ -43,6 +43,7 @@ Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
 - [Output formats](#output-formats)
 - [Web GUI](#web-gui)
 - [New tables created after bootstrap](#new-tables-created-after-bootstrap)
+- [Encrypting the target with pg_tde](#encrypting-the-target-with-pg_tde)
 - [Special handling & edge cases](#special-handling--edge-cases)
 - [Typical migration workflow](#typical-migration-workflow)
 - [Limitations](#limitations)
@@ -173,6 +174,15 @@ created **before** the data copy, not after — see
     source while data was being copied.
 12. **Create the subscription** on the target, attached to the slot created in
     step 6 (`copy_data = false`, `create_slot = false`) — **not** a new one.
+
+With **`--using-pg-tde`** three more steps are interleaved, and nothing changes
+without the flag: pg_tde readiness is verified and the database's
+`default_table_access_method` is set **between steps 1 and 2** (before the
+publication and slot exist, so a target that cannot encrypt costs nothing on
+the source); relations that already existed on the target are converted to
+`tde_heap` **between steps 3 and 4**, while they are still empty; and a
+report-only encryption check runs at the very end. See
+[Encrypting the target with pg_tde](#encrypting-the-target-with-pg_tde).
 
 Progress is shown live with a Rich spinner; each table reports its copied row
 count, and PK-less tables are flagged in yellow. Any unexpected failure at any
@@ -509,6 +519,7 @@ pg_emigrant preflight                          # all discovered databases
 pg_emigrant preflight --database myapp
 pg_emigrant preflight -f json | jq .passed     # CI / runbook gate
 pg_emigrant preflight --strict                 # exit 1 on warnings too
+pg_emigrant preflight --using-pg-tde           # also check the pg_tde prerequisites
 ```
 
 Exit code is **1** when any check fails (with `--strict`, also on warnings), so
@@ -521,6 +532,7 @@ it drops straight into a pipeline or a change-approval runbook.
 | **Privileges** | The migration role can create replication slots (REPLICATION or superuser), can `CREATE DATABASE` and `CREATE SUBSCRIPTION` on the target (superuser, or `pg_create_subscription` + CREATEDB on PG16+), has CREATE on each source database for the publication, and can `SELECT` **every** table that will be copied. |
 | **Naming** | The per-database publication / slot / subscription names are free — catching an already-bootstrapped database before a re-run gets anywhere near its live slot. |
 | **Extensions** | Every extension used on the source is in the target's `pg_available_extensions` (missing ⇒ error, different version ⇒ warning). |
+| **pg_tde** *(only with `--using-pg-tde`)* | `pg_tde` is in the target's `pg_available_extensions` and in its `shared_preload_libraries`; per target database, the extension is installed, it registers the `tde_heap` access method, and a principal key is configured. See [Encrypting the target with pg_tde](#encrypting-the-target-with-pg_tde). |
 | **Schema** | Every configured database exists on the source; object-owner roles exist on the target (pg_emigrant never creates roles); columns and types match for tables that already exist on **both** sides; unlogged tables (silently never replicated) and tables with no primary key (bootstrap would take `ACCESS EXCLUSIVE` on the production source to set `REPLICA IDENTITY FULL`) are flagged. |
 
 `bootstrap` runs these checks automatically and **refuses to start** if any of
@@ -546,8 +558,13 @@ pg_emigrant bootstrap
 pg_emigrant bootstrap --config /etc/pg_emigrant/prod.yaml
 pg_emigrant bootstrap --database myapp
 pg_emigrant bootstrap --skip-preflight     # run the checks yourself / override
+pg_emigrant bootstrap --using-pg-tde       # migrate into pg_tde-encrypted storage
 pg_emigrant --verbose bootstrap
 ```
+
+`--using-pg-tde` (also accepted as `--using_pg_tde`) creates every table on the
+target as an encrypted `tde_heap` relation — see
+[Encrypting the target with pg_tde](#encrypting-the-target-with-pg_tde).
 
 ### `pg_emigrant start` / `pg_emigrant stop`
 
@@ -925,6 +942,111 @@ the same way a new row does. Nothing to remember, nothing to run by hand.
 
 ---
 
+## Encrypting the target with pg_tde
+
+`pg_emigrant bootstrap --using-pg-tde` migrates into
+[pg_tde](https://docs.percona.com/pg-tde/)-encrypted storage on the target:
+every table is created as a `tde_heap` relation instead of a plain `heap` one.
+The source is not touched, is not required to have pg_tde, and does not need to
+know anything about it — this is purely a property of what gets built on the
+target.
+
+```bash
+pg_emigrant preflight --using-pg-tde            # check the prerequisites first
+pg_emigrant bootstrap --using-pg-tde
+pg_emigrant bootstrap --using-pg-tde --database myapp
+```
+
+Without the flag, nothing in this section runs and the generated DDL is
+byte-for-byte what it always was.
+
+### Why it takes more than one mechanism
+
+pg_tde encrypts through its own **table access method**, `tde_heap`. Encryption
+is therefore a property of *each relation*, fixed when the relation is created —
+not a cluster switch that retro-encrypts what already exists. So bootstrap does
+three separate things:
+
+| | What | Why |
+|---|---|---|
+| **1. `USING tde_heap`** | Appended to every generated `CREATE TABLE`. | The statement says what it means, and it shows up in the logs. Applied to ordinary tables and to partition children; on a **partitioned parent** only from PostgreSQL 17, which is the first version that accepts an access method on one (below that the clause is omitted — the rows live in the leaf partitions, and those get it). |
+| **2. `ALTER DATABASE … SET default_table_access_method = 'tde_heap'`** | Set on each target database, before schema sync and again after per-database settings are copied from the source. | Catches every relation-creating path that does *not* go through the `CREATE TABLE` generator: materialized views, `detect-ddl --apply`, the new-table reconciliation inside `sync-sequences`, and your application's own DDL after cutover. Relying on mechanism 1 alone would silently leave all of those unencrypted. It is re-applied after `sync_db_settings` because a source that pins `default_table_access_method` to plain `heap` would otherwise overwrite it. |
+| **3. `ALTER TABLE … SET ACCESS METHOD tde_heap`** | Run against relations that already existed on the target. | `CREATE TABLE IF NOT EXISTS` will not touch a table that is already there, so a re-bootstrap or a pre-created schema would keep plain-heap tables. This runs **before the initial data copy**, while those tables are still empty (the copy `TRUNCATE`s them moments later), so the rewrite is free — doing it afterwards would rewrite the fully-loaded table a second time. Needs PostgreSQL 15+. |
+
+At the end of each database a **report-only** check lists anything still not
+stored as `tde_heap`, in the same style as the post-bootstrap drift check. It
+only reports: converting there would mean rewriting fully-loaded tables at the
+worst possible moment, and a migration that asked for encryption and did not
+fully get it needs to say so rather than quietly paper over it.
+
+### What you have to provide
+
+pg_emigrant runs `CREATE EXTENSION pg_tde` in each target database itself — it
+has to, because a freshly created target database is cloned from `template0`
+and has no extensions at all, which leaves you no window to install it by hand.
+
+It deliberately does **not** create a key provider or a principal key. Which
+provider you use (file / Vault / KMIP), where its secrets live and who can read
+them is a security decision that belongs to you, not to a migration tool. So
+the target must already have:
+
+- `shared_preload_libraries = 'pg_tde'` — and a **restart**, not a reload;
+  pg_tde hooks the storage manager at server start, and `CREATE EXTENSION`
+  refuses to run without it;
+- a key provider and a principal key for each target database, e.g. (pg_tde 1.0
+  spelling):
+
+  ```sql
+  SELECT pg_tde_add_database_key_provider_file('file-provider', '/secure/path/keyring.per');
+  SELECT pg_tde_set_key_using_database_key_provider('principal-key', 'file-provider');
+  ```
+
+  Older builds spell these `pg_tde_add_key_provider_file()` /
+  `pg_tde_set_principal_key()`. For target databases that **do not exist yet**,
+  use a *global* key provider with a default principal key, so the databases
+  bootstrap creates inherit one — otherwise there is no moment at which you
+  could configure the key yourself.
+
+Without a principal key, the very first `CREATE TABLE … USING tde_heap` fails.
+That is why readiness is verified in **step 2c**, before the publication and the
+replication slot are created: a target that cannot encrypt is rejected while
+nothing at all has been created on the production source, rather than halfway
+through with a live slot to tear back down.
+
+### What is checked, and how strictly
+
+| Condition | Result |
+|---|---|
+| `pg_tde` not in `pg_available_extensions` on the target | **error** — the package is not installed on the target host |
+| `pg_tde` not in `shared_preload_libraries` | **error** — needs a config change and a restart |
+| extension not yet installed in the target database | installed automatically (preflight reports it as a warning) |
+| `tde_heap` not registered by the installed extension | **error** — early builds shipped only `tde_heap_basic`, and `tde_heap` additionally needs a PostgreSQL build carrying Percona's storage-manager patches (Percona Server for PostgreSQL) |
+| no principal key for the database | **error**, with the server's own message quoted |
+| this pg_tde build exposes no key-info function | **warning** — proceeds; if no key is set the first encrypted `CREATE TABLE` fails and that database is aborted before replication is configured |
+| target database does not exist yet | **warning** — extension and key cannot be inspected in advance |
+
+The version-dependent parts are probed, not assumed: the principal-key check
+looks up whichever of `pg_tde_key_info()` / `pg_tde_principal_key_info()` the
+installed build actually provides, and an unfamiliar build downgrades to a
+warning rather than blocking a migration that would have worked.
+
+### Notes
+
+- **Indexes are not encrypted by `tde_heap`.** The access method covers table
+  (and TOAST) storage. Index encryption depends on your pg_tde version — check
+  its documentation if index contents are part of your threat model.
+- The database-level default in mechanism 2 is a **persistent** change to the
+  target database, and that is intentional: it keeps tables created *after*
+  cutover encrypted too. Undo it with
+  `ALTER DATABASE <db> RESET default_table_access_method;`.
+- If the migration role may not `ALTER DATABASE`, mechanism 2 is skipped with a
+  warning and the tables pg_emigrant creates are still encrypted through
+  mechanism 1; the final check then reports whatever was missed.
+- In the [Web GUI](#web-gui), pass `{"use_pg_tde": true}` in the bootstrap
+  action's `options`.
+
+---
+
 ## Special handling & edge cases
 
 pg_emigrant encodes a lot of hard-won PostgreSQL knowledge. The notable cases:
@@ -1196,6 +1318,7 @@ pg_emigrant/
     ├── data_copy.py        # parallel, snapshot-consistent COPY
     ├── replication.py      # publications, subscriptions, slots, reinit-sync
     ├── preflight.py        # read-only pre-migration verification
+    ├── tde.py              # pg_tde support for the target (--using-pg-tde)
     ├── sequence_sync.py    # source→target sequence synchronisation
     ├── ddl_detector.py     # schema drift detection & repair
     ├── monitor.py          # read-only status dashboard (rich/simple/json)
@@ -1220,6 +1343,7 @@ pg_emigrant/
 | `preflight.py` | `run_preflight()` — strictly read-only production readiness checks (cluster identity, capacity, privileges, naming, extensions, schema compatibility) returning a `PreflightReport`. Gates `bootstrap`. |
 | `bootstrap.py` | `bootstrap()` — drives the entire per-database pipeline and the live progress display; `ensure_database_exists()`. |
 | `schema_sync.py` | All schema introspection queries and the sync routines: tables/columns, constraints, indexes (with deferred non-unique build), sequences, enum & composite types, functions/procedures, triggers, views/matviews, extensions, `REPLICA IDENTITY FULL`, and ownership (`sync_ownership`, `make_owner_fix_ddl`). |
+| `tde.py` | Everything behind `--using-pg-tde`: `probe_tde()` (read-only, shared with preflight), `ensure_tde_ready()` (installs the extension, verifies `tde_heap` and the principal key), `set_database_default_access_method()`, `enforce_access_method()` (`ALTER TABLE … SET ACCESS METHOD`), and the report-only `verify_encrypted()`. Inert unless the flag is set. |
 | `data_copy.py` | `copy_all_tables()` (snapshot export, truncation, parallel orchestration) and `copy_table_data_pipe()` (streaming CSV copy with optional `ctid` chunking). |
 | `replication.py` | Publication/subscription/slot lifecycle (`create_*`, `drop_*`, `enable_*`, `disable_*`, `refresh_subscription`), status queries, the slot-blocker pre-flight warning, and `reinit_sync()`. |
 | `sequence_sync.py` | `sync_sequences_once()` (forward-only writes, orphan handling), `get_sequence_status()` (read-only), `run_sequence_sync_loop()`. |

@@ -31,6 +31,12 @@ from pg_emigrant.config import ReplicatorConfig
 from pg_emigrant.db import _SYSTEM_SCHEMAS, connect, discover_databases, discover_schemas
 from pg_emigrant.replication import _UNSTABLE_HOSTS, pub_name, sub_name
 from pg_emigrant.schema_sync import get_columns, get_tables
+from pg_emigrant.tde import (
+    TDE_ACCESS_METHOD,
+    TDE_EXTENSION,
+    KEY_SETUP_HINT,
+    probe_tde,
+)
 from pg_emigrant.utils import get_logger, qt
 
 log = get_logger(__name__)
@@ -460,6 +466,120 @@ async def _check_privileges(
             )
 
 
+async def _check_pg_tde_cluster(
+    report: PreflightReport,
+    cfg: ReplicatorConfig,
+    tgt: asyncpg.Connection,
+) -> None:
+    """Cluster-wide prerequisites for ``--using-pg-tde`` on the target.
+
+    Both are properties of the target *server*, so they are checked once
+    against its maintenance database.  Whether the extension is actually
+    installed — and whether a principal key exists — is per-database and lives
+    in :func:`_check_pg_tde_database`.
+    """
+    st = await probe_tde(tgt)
+
+    if not st.available:
+        report.add(
+            "pg_tde_available", "extensions", ERROR,
+            f"--using-pg-tde requested but '{TDE_EXTENSION}' is not available on the target",
+            f"It is not in the target's pg_available_extensions. Install the pg_tde "
+            f"package on {cfg.target.host} (it ships with Percona Server for "
+            f"PostgreSQL) and restart. Without it no table can be created encrypted.",
+        )
+    else:
+        report.add(
+            "pg_tde_available", "extensions", OK,
+            f"'{TDE_EXTENSION}' is available on the target",
+        )
+
+    if st.preloaded is False:
+        report.add(
+            "pg_tde_preloaded", "config", ERROR,
+            f"'{TDE_EXTENSION}' is not in the target's shared_preload_libraries",
+            "pg_tde hooks the storage manager at server start, so CREATE EXTENSION "
+            "refuses to run without it. Set  shared_preload_libraries = 'pg_tde'  "
+            "on the target and RESTART it — a reload is not enough.",
+        )
+    elif st.preloaded:
+        report.add(
+            "pg_tde_preloaded", "config", OK,
+            f"'{TDE_EXTENSION}' is in the target's shared_preload_libraries",
+        )
+    else:
+        report.add(
+            "pg_tde_preloaded", "config", SKIP,
+            "could not read the target's shared_preload_libraries",
+        )
+
+
+async def _check_pg_tde_database(
+    cfg: ReplicatorConfig,
+    dbname: str,
+    tgt_has_db: bool,
+    add,
+) -> None:
+    """Per-database pg_tde readiness: extension, ``tde_heap``, principal key.
+
+    Extensions and principal keys are per-database, so a target database that
+    does not exist yet cannot be checked at all — bootstrap will create it,
+    install the extension, and then need a key.  That case is a WARN, not an
+    error: it is the normal state of a first migration, and the only thing the
+    user can act on in advance is the key.
+    """
+    if not tgt_has_db:
+        add("pg_tde_ready", "extensions", WARN,
+            f"target database '{dbname}' does not exist yet — pg_tde cannot be verified",
+            f"Bootstrap will CREATE the database and install '{TDE_EXTENSION}' into it, "
+            f"but it cannot configure a principal key for you, and without one the "
+            f"first CREATE TABLE … USING {TDE_ACCESS_METHOD} fails (bootstrap then "
+            f"aborts this database before any replication is set up). Either set a "
+            f"default principal key from a GLOBAL key provider so new databases "
+            f"inherit one, or pre-create '{dbname}' on the target with its own key. "
+            + KEY_SETUP_HINT)
+        return
+
+    try:
+        async with connect(cfg.target, dbname) as tgt_db:
+            st = await probe_tde(tgt_db)
+    except Exception as exc:
+        add("pg_tde_ready", "extensions", SKIP,
+            f"could not inspect pg_tde in target database '{dbname}': {exc}")
+        return
+
+    if not st.installed:
+        add("pg_tde_ready", "extensions", WARN,
+            f"'{TDE_EXTENSION}' is not installed in target database '{dbname}'",
+            f"Bootstrap will run CREATE EXTENSION {TDE_EXTENSION} there. It still needs "
+            f"a principal key afterwards. " + KEY_SETUP_HINT)
+        return
+
+    if not st.access_method:
+        add("pg_tde_ready", "extensions", ERROR,
+            f"'{TDE_EXTENSION}' {st.version} in '{dbname}' does not provide "
+            f"'{TDE_ACCESS_METHOD}'",
+            f"Early pg_tde builds shipped only 'tde_heap_basic', and '{TDE_ACCESS_METHOD}' "
+            f"additionally needs a PostgreSQL build carrying Percona's storage-manager "
+            f"patches. Upgrade the target, or migrate without --using-pg-tde.")
+        return
+
+    if st.key_configured is False:
+        add("pg_tde_ready", "extensions", ERROR,
+            f"no pg_tde principal key is configured for target database '{dbname}'",
+            f"{st.key_detail}. Every CREATE TABLE … USING {TDE_ACCESS_METHOD} would "
+            f"fail. " + KEY_SETUP_HINT)
+    elif st.key_configured is None:
+        add("pg_tde_ready", "extensions", WARN,
+            f"'{TDE_EXTENSION}' {st.version} is ready in '{dbname}'; principal key unverified",
+            f"{st.key_detail}. Bootstrap will proceed — if no key is set, the first "
+            f"encrypted CREATE TABLE fails and the database is aborted before "
+            f"replication is configured.")
+    else:
+        add("pg_tde_ready", "extensions", OK,
+            f"pg_tde {st.version} ready in '{dbname}' ({TDE_ACCESS_METHOD} + principal key)")
+
+
 def _check_source_host(report: PreflightReport, cfg: ReplicatorConfig) -> None:
     """``source.host`` is resolved by the TARGET's apply worker, not by us.
 
@@ -611,12 +731,19 @@ async def _check_db_local(
     tgt_available_ext: dict[str, str],
     tgt_roles: set[str],
     tgt_has_db: bool,
+    use_pg_tde: bool = False,
 ) -> list[CheckResult]:
     """All checks that need a connection into a specific database."""
     out: list[CheckResult] = []
 
     def add(name, category, status, summary, detail=""):
         out.append(CheckResult(name, category, status, summary, detail, database=dbname))
+
+    # Runs first, and against the TARGET: it is the one check here that does not
+    # depend on the source connection below, and it gates whether the migration
+    # can be encrypted at all.
+    if use_pg_tde:
+        await _check_pg_tde_database(cfg, dbname, tgt_has_db, add)
 
     try:
         async with connect(cfg.source, dbname) as src:
@@ -846,12 +973,18 @@ async def _compare_columns(cfg, dbname, src, schemas, add) -> None:
 async def run_preflight(
     cfg: ReplicatorConfig,
     database: str | None = None,
+    use_pg_tde: bool = False,
 ) -> PreflightReport:
     """Run every preflight check and return the aggregate report.
 
     Strictly read-only: only ``SELECT``s against ``pg_catalog`` are issued, so
     this is safe to run against production at any time — including while a
     migration is already in progress.
+
+    ``use_pg_tde`` adds the checks that a ``bootstrap --using-pg-tde`` depends
+    on (extension availability, ``shared_preload_libraries``, ``tde_heap``, and
+    a principal key per target database).  Those are skipped entirely
+    otherwise, so an ordinary preflight is unchanged.
     """
     report = PreflightReport()
 
@@ -903,6 +1036,8 @@ async def run_preflight(
         await _check_target_config(report, tgt, len(present))
         await _check_privileges(report, cfg, src, tgt)
         await _check_naming_collisions(report, cfg, src, tgt, present)
+        if use_pg_tde:
+            await _check_pg_tde_cluster(report, cfg, tgt)
 
         # Shared target-side facts, fetched once for all databases.
         ext_rows = await tgt.fetch("SELECT name, default_version FROM pg_available_extensions")
@@ -918,7 +1053,8 @@ async def run_preflight(
     async def _one(db: str) -> list[CheckResult]:
         async with sem:
             return await _check_db_local(
-                cfg, db, tgt_available_ext, tgt_roles, tgt_has_db=db in tgt_dbs
+                cfg, db, tgt_available_ext, tgt_roles, tgt_has_db=db in tgt_dbs,
+                use_pg_tde=use_pg_tde,
             )
 
     for results in await asyncio.gather(*[_one(db) for db in present]):
