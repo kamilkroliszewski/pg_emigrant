@@ -40,13 +40,18 @@ Everything is driven from a single `pg_emigrant` CLI and one YAML config file.
   - [`sync-sequences`](#pg_emigrant-sync-sequences)
   - [`detect-ddl`](#pg_emigrant-detect-ddl)
   - [`reinit-sync`](#pg_emigrant-reinit-sync)
+  - [`cutover-check`](#pg_emigrant-cutover-check)
   - [`hash-password`](#pg_emigrant-hash-password)
+- [Safety guarantees](#safety-guarantees)
+- [Exit codes](#exit-codes)
 - [Output formats](#output-formats)
 - [Web GUI](#web-gui)
 - [New tables created after bootstrap](#new-tables-created-after-bootstrap)
 - [Encrypting the target with pg_tde](#encrypting-the-target-with-pg_tde)
 - [Special handling & edge cases](#special-handling--edge-cases)
 - [Typical migration workflow](#typical-migration-workflow)
+- [Production runbook](#production-runbook)
+- [Testing](#testing)
 - [Limitations](#limitations)
 - [Project layout](#project-layout)
 - [Module reference](#module-reference)
@@ -79,8 +84,17 @@ slot/subscription — losslessly when the slot survived, and refusing outright
 (changing nothing) when the slot is gone and only a re-copy could restore
 consistency.
 
-At cutover you stop replication, run a final sequence sync, point the application
-at the target, and (optionally) tear the replication objects down.
+**3. Cutover (irreversible).** You stop replication, run a final sequence sync,
+and ask `pg_emigrant cutover-check` whether the target is actually ready —
+replication healthy and caught up, sequences ahead of the source, no unresolved
+drift. It answers; it does not act. Then you point the application at the target
+and tear the replication objects down.
+
+Everything before step 3 is reversible: tear down and bootstrap again. Once the
+application is writing to the target, source and target have diverged and there
+is no going back to a single source of truth without downtime and
+reconciliation. That is why the readiness check is a separate, read-only
+command and why it treats anything it cannot verify as a reason to say no.
 
 Each database is handled **independently** and gets its own publication,
 subscription and replication slot (PostgreSQL logical replication is scoped to a
@@ -260,8 +274,24 @@ subscriber would reject it.
   Version-dependent catalog differences (`daticulocale`/`datlocale`,
   `colliculocale`/`colllocale`, PG17's builtin locale provider, PG16+ view
   deparse changes, PG18's catalogued `NOT NULL` constraints) are handled
-  automatically — verified end-to-end on a
-  PG 14 → PG 18 migration.
+  automatically.
+
+  **Tested version matrix.** The integration suite runs the full migration —
+  copy, replication, sequences, failover, failure injection — against real
+  PostgreSQL containers for these source→target pairs:
+
+  | Source | Target | Status |
+  |---|---|---|
+  | 14 | 18 | tested |
+  | 15 | 18 | tested |
+  | 16 | 18 | tested |
+  | 17 | 18 | tested |
+  | 17 | 17 | tested (same-version) |
+  | 18 | 18 | tested (default for a plain `pytest` run) |
+
+  PostgreSQL 13 sources are handled by the same `< 15` publication code path as
+  14 but are **not** covered by the suite; treat 14 as the oldest tested source.
+  See [Testing](#testing) to run the matrix yourself.
 - A migration role on each server with sufficient privileges:
   - **Source:** `REPLICATION` privilege — required for two things: creating the
     publication/replication slot (`CREATE_REPLICATION_SLOT`, issued directly by
@@ -463,13 +493,50 @@ sequence_sync_interval: 10
 | `parallel_workers` | int | `4` | Number of tables copied simultaneously. |
 | `table_parallel_workers` | int | `4` | `ctid` page-range slices streamed concurrently for a single large table. |
 | `sequence_sync_interval` | int | `10` | Seconds between iterations of `sync-sequences --loop`. |
-| `exclude_tables` | list[str] | `[]` | **Accepted but currently has no effect** — table-level exclusion is not yet wired into the copy/publication path. |
-| `replication_slot_name` | str | `pg_emigrant_slot` | **Accepted but unused** — the slot is named after the subscription (`subscription_name`_`<dbname>`), created automatically by PostgreSQL. |
+| `exclude_tables` | list[str] | `[]` | Tables left out of the migration entirely — see [below](#excluding-tables). |
 
-> The last two keys are present in the config model (and in
-> `config.yaml.example`) for forward-compatibility but are **not** consulted by
-> the current code. They are documented here for completeness so their presence
-> isn't mistaken for active behaviour.
+> There is no `replication_slot_name` key. The slot is named after the
+> subscription, one per database (`<subscription_name>_<dbname>`), because
+> `bootstrap` creates the slot up front (to copy from its exported snapshot)
+> and then attaches the subscription to it by that exact name. The key used to
+> exist and was read by nothing; a config that still sets it is now **rejected
+> at load time** with a message telling you to delete the line, rather than
+> silently ignored. Honouring it instead would have renamed the slot on every
+> existing installation — orphaning the live one on the production source,
+> where it would go on retaining WAL until someone noticed.
+
+#### Excluding tables
+
+`exclude_tables` removes tables from the migration completely: they are not
+created on the target, not copied, not published, not replicated, and not
+reported as schema drift.
+
+```yaml
+exclude_tables:
+  - app.audit_log        # schema-qualified
+  - app.tmp_*            # fnmatch glob in either half
+  - scratch_data         # bare name: matches that table in any migrated schema
+```
+
+Matching is **case-sensitive**, because PostgreSQL identifiers are: a table
+created as `"Orders"` is not `orders`.
+
+Two things to know before using it:
+
+- **The target becomes knowingly incomplete.** An excluded table's data never
+  reaches the target and its changes are never replicated. `preflight` reports
+  exactly which tables a pattern resolved to, as a warning, and also warns when
+  a pattern matches nothing at all (usually a typo in a setting whose whole
+  purpose is to leave data behind).
+- **Excluding a referenced table is refused.** If a migrated table has a foreign
+  key to an excluded one, the target's constraint could never be satisfied, so
+  `preflight` fails and `bootstrap` refuses. Exclude the referencing tables too,
+  or don't exclude that table.
+
+On PostgreSQL 15+, any exclusion within a schema forces the publication into the
+enumerated `FOR TABLE` form, because `FOR TABLES IN SCHEMA` cannot leave one
+table out. Tables created afterwards are still picked up automatically by the
+`sync-sequences --loop` process.
 
 ### Auto-discovery rules
 
@@ -605,7 +672,8 @@ Sections:
 
 | Section | Source of data | Shows |
 |---|---|---|
-| **Subscription** | `pg_stat_subscription` (target) | subscription name, worker PID, received/latest-end LSN, byte lag, last-message timestamps |
+| **Health** | slot + apply worker, together | the state (`HEALTHY` / `LAGGING` / `CRITICAL` / `BROKEN` / `ABSENT`), unapplied-WAL lag, **WAL retained by the slot on the source**, `wal_status`, apply-error count, and a plain-language reason for anything but `HEALTHY` |
+| **Subscription** | `pg_stat_subscription` (target) | subscription name, worker PID, received/latest-end LSN, last-message timestamps |
 | **Slots** | `pg_replication_slots` (source) | slot name/type, active flag, active PID, restart LSN, confirmed-flush LSN, `wal_status` — warns loudly if no slot exists |
 | **Lag** | `pg_stat_replication` (source) | application, state, sent LSN, write/flush/replay lag |
 | **Tables** | `pg_class` both sides | per-schema table counts source vs target; mismatched rows highlighted yellow |
@@ -616,11 +684,25 @@ With no section flags, **all** sections are shown. Pass one or more flags to
 limit output (handy across many databases):
 
 ```
---subscription   --slots   --lag   --tables   --sequences   --drift
+--health   --subscription   --slots   --lag   --tables   --sequences   --drift
 ```
+
+> **Read the Health section, not the Subscription one, to answer "is this
+> working?"** A subscription row existing says nothing: it can exist while the
+> apply worker is dead, while the slot has been dropped, or while the target is
+> far enough behind that cutting over would lose recent writes.
+>
+> The lag figure in the Health section is measured from the slot's
+> `confirmed_flush_lsn` against `pg_current_wal_insert_lsn()`, which is the only
+> pair that means what it looks like. `pg_stat_subscription.latest_end_lsn` — the
+> obvious candidate — tracks what the *sender* last reported, and keepalives
+> advance it regardless of what the apply worker has actually done, so a lag
+> computed from it reads as zero on a badly behind subscription.
 
 ```bash
 pg_emigrant status
+pg_emigrant status --health
+pg_emigrant status --health --format json | jq '.[] | {db: .database, state: .health.state, lag: .health.lag_bytes, retained: .health.retained_wal_bytes}'
 pg_emigrant status --database myapp
 pg_emigrant status --format simple --lag | grep write_lag
 pg_emigrant status --format json --drift | jq '.[] | select(.drift.has_drift)'
@@ -800,6 +882,46 @@ override remains a CLI-only action.
 
 ---
 
+### `pg_emigrant cutover-check`
+
+Answers one question, read-only: **is it safe to cut over yet?**
+
+```bash
+pg_emigrant cutover-check [--database DB] [--max-lag-bytes N] [--accept-drift]
+                          [--format rich|simple|json]
+```
+
+Checks, per database:
+
+| Check | Passes when |
+|---|---|
+| `cluster_identity` | source and target are provably different clusters (`system_identifier`) |
+| `target_writable` | the target database is reachable and not a read-only standby |
+| `replication_healthy` | the state is `HEALTHY` — slot present and reserved, subscription enabled, apply worker running, publication present |
+| `replication_caught_up` | unapplied WAL is within `--max-lag-bytes` (default 8 MiB) |
+| `sequences_synchronised` | no sequence is behind the source, missing on the target, or unreadable |
+| `no_schema_drift` | `detect-ddl` finds nothing (or `--accept-drift` was passed) |
+| `wal_retention` | the slot's WAL is `reserved`, and not close to `max_slot_wal_keep_size` |
+
+Every check defaults to **not ready**. A check that cannot be evaluated — an
+unreachable target, an unreadable catalog — counts *against* readiness, because
+a green light based on missing evidence is worse than a red one.
+
+It changes nothing: it will not stop the application, disable the subscription,
+or move any traffic.
+
+Exit code **0** = `SAFE TO CUT OVER`, **5** = `DO NOT CUT OVER`, so it works as
+a gate:
+
+```bash
+pg_emigrant cutover-check --format json > readiness.json || {
+  jq -r '.databases[].checks[] | select(.ready==false) | "\(.name): \(.summary)"' readiness.json
+  exit 1
+}
+```
+
+---
+
 ### `pg_emigrant hash-password`
 
 Generates a password hash for the web GUI's `web.auth.password_hash`. Prompts
@@ -813,6 +935,135 @@ pg_emigrant hash-password > hash.txt        # only the hash goes to stdout
 
 Needs the web extra (`pip install -e ".[web]"`), since the hasher comes from
 Werkzeug. See [Authentication](#authentication).
+
+---
+
+## Safety guarantees
+
+The rule the whole tool is built around: **if pg_emigrant cannot prove that
+source and target are consistent, it fails closed.** Concretely, and each of
+these is covered by an integration test against real PostgreSQL clusters:
+
+**It will not report success on an incomplete migration.**
+Every database ends in exactly one terminal state, and the run reports the worst
+of them:
+
+| Outcome | Meaning | Exit |
+|---|---|---|
+| `success` | copied, replicating, nothing outstanding | 0 |
+| `incomplete` | copied and replicating, but something the migration was asked to reproduce is missing (a view, a trigger, an FK, a sequence, residual drift) | 4 |
+| `failed` | aborted before replication; the slot and publication this run created on the source were rolled back | 4 |
+| `refused` | refused up front because proceeding would be unsafe | 7 |
+
+`incomplete` deliberately **leaves the subscription running** — the data is
+intact and tearing it down would force a needless full re-copy — but it is not
+success, it exits non-zero, and `cutover-check` refuses on it.
+
+**It will not migrate a cluster into itself.** Source and target are compared by
+`system_identifier`, which is stamped in at initdb time and inherited by every
+physical replica. Host and port cannot answer this question: one cluster is
+reachable under a VIP, a pooler, a DNS alias or a second port. The check runs
+inside `bootstrap` and `teardown`, is **not** skippable by `--skip-preflight`,
+and refuses when the identifier cannot be read at all rather than assuming the
+best. This matters because the initial copy clears its target tables: a target
+that is really the source destroys production data.
+
+**It will not destroy target data it does not own.** The initial copy clears the
+tables it is about to load. If a table *outside* the migration's scope holds
+rows and references one inside it, `TRUNCATE ... CASCADE` would empty it too —
+so that case is detected and refused before anything is cleared.
+
+**It will not silently drop columns.** Missing target columns are reconciled
+where they can be (`ALTER TABLE ... ADD COLUMN`); a column that still has
+nowhere to land, or one whose type differs, is refused **before** the target is
+cleared. CSV `COPY` will happily load a `bigint` into a `text` column, so
+without this the run would report success while the target quietly stopped
+being the same data.
+
+**It will not take over another migration's replication objects.** Slots are
+cluster-wide and named from the configuration, so two migrations that were
+never told about each other can collide on one. A slot that is **active** —
+something is streaming from it right now — is never reclaimed implicitly:
+doing so terminates that walsender, drops the slot, and leaves the other
+migration's target silently missing every subsequent change while continuing to
+report itself healthy. Same for a slot belonging to a different database, and
+for a publication this run did not create: a failed run rolls back only its own
+work. Reclaiming an *inactive* orphan — what an interrupted run leaves behind —
+still happens automatically. `teardown` is the explicit way to remove a live
+one.
+
+**It will not claim replication was repaired when it was not.** If the
+replication slot is gone or its WAL was recycled, everything committed since
+its last confirmed LSN is unreachable. `reinit-sync` decides this **before**
+dropping anything, refuses (exit 6), and leaves the broken-but-inspectable state
+exactly as it found it. `--allow-data-gap` overrides it and records the loss
+unambiguously in the result — a repair that lost data never reports as clean.
+
+**It barely touches the source.** The complete set of changes a migration makes
+to the production source is: `REPLICA IDENTITY FULL` on tables that have no
+primary key, one publication, one replication slot. This is verified
+behaviourally rather than by code review — the entire source is photographed
+before and after a real bootstrap (row checksums, object inventory, ownership,
+privileges, indexes, constraints, sequence values, per-database settings) and
+the two are compared.
+
+**An interrupt does not strand a slot.** `SIGINT`/`SIGTERM` cancel the run and
+roll back the replication objects it created on the source, within a bounded 60
+seconds. `SIGKILL` cannot clean up after itself by definition — there, the
+guarantee moves to recovery: the next `bootstrap` run adopts the orphan.
+
+### Reconciliation: what happens when the target already has something
+
+The intended target is a freshly provisioned cluster whose roles, databases and
+sometimes schemas were created by configuration management, so "the target
+already contains things" is the normal case. Per object type:
+
+| Target state | What happens |
+|---|---|
+| **Database** exists | Reused. Not recreated, not dropped. (Created with the source's encoding/collation when absent.) |
+| **Schema** exists | Reused. |
+| **Table** missing | Created from the source definition. |
+| **Table** exists, same columns | Reused; its rows are cleared and reloaded by the copy. |
+| **Table** exists, missing a column | The column is added (`ALTER TABLE … ADD COLUMN`), then the table is loaded in full. |
+| **Table** exists, column type differs | **Refused** before anything is cleared. Nothing reconciles this, and CSV `COPY` would load the wrong type without complaint. |
+| **Table** exists outside the migration's scope, referencing one inside it, and holding rows | **Refused** — clearing the in-scope table would cascade into it. |
+| **Index / constraint** missing | Created. |
+| **Function / view / trigger / policy** missing | Created; a failure makes the run `incomplete`. |
+| **Ownership / grants** differ | Ownership is aligned to the source. Grants are **additive only** — a privilege present on the target and absent on the source is left alone rather than revoked. |
+| **Sequence** exists but behind | Advanced. Never rewound: a target sequence that is *ahead* is left ahead. |
+| **Anything on the target that the source does not have** | Left alone. `detect-ddl` reports it as `missing_on_source`; only `detect-ddl --apply --drop-extra` removes it, and only because you asked. |
+| **A live subscription for this database** | Bootstrap **refuses**. Re-running would drop the live slot and truncate the target mid-replication. `teardown` first. |
+| **An active replication slot with this name** | **Refused** — see above. |
+
+### What is *not* guaranteed
+
+- **Nothing is guaranteed about an excluded table** — that is what
+  `exclude_tables` means.
+- **`UNLOGGED` tables** produce no WAL. Their initial copy happens; later writes
+  silently diverge. `preflight` warns.
+- **DDL executed on the source after bootstrap** is not replicated. `detect-ddl`
+  finds it; `cutover-check` refuses while it is outstanding.
+- **Large objects (`pg_largeobject`)**, tablespace placement, `COMMENT ON`, event
+  triggers, foreign tables, rules and statistics objects are not migrated.
+
+---
+
+## Exit codes
+
+Stable, and part of the interface a runbook can depend on. `0` and `1` keep the
+meaning they have always had, so a script that only distinguishes success from
+failure is unaffected.
+
+| Code | Meaning |
+|---|---|
+| `0` | Success — everything asked for completed, and completed fully. |
+| `1` | Generic failure with no more specific code. |
+| `2` | Configuration error — the config file is missing, invalid, or sets a removed option. Nothing was attempted. |
+| `3` | Preflight failed. Nothing was modified. |
+| `4` | Migration failed or finished incomplete, or a `detect-ddl --apply` fix failed. The target is not fit to cut over to. |
+| `5` | Replication unhealthy — also `cutover-check`'s "do not cut over". |
+| `6` | Recovery impossible — `reinit-sync` refused because streaming cannot close the gap. **Do not retry**; re-copy instead. |
+| `7` | Unsafe operation refused up front (e.g. source and target are the same cluster). |
 
 ---
 
@@ -1327,17 +1578,22 @@ pg_emigrant detect-ddl --config config.yaml --apply
 # 6. (If source is Patroni and a failover happens) repair without re-copying
 pg_emigrant reinit-sync --config config.yaml
 #    Lossless if the slot survived. If the slot is gone it REFUSES and changes
-#    nothing (exit 1) — re-copy that database instead: teardown + bootstrap.
+#    nothing (exit 6) — re-copy that database instead: teardown + bootstrap.
 
 # 7. Cutover
 pg_emigrant stop --config config.yaml                       # pause replication
-#   … confirm replay_lag is 0 via `pg_emigrant status --lag` …
 pg_emigrant sync-sequences --config config.yaml --margin 1000  # final sequence sync,
 #   with a safety buffer against any nextval() call on the source in the gap
 #   between this read and the application actually stopping
+pg_emigrant cutover-check --config config.yaml   # exit 0 = safe, 5 = do NOT
 #   … repoint the application at the target …
-pg_emigrant teardown --config config.yaml      # optional: remove replication objects
+pg_emigrant teardown --config config.yaml      # remove replication objects
+#   Until you do, the slot keeps retaining WAL on the old source.
 ```
+
+> For the annotated version — what each exit code means, what to read in the
+> JSON, and what to do when a step refuses — see the
+> [production runbook](#production-runbook).
 
 ### Many databases / many schemas
 
@@ -1350,6 +1606,152 @@ might migrate `[public, analytics]` while `legacy` migrates only `[public]`, wit
 no manual configuration. An explicit `schemas:` list applies uniformly to every
 database; for differing per-database schema sets, run separate configs with
 `databases:` set.
+
+---
+
+## Production runbook
+
+The sequence below is the one the safety guarantees are designed around. Every
+step is either read-only or reversible until step 8.
+
+```bash
+# ── 1. Configure ───────────────────────────────────────────────────────────
+cp config.yaml.example config.yaml
+chmod 600 config.yaml                    # it holds database passwords
+$EDITOR config.yaml
+
+# ── 2. Verify, before touching production. Changes nothing. ────────────────
+pg_emigrant preflight --format json | tee preflight.json
+#   Exit 3 = do not proceed. Read every WARN as well as every ERROR:
+#   PK-less tables, unlogged tables and excluded tables are all warnings that
+#   change what the migration will and will not carry.
+
+# ── 3. Bootstrap: schema + data + replication ──────────────────────────────
+pg_emigrant bootstrap --verbose --format json | tee bootstrap.json
+#   Exit 0 only if every database came out `success`.
+#   Exit 4 with outcome `incomplete` means replication IS running but the
+#   target is not a faithful copy — read .databases[].problems and fix them.
+#   Exit 4 with outcome `failed` means nothing is replicating for that
+#   database and its source-side objects were rolled back; fix and re-run.
+
+# ── 4. Keep the migration current (run this for the whole window) ──────────
+pg_emigrant sync-sequences --loop &
+#   This process does two jobs: it keeps target sequences ahead of the source,
+#   and it picks up tables created on the source after bootstrap. If it is not
+#   running, neither happens.
+
+# ── 5. Watch it ────────────────────────────────────────────────────────────
+pg_emigrant status --health
+#   HEALTHY / LAGGING / CRITICAL / BROKEN, plus unapplied-WAL lag and how much
+#   WAL the slot is retaining ON THE SOURCE. Watch that second number: see
+#   "WAL retention" below.
+
+# ── 6. Reconcile schema changes made on the source since bootstrap ─────────
+pg_emigrant detect-ddl                    # report
+pg_emigrant detect-ddl --apply            # fix
+
+# ── 7. Decide ──────────────────────────────────────────────────────────────
+pg_emigrant stop                                  # pause the apply worker
+pg_emigrant sync-sequences --margin 1000          # final, one-shot sequence sync
+pg_emigrant cutover-check                         # exit 0 = safe, 5 = do not
+#   Run cutover-check AFTER stopping writes to the source, not before: the lag
+#   check is only meaningful once the source has stopped moving.
+
+# ── 8. Cut over (manual, and irreversible) ─────────────────────────────────
+#   Repoint the application at the target.
+
+# ── 9. Afterwards ──────────────────────────────────────────────────────────
+pg_emigrant teardown                      # drops subscription, publication, slot
+#   Do this once you are confident. Until you do, the slot keeps retaining WAL
+#   on the old source.
+```
+
+### If a Patroni failover happens mid-migration
+
+```bash
+pg_emigrant reinit-sync --format json
+```
+
+- Exit **0**: repaired without a gap (the slot survived, or only the
+  subscription was broken).
+- Exit **6**: **refused, nothing changed.** The slot is gone or its WAL was
+  recycled, so the transactions it held cannot reach the target. Do not retry.
+  Re-copy that database: `teardown --database X && bootstrap --database X`.
+
+`--allow-data-gap` exists for the case where you have independently established
+that the source took no writes in the window. It records the loss in the result
+and the target must be treated as incomplete until the affected tables are
+re-copied.
+
+### WAL retention — the failure that shows up days later
+
+A logical replication slot is the only thing keeping WAL the target has not
+replayed yet, and it keeps it **on the production source**. A slot whose
+consumer has stopped will retain WAL indefinitely, and the symptom is a full
+disk on the primary long after everyone stopped watching the migration.
+
+`status --health` reports `retained_wal_bytes` for exactly this reason, and
+`cutover-check` fails when the slot's `wal_status` is `unreserved` or `lost`, or
+when retention is within 20% of `max_slot_wal_keep_size`.
+
+**pg_emigrant never drops a slot to relieve retention.** That trades a
+disk-space problem — recoverable — for permanent, unrecoverable data loss. The
+options are: let the target catch up, raise `max_slot_wal_keep_size` on the
+source, or decide to abandon the migration and run `teardown` deliberately.
+
+Setting `max_slot_wal_keep_size` on the source is worth thinking about before
+you start. Left unlimited, a stalled migration can fill the primary's disk. Set,
+a slot that falls behind it is silently invalidated (`wal_status = 'lost'`) and
+the migration then requires a full re-copy. Neither is free; choose knowingly.
+
+### PK-less tables — what `REPLICA IDENTITY FULL` costs
+
+A table with no primary key cannot be replicated at all unless it has a replica
+identity, so `bootstrap` sets `REPLICA IDENTITY FULL` on those tables, on the
+**source**. Three consequences:
+
+- The `ALTER TABLE` takes an `ACCESS EXCLUSIVE` lock. It runs under a bounded
+  `lock_timeout` with retries, but on a busy production table it can still take
+  a moment or fail.
+- Every subsequent `UPDATE`/`DELETE` on that table writes the **entire old row**
+  to WAL, not just the key. On a wide, frequently-updated table this is a real
+  increase in WAL volume — and therefore in what the slot retains.
+- On the subscriber, matching a row means a **sequential scan comparing every
+  column**. High update rates against a large PK-less table apply slowly.
+
+`preflight` reports these tables as a warning listing each one. Adding a real
+primary key first is cheaper and safer than any of the above.
+
+If the `ALTER` cannot be applied, `bootstrap` **fails** rather than continuing —
+because once such a table is published, PostgreSQL rejects every `UPDATE` and
+`DELETE` against it *on the production source*. That check runs before the
+publication is created, which is the last moment stopping is free.
+
+### Patroni / failover behaviour
+
+Point `source` at the cluster's **leader-only** endpoint, never at a
+load-balanced or round-robin address. A logical slot is local storage on one
+instance; if two connections land on different nodes, the slot is created on
+one and looked for on the other. Likewise, `source.host` must never be
+`localhost` — that string is stored verbatim in the subscription and resolved
+later by the *target's* apply worker, on the target machine, where it means
+"myself". Both cases are warned about at startup and the second is detected
+after `CREATE SUBSCRIPTION` by asking the target what its own apply worker is
+actually doing.
+
+Before PostgreSQL 17, a logical slot is **not** carried to a physical replica,
+so a promotion loses it. On PostgreSQL 17+, enable failover slots
+(`sync_replication_slots = on`) so a switchover stops losing the slot in the
+first place — this is the single most valuable configuration change for a
+Patroni source.
+
+What is tested: a real streaming standby is built with `pg_basebackup`,
+promoted with `pg_ctl promote`, and the migration is pointed at the new
+primary — which genuinely has no slot, exactly as a promoted Patroni leader
+would not. Recovery must refuse, and does. **Patroni itself is not in the test
+environment**: what it contributes — leader election, DCS state, moving an
+endpoint — changes *which node* the tool connects to, not what PostgreSQL does
+about the slot, which is the part that determines whether data is recoverable.
 
 ---
 
@@ -1373,18 +1775,20 @@ database; for differing per-database schema sets, run separate configs with
 
 ### Not yet implemented in pg_emigrant
 
-- **`exclude_tables` / `replication_slot_name`** config keys are accepted but have
-  no effect (see [configuration](#full-parameter-reference)).
 - **Tablespaces**: objects are created in the target's default tablespace; source
   tablespace placement is ignored.
 - **Row-level filtering**: no per-table `WHERE` filter for copy or publication —
   whole tables are replicated.
-- **Resumable bootstrap**: an interrupted bootstrap restarts the affected database
-  from scratch (no checkpointing).
-- **Built-in observability**: no Prometheus/Grafana exporter; monitoring is via
-  the `status` command.
+- **Resumable bootstrap**: an interrupted bootstrap re-copies the affected
+  database from scratch; there is no per-table checkpointing. The re-run is
+  safe (it adopts the orphaned slot and reloads the target), just not cheap.
+- **Built-in observability**: no Prometheus/Grafana exporter. `status --health
+  --format json` is the integration point — it carries the replication state,
+  lag and WAL-retention figures an exporter would need.
 - **Automated cutover**: redirecting application traffic (DNS, pooler config, …)
-  is manual; pg_emigrant stops at `stop` + final `sync-sequences`.
+  is manual and deliberately so. `cutover-check` answers *whether* it is safe;
+  moving traffic involves load balancers, DNS, connection pools and people that
+  this tool cannot see, so it does not act.
 - **Ordered-set / hypothetical-set aggregates** (`WITHIN GROUP` syntax) are
   detected but not reproduced — reported with a warning. Normal aggregates
   are fully supported.
@@ -1397,6 +1801,89 @@ database; for differing per-database schema sets, run separate configs with
 
 ---
 
+## Testing
+
+```bash
+pip install -e ".[test]"
+
+pytest tests/unit                 # pure logic, no database, <1s
+pytest tests/integration          # real PostgreSQL in Docker
+pytest                            # both
+```
+
+The integration suite starts throw-away PostgreSQL containers and runs the real
+orchestration against them. It needs a working Docker daemon; without one those
+tests skip rather than fail.
+
+**PostgreSQL semantics are never mocked.** Replication slots, exported
+snapshots, `COPY`, sequence caching, transaction visibility and apply-worker
+behaviour are precisely what these tests exist to pin down — a mock of any of
+them would only assert that the mock behaves like the mock. Mocks are used for
+pure logic (pattern matching, exit-code arithmetic) and nowhere else.
+
+### Version matrix
+
+`--pg-matrix` selects which source→target pairs to run. The default is a single
+`18->18` pair so an ordinary run is fast; the cross-version matrix is opt-in:
+
+```bash
+pytest tests/integration --pg-matrix "14->18,15->18,16->18,17->18,18->18,17->17"
+pytest tests/integration --pg-matrix full     # the same set
+```
+
+Containers share the host network namespace rather than publishing ports. That
+is not a convenience: a subscription's `CONNECTION` string is resolved by the
+*target's own apply worker*, so with published ports `127.0.0.1:<source port>`
+means "the source" to the test process and "myself" to the target container —
+which is the production failure mode the tool warns about, and would make every
+replication test fail for the wrong reason.
+
+### What the suite covers
+
+| Area | What is asserted |
+|---|---|
+| Data consistency | Whole-table checksums (order-independent, over every column), row counts, primary-key set diffs, sequence values and the schema object inventory — all computed **by PostgreSQL**, not by comparing Python objects |
+| Concurrent DML | A live INSERT/UPDATE/DELETE workload across multiple tables (including a PK-less one) runs for the whole bootstrap; source and target must converge exactly |
+| Failure injection | Every bootstrap phase failed on purpose; each must exit non-zero, leak no slot/publication/subscription, and leave a plain re-run able to succeed |
+| Slot safety | Slot dropped for real, then recovery attempted: must refuse, and must not destroy the existing subscription first |
+| Failover | A real `pg_basebackup` standby, really promoted; recovery against the slot-less new primary must refuse |
+| Same-cluster | Identical endpoints and aliases for one cluster; must refuse before any write |
+| Source mutation | The whole source photographed before and after; only replica identity, one publication and one slot may differ |
+| Pre-existing target | Pre-created databases, schemas and tables; out-of-scope data must survive |
+| COPY edges | Text-COPY sentinels as data, NULL vs empty string, NaN, timestamp infinities, TOAST, generated and identity columns, ctid slicing, a backend killed mid-stream |
+| Interrupts | `SIGINT`/`SIGTERM` must strand no slot; `SIGKILL` must leave a state the next run recovers from |
+| Security | No command prints the database password on either stream, including the diagnostics that quote a connection string |
+
+### Docker environments
+
+The suite needs nothing set up: it starts and stops its own containers, labelled
+`pg_emigrant_test=1` so an interrupted run can be tidied with
+`docker rm -f $(docker ps -aq --filter label=pg_emigrant_test=1)`.
+
+`docker/docker-compose.yml` is a separate thing — long-lived servers, one per
+supported major version, for pointing a real `config.yaml` at while working on
+the tool by hand. See [`docker/README.md`](docker/README.md).
+
+CI runs the unit tests, then each version pair as its own job, then a
+correctness-only lint (`ruff check --select F,E9`) — see
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml).
+
+### Failure injection
+
+Bootstrap phases can be failed deliberately, but arming it takes **two**
+environment variables and neither is anything a migration host would have set:
+
+```bash
+PG_EMIGRANT_TEST_HOOKS_ENABLED=1 PG_EMIGRANT_TEST_FAIL_AT=data_copy pg_emigrant bootstrap
+```
+
+`PG_EMIGRANT_TEST_FAIL_AT` alone does nothing and logs a warning saying so.
+Failure injection is deliberately unreachable from `config.yaml`: config files
+get copied between environments, an environment variable named for testing does
+not. A unit test asserts it is inert by default.
+
+---
+
 ## Project layout
 
 ```
@@ -1405,6 +1892,13 @@ pg_emigrant/
 ├── config.yaml.example     # sample configuration
 ├── LICENSE                 # MIT
 ├── README.md
+├── docker/                 # long-lived clusters for hand testing (not used by the suite)
+├── .github/workflows/      # unit + per-version-pair integration + lint
+├── tests/
+│   ├── unit/               # pure logic: pattern matching, config, exit codes
+│   ├── integration/        # real PostgreSQL in Docker
+│   ├── fixtures/           # the representative migration schema + data
+│   └── helpers/            # containers, checksums, catch-up waits, workload
 └── pg_emigrant/
     ├── __init__.py         # package version (0.1.0)
     ├── cli.py              # Typer CLI — all commands & flags
@@ -1419,7 +1913,14 @@ pg_emigrant/
     ├── sequence_sync.py    # source→target sequence synchronisation
     ├── ddl_detector.py     # schema drift detection & repair
     ├── monitor.py          # read-only status dashboard (rich/simple/json)
-    ├── utils.py            # logging + SQL identifier quoting
+    ├── health.py           # replication state, lag, WAL retention
+    ├── cutover.py          # read-only cutover readiness
+    ├── guards.py           # unskippable pre-mutation checks (cluster identity)
+    ├── scope.py            # exclude_tables matching, applied everywhere
+    ├── report.py           # bootstrap terminal outcomes
+    ├── exits.py            # stable CLI exit codes
+    ├── _testhooks.py       # failure injection (inert unless doubly armed)
+    ├── utils.py            # logging, SQL quoting, conninfo redaction
     └── web/                # optional Flask + Material Design GUI (pg_emigrant web)
         ├── app.py          # Flask app factory + routes (delegates to the modules above)
         ├── auth.py         # optional login gate (web.auth in config.yaml)
@@ -1435,7 +1936,7 @@ pg_emigrant/
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | Defines the `pg_emigrant` Typer app and its commands: `preflight`, `bootstrap`, `start`, `stop`, `teardown`, `status`, `sync-sequences`, `detect-ddl`, `reinit-sync`. Handles output formatting for the reporting commands. |
+| `cli.py` | Defines the `pg_emigrant` Typer app and its commands: `preflight`, `bootstrap`, `start`, `stop`, `teardown`, `status`, `sync-sequences`, `detect-ddl`, `reinit-sync`, `cutover-check`, `web`, `hash-password`. Handles output formatting, `--format` validation, semantic exit codes, and signal-driven cancellation. |
 | `config.py` | `DatabaseConfig` and `ReplicatorConfig` Pydantic models and `load_config()` (YAML → validated config; defaults to `config.yaml`, raises if missing). |
 | `db.py` | DSN building and async `connect()` context manager; `discover_databases()` and `discover_schemas()` with the system-schema exclusion set. |
 | `preflight.py` | `run_preflight()` — strictly read-only production readiness checks (cluster identity, capacity, privileges, naming, extensions, schema compatibility) returning a `PreflightReport`. Gates `bootstrap`. |
@@ -1447,7 +1948,14 @@ pg_emigrant/
 | `sequence_sync.py` | `sync_sequences_once()` (forward-only writes, orphan handling), `get_sequence_status()` (read-only), `run_sequence_sync_loop()`. |
 | `ddl_detector.py` | `detect_drift()` (full object comparison → `DriftReport`/`DriftItem`) and `apply_drift_fixes()` (applies fixes, schedules tablesync for new tables). |
 | `monitor.py` | `build_status()` and the rich/simple/json renderers for the status dashboard. `_collect_db_status()` returns the raw per-database status dict reused by the web GUI. |
-| `utils.py` | Rich `console`, logging setup, and `qi()` / `qt()` SQL-identifier quoting. |
+| `health.py` | `replication_health()` — HEALTHY/LAGGING/CRITICAL/BROKEN/ABSENT plus unapplied-WAL lag, WAL retained by the slot, `wal_status` and apply-error count. Read-only. |
+| `cutover.py` | `check_cutover_readiness()` — the read-only SAFE / DO NOT CUT OVER decision. Takes no action of its own. |
+| `guards.py` | `assert_distinct_clusters()` — the `system_identifier` check, enforced where mutation happens rather than only in the (skippable) preflight. |
+| `scope.py` | `exclude_tables` pattern matching and the safety check refusing to exclude a table a migrated table references. |
+| `report.py` | `BootstrapReport` / `Outcome` — the four terminal states and their exit codes. |
+| `exits.py` | The stable exit-code table. |
+| `_testhooks.py` | Failure injection for the test suite; inert unless two environment variables are both set. |
+| `utils.py` | Rich `console`, logging setup, `qi()` / `qt()` SQL-identifier quoting, and `redact_conninfo()`. |
 | `web/` | Optional Flask GUI (`pg_emigrant web`). `app.py` (routes), `auth.py` (session-cookie login gate driven by `web.auth`), `services.py` (sync↔async bridges + action registry), `jobs.py` (threaded background `JobManager` with per-thread log capture), `templates/`, `static/`. Reuses the orchestration modules; never duplicates migration logic. |
 
 ---
@@ -1457,9 +1965,18 @@ pg_emigrant/
 - Database passwords live only in your local `config.yaml`
   (which is git-ignored). Restrict it: `chmod 600 config.yaml`.
 - The connection DSN (with the password) is assembled in process memory only and
-  is never logged.
+  is never logged. The one place a password could otherwise escape is the
+  diagnostic that quotes a subscription's stored `CONNECTION` string back at you
+  — that string is redacted (`password=***REDACTED***`) while keeping the host,
+  port and user that make the message useful. An integration test runs every
+  command with `--verbose` and asserts the password appears on neither stream.
 - Grant the migration roles the **least privilege** necessary (see
   [Requirements](#requirements)).
+- pg_emigrant spawns no subprocesses and writes no temporary files, so there is
+  no argv or temp-file exposure of credentials.
+- Failure injection (`PG_EMIGRANT_TEST_FAIL_AT`) cannot be enabled from the
+  config file and needs a second environment variable to arm — see
+  [Testing](#testing).
 - The optional [web GUI](#web-gui) exposes the configuration and can run
   destructive operations. It binds to `127.0.0.1`, and a login can be required
   with `web.auth` in `config.yaml` — it is off unless you configure a

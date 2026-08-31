@@ -138,7 +138,10 @@ def masked_config(cfg: ReplicatorConfig) -> dict[str, Any]:
         "exclude_tables": cfg.exclude_tables,
         "publication_name": cfg.publication_name,
         "subscription_name": cfg.subscription_name,
-        "replication_slot_name": cfg.replication_slot_name,
+        # Derived, not configured: the slot is named after the subscription,
+        # one per database, because bootstrap creates it up front and attaches
+        # the subscription to it by that name.
+        "slot_name_pattern": f"{cfg.subscription_name}_<database>",
         "parallel_workers": cfg.parallel_workers,
         "table_parallel_workers": cfg.table_parallel_workers,
         "sequence_sync_interval": cfg.sequence_sync_interval,
@@ -171,7 +174,13 @@ def _build_bootstrap(cfg: ReplicatorConfig, db: Optional[str], _opts: dict) -> C
     use_pg_tde = bool(_opts.get("use_pg_tde"))
 
     async def _coro() -> Any:
-        await bootstrap(cfg, database=db, use_pg_tde=use_pg_tde)
+        # bootstrap() raises BootstrapIncomplete for anything short of full
+        # success, so the job runner marks the job failed and the GUI shows the
+        # per-database reasons rather than a green tick over a partial
+        # migration.  Returning the report normally would let a partially
+        # migrated database read as "done" in the job list.
+        report = await bootstrap(cfg, database=db, use_pg_tde=use_pg_tde)
+        return report.summary
         suffix = " (pg_tde)" if use_pg_tde else ""
         return {"message": f"Bootstrap finished for {db or 'all databases'}{suffix}"}
 
@@ -299,9 +308,23 @@ def _build_detect_ddl_apply(cfg: ReplicatorConfig, db: str, opts: dict) -> CoroF
             log.info("No drift detected for %s — nothing to apply", db)
             return {"message": f"No drift detected for {db}", "applied": 0}
         log.info("Applying drift fixes for %s (%s)", db, report.summary)
-        applied = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
-        log.info("Applied %d fix(es) for %s", applied, db)
-        return {"message": f"Applied {applied} fix(es) for {db}", "applied": applied}
+        fixes = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
+        log.info("Applied %d fix(es) for %s", fixes.applied, db)
+        if not fixes.clean:
+            # Raise, so the job is marked failed in the GUI.  Reporting
+            # "applied 4 fixes" for a pass that could not apply half its DDL
+            # leaves the operator believing the target is now correct.
+            for failure in fixes.failures:
+                log.error("Could not apply: %s", failure)
+            raise RuntimeError(
+                f"{len(fixes.failures)} drift fix(es) FAILED for {db} "
+                f"({fixes.applied} applied) — the drift they were meant to "
+                f"correct is still there: " + "; ".join(fixes.failures)
+            )
+        return {
+            "message": f"Applied {fixes.applied} fix(es) for {db}",
+            "applied": fixes.applied,
+        }
 
     return _coro
 

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 from typing import Optional
 
 import typer
 from rich.table import Table
 
+from pg_emigrant import exits
 from pg_emigrant.config import load_config
-from pg_emigrant.utils import console, setup_logging
+from pg_emigrant.utils import console, route_console_to_stderr, setup_logging
 
 app = typer.Typer(
     name="pg_emigrant",
@@ -19,8 +21,78 @@ app = typer.Typer(
 
 
 def _run(coro):
-    """Run an async coroutine from the synchronous CLI layer."""
-    return asyncio.run(coro)
+    """Run an async coroutine from the synchronous CLI layer.
+
+    SIGINT and SIGTERM cancel the running task rather than tearing the process
+    down where it stands.  That matters because the dangerous moment to be
+    killed is the one where a replication slot exists on the production source
+    and nothing is attached to it yet: an abandoned logical slot retains WAL
+    until somebody drops it, which is how an interrupted migration fills a
+    primary's disk days later.  Cancellation gives the orchestrators a chance
+    to roll that back (see bootstrap's handler); SIGKILL by definition does
+    not, so the recovery path there is the next run adopting the orphan.
+    """
+    async def _cancellable():
+        task = asyncio.ensure_future(coro)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, task.cancel)
+            except (NotImplementedError, RuntimeError):
+                # Windows, or a non-main thread: fall back to the default
+                # behaviour rather than failing to run at all.
+                pass
+        return await task
+
+    return asyncio.run(_cancellable())
+
+
+_FORMATS = ("rich", "simple", "json")
+
+
+def _resolve_format(fmt: str) -> str:
+    """Validate ``--format`` and, for JSON, get everything else off stdout.
+
+    An unrecognised value used to fall through to the rich renderer, so a
+    typo in a CI pipeline's ``--format jsom`` produced a coloured table that
+    the pipeline then failed to parse, blaming the data.
+    """
+    fmt = fmt.strip().lower()
+    if fmt not in _FORMATS:
+        console.print(
+            f"[bold red]Configuration error:[/bold red] unknown --format "
+            f"{fmt!r}; expected one of {', '.join(_FORMATS)}"
+        )
+        raise typer.Exit(code=exits.CONFIG_ERROR)
+    if fmt == "json":
+        route_console_to_stderr()
+    return fmt
+
+
+def _load(config: str):
+    """Load the configuration, turning any problem with it into exit 2.
+
+    A missing file, invalid YAML or a rejected setting is a *configuration*
+    error, not a migration failure — a runbook needs to tell "fix your config"
+    apart from "the migration went wrong", and an unhandled traceback tells it
+    neither.
+    """
+    from pydantic import ValidationError
+
+    try:
+        return load_config(config)
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        raise typer.Exit(code=exits.CONFIG_ERROR)
+    except ValidationError as exc:
+        console.print("[bold red]Configuration error:[/bold red]")
+        for err in exc.errors():
+            location = ".".join(str(p) for p in err["loc"]) or "(root)"
+            console.print(f"  [red]{location}: {err['msg']}[/red]")
+        raise typer.Exit(code=exits.CONFIG_ERROR)
+    except Exception as exc:  # malformed YAML, unreadable file, …
+        console.print(f"[bold red]Configuration error:[/bold red] {exc!s}")
+        raise typer.Exit(code=exits.CONFIG_ERROR)
 
 
 @app.callback()
@@ -62,7 +134,8 @@ def preflight(
 
     from pg_emigrant.preflight import ERROR, OK, SKIP, WARN, run_preflight
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
     report = _run(run_preflight(cfg, database=database, use_pg_tde=using_pg_tde))
 
     if format == "json":
@@ -116,7 +189,7 @@ def preflight(
             console.rule(f"[bold red]Preflight FAILED — {report.summary}")
 
     if not report.passed or (strict and report.warnings):
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exits.PREFLIGHT_FAILED)
 
 
 @app.command()
@@ -136,6 +209,10 @@ def bootstrap(
             "table with ALTER TABLE … SET ACCESS METHOD tde_heap."
         ),
     ),
+    format: str = typer.Option(
+        "rich", "--format", "-f",
+        help="Output format: rich (default) or json (machine-readable result on stdout)",
+    ),
 ):
     """Run full bootstrap migration: discover → schema sync → data copy → replication setup.
 
@@ -146,10 +223,15 @@ def bootstrap(
     live) that belong to you. The readiness check runs before anything is
     created on the source, so a target that cannot encrypt costs nothing.
     """
-    from pg_emigrant.bootstrap import bootstrap as do_bootstrap
-    from pg_emigrant.preflight import run_preflight
+    import json as _json
 
-    cfg = load_config(config)
+    from pg_emigrant.bootstrap import bootstrap as do_bootstrap
+    from pg_emigrant.guards import UnsafeOperation
+    from pg_emigrant.preflight import run_preflight
+    from pg_emigrant.report import BootstrapIncomplete
+
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     # Gate the irreversible part behind the read-only checks: almost everything
     # that makes a bootstrap fail halfway (missing extension/role on the target,
@@ -169,7 +251,7 @@ def bootstrap(
                 "\n[dim]Nothing was modified. Run 'pg_emigrant preflight' for the full "
                 "report, or re-run with --skip-preflight to override.[/dim]"
             )
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=exits.PREFLIGHT_FAILED)
         if report.warnings:
             console.print(
                 f"[yellow]⚠ Preflight passed with {len(report.warnings)} warning(s)[/yellow] "
@@ -177,10 +259,25 @@ def bootstrap(
             )
 
     try:
-        _run(do_bootstrap(cfg, database=database, use_pg_tde=using_pg_tde))
+        result = _run(do_bootstrap(cfg, database=database, use_pg_tde=using_pg_tde))
+    except UnsafeOperation as exc:
+        console.print(f"[bold red]Refusing to start the migration:[/bold red] {exc}")
+        raise typer.Exit(code=exits.UNSAFE_REFUSED)
+    except BootstrapIncomplete as exc:
+        if format == "json":
+            print(_json.dumps(exc.report.to_dict(), indent=2))
+        raise typer.Exit(code=exc.report.exit_code)
+    except asyncio.CancelledError:
+        # An interrupt that reached here without a report: the run was
+        # cancelled before it had per-database state to summarise.
+        console.print("[bold yellow]Interrupted — nothing further was changed.[/bold yellow]")
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
     except RuntimeError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
+
+    if format == "json":
+        print(_json.dumps(result.to_dict(), indent=2))
 
 
 @app.command()
@@ -192,7 +289,7 @@ def start(
     from pg_emigrant.db import discover_databases
     from pg_emigrant.replication import enable_subscription
 
-    cfg = load_config(config)
+    cfg = _load(config)
 
     async def _start():
         dbs = [database] if database else await discover_databases(cfg)
@@ -212,7 +309,7 @@ def stop(
     from pg_emigrant.db import discover_databases
     from pg_emigrant.replication import disable_subscription
 
-    cfg = load_config(config)
+    cfg = _load(config)
 
     async def _stop():
         dbs = [database] if database else await discover_databases(cfg)
@@ -230,18 +327,27 @@ def teardown(
 ):
     """Remove subscriptions, publications, and replication slots."""
     from pg_emigrant.db import discover_databases
+    from pg_emigrant.guards import UnsafeOperation, assert_distinct_clusters
     from pg_emigrant.replication import drop_publication, drop_subscription
 
-    cfg = load_config(config)
+    cfg = _load(config)
 
     async def _teardown():
+        # Teardown drops publications and replication slots on the SOURCE; if
+        # 'target' is really the source, the subscription lookup and the drop
+        # both land on production.
+        await assert_distinct_clusters(cfg)
         dbs = [database] if database else await discover_databases(cfg)
         for db in dbs:
             await drop_subscription(cfg, db)
             await drop_publication(cfg, db)
             console.print(f"[red]Torn down replication for {db}")
 
-    _run(_teardown())
+    try:
+        _run(_teardown())
+    except UnsafeOperation as exc:
+        console.print(f"[bold red]Refusing to tear down:[/bold red] {exc}")
+        raise typer.Exit(code=exits.UNSAFE_REFUSED)
 
 
 @app.command()
@@ -249,6 +355,13 @@ def status(
     config: str = typer.Option("config.yaml", "--config", "-c"),
     database: Optional[str] = typer.Option(None, "--database", "-d", help="Show status for a specific database only"),
     format: str = typer.Option("rich", "--format", "-f", help="Output format: rich (default), simple (grep-friendly), json"),
+    show_health: bool = typer.Option(
+        False, "--health",
+        help=(
+            "Show the replication health state (HEALTHY/LAGGING/CRITICAL/BROKEN), "
+            "unapplied-WAL lag, and how much WAL the slot is retaining on the source"
+        ),
+    ),
     show_subscription: bool = typer.Option(False, "--subscription", help="Show subscription status"),
     show_slots: bool = typer.Option(False, "--slots", help="Show replication slots"),
     show_lag: bool = typer.Option(False, "--lag", help="Show replication lag"),
@@ -257,11 +370,14 @@ def status(
     show_drift: bool = typer.Option(False, "--drift", help="Show schema drift summary"),
 ):
     """Display replication status, lag, sequence sync, and drift for all databases."""
-    from pg_emigrant.monitor import _ALL_SECTIONS, build_status
+    from pg_emigrant.monitor import build_status
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     selected: set[str] = set()
+    if show_health:
+        selected.add("health")
     if show_subscription:
         selected.add("subscription")
     if show_slots:
@@ -312,7 +428,8 @@ def sync_sequences(
     from pg_emigrant.replication import run_new_table_sync_loop
     from pg_emigrant.sequence_sync import run_sequence_sync_loop, sync_sequences_once
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     def _kv_quote(s: object) -> str:
         v = str(s) if s is not None else ""
@@ -413,7 +530,8 @@ def detect_ddl(
     from pg_emigrant.db import discover_databases
     from pg_emigrant.ddl_detector import apply_drift_fixes, detect_drift
 
-    cfg = load_config(config)
+    format = _resolve_format(format)
+    cfg = _load(config)
 
     def _kv_quote(s: object) -> str:
         v = str(s) if s is not None else ""
@@ -423,9 +541,13 @@ def detect_ddl(
             return '"' + v.replace('"', '\\"') + '"'
         return v
 
-    async def _detect():
+    async def _detect() -> bool:
         dbs = [database] if database else await discover_databases(cfg)
         all_data = []
+        # A repair pass that could not apply half its DDL and reported only
+        # "applied 4 fixes" leaves the operator believing the target is now
+        # correct.  Tracked so the command can exit non-zero.
+        apply_failed = False
 
         for db in dbs:
             report = await detect_drift(cfg, db)
@@ -501,11 +623,25 @@ def detect_ddl(
                         "[bold red]WARNING:[/bold red] --drop-extra will DROP tables on target "
                         "that do not exist on source. This is destructive!"
                     )
-                applied = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
+                fixes = await apply_drift_fixes(cfg, db, report, drop_extra=drop_extra)
+                if not fixes.clean:
+                    apply_failed = True
                 if format == "simple":
-                    print(f"db={_kv_quote(db)} section=apply applied={applied}")
-                elif format != "json":
-                    console.print(f"[green]Applied {applied} fix(es) for {db}")
+                    print(
+                        f"db={_kv_quote(db)} section=apply applied={fixes.applied}"
+                        f" failed={len(fixes.failures)}"
+                    )
+                elif format == "json":
+                    all_data[-1]["apply"] = fixes.to_dict()
+                else:
+                    console.print(f"[green]Applied {fixes.applied} fix(es) for {db}")
+                    for failure in fixes.failures:
+                        console.print(f"  [bold red]✗ could not apply: {failure}[/bold red]")
+                    if not fixes.clean:
+                        console.print(
+                            f"  [bold red]{len(fixes.failures)} fix(es) FAILED for {db} — "
+                            f"the drift they were meant to correct is still there.[/bold red]"
+                        )
             elif format == "rich":
                 console.print(
                     "[dim]Run with [bold]--apply[/bold] to fix missing objects and ownership drift, "
@@ -514,8 +650,10 @@ def detect_ddl(
 
         if format == "json":
             print(_json.dumps(all_data, indent=2))
+        return apply_failed
 
-    _run(_detect())
+    if _run(_detect()):
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
 
 
 @app.command(name="reinit-sync")
@@ -533,6 +671,10 @@ def reinit_sync(
             "slot's last confirmed LSN. Without this, such a repair is refused and "
             "nothing is changed."
         ),
+    ),
+    format: str = typer.Option(
+        "rich", "--format", "-f",
+        help="Output format: rich (default) or json (machine-readable result on stdout)",
     ),
 ):
     """Re-initialize replication after a Patroni switchover/failover.
@@ -556,8 +698,12 @@ def reinit_sync(
     from pg_emigrant.replication import reinit_sync as do_reinit
     from pg_emigrant.replication import warn_if_unstable_host
 
-    cfg = load_config(config)
+    import json as _json
+
+    format = _resolve_format(format)
+    cfg = _load(config)
     warn_if_unstable_host(cfg)
+    results: list[dict] = []
 
     async def _reinit() -> int:
         dbs = [database] if database else await discover_databases(cfg)
@@ -568,6 +714,7 @@ def reinit_sync(
         for db in dbs:
             console.rule(f"[bold cyan]Reinit Sync — {db}")
             result = await do_reinit(cfg, db, allow_data_gap=allow_data_gap)
+            results.append(result)
 
             if result["issues_found"]:
                 all_healthy = False
@@ -615,8 +762,111 @@ def reinit_sync(
             console.rule("[bold green]Reinit complete — issues repaired with no data loss")
         return 0
 
-    if _run(_reinit()) != 0:
-        raise typer.Exit(code=1)
+    code = _run(_reinit())
+
+    if format == "json":
+        blocked = [r for r in results if r.get("blocked")]
+        lossy = [r for r in results if r.get("data_gap")]
+        print(_json.dumps({
+            "repaired": code == 0,
+            # 'blocked' is the one an automated caller must never treat as a
+            # transient failure to retry: the repair is impossible, not slow.
+            "blocked": [r["database"] for r in blocked],
+            "data_gap": [r["database"] for r in lossy],
+            "databases": results,
+        }, indent=2, default=str))
+
+    if code != 0:
+        # A refusal is not the same failure as a completed-but-lossy repair:
+        # the first means 'this cannot be fixed by streaming', the second
+        # means 'it was fixed and the target is now incomplete'.
+        if any(r.get("blocked") for r in results):
+            raise typer.Exit(code=exits.RECOVERY_IMPOSSIBLE)
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
+
+
+@app.command(name="cutover-check")
+def cutover_check(
+    config: str = typer.Option("config.yaml", "--config", "-c", help="Path to config file"),
+    database: Optional[str] = typer.Option(
+        None, "--database", "-d", help="Check only this database (default: all discovered)"
+    ),
+    max_lag_bytes: int = typer.Option(
+        None, "--max-lag-bytes",
+        help=(
+            "How far behind the target may be and still count as caught up "
+            "(default 8 MiB). Not zero: a live source keeps committing, so the "
+            "gap is never exactly nothing while the application is running."
+        ),
+    ),
+    accept_drift: bool = typer.Option(
+        False, "--accept-drift",
+        help=(
+            "Treat existing schema drift as a deliberate decision rather than a "
+            "blocker. Use only after reviewing 'detect-ddl' output."
+        ),
+    ),
+    format: str = typer.Option("rich", "--format", "-f", help="Output format: rich (default), simple, json"),
+):
+    """Answer one question, read-only: is it safe to cut over yet?
+
+    Checks that replication is healthy and caught up, that sequences are at or
+    ahead of the source, that there is no unresolved schema drift, that the
+    target is reachable and writable, and that source and target really are
+    different clusters. Anything that cannot be verified counts against
+    readiness — a green light on missing evidence is worse than a red one.
+
+    Changes nothing. It will not stop the application, disable the
+    subscription, or move any traffic: when to move traffic involves load
+    balancers, DNS, connection pools and people, none of which this tool can
+    see. Exit code 0 means SAFE TO CUT OVER, 5 means DO NOT CUT OVER.
+    """
+    import json as _json
+
+    from pg_emigrant.cutover import DEFAULT_MAX_LAG_BYTES, check_cutover_readiness
+
+    format = _resolve_format(format)
+    cfg = _load(config)
+    report = _run(check_cutover_readiness(
+        cfg, database=database,
+        max_lag_bytes=max_lag_bytes if max_lag_bytes is not None else DEFAULT_MAX_LAG_BYTES,
+        accept_drift=accept_drift,
+    ))
+
+    if format == "json":
+        print(_json.dumps(report.to_dict(), indent=2))
+    elif format == "simple":
+        for db in report.databases:
+            for c in db.checks:
+                print(
+                    f"db={db.database} check={c.name} "
+                    f"ready={'yes' if c.ready else 'no'} summary={c.summary!r}"
+                )
+        print(f"ready={'yes' if report.ready else 'no'} summary={report.summary!r}")
+    else:
+        console.rule("[bold]pg_emigrant cutover readiness")
+        for db in report.databases:
+            tbl = Table(title=f"Database: {db.database}", show_lines=False, expand=True)
+            tbl.add_column("", width=1, no_wrap=True)
+            tbl.add_column("Check", no_wrap=True)
+            tbl.add_column("Result")
+            for c in db.checks:
+                mark = "[green]✓[/green]" if c.ready else "[bold red]✗[/bold red]"
+                style = "" if c.ready else "red"
+                tbl.add_row(mark, c.name,
+                            f"[{style}]{c.summary}[/{style}]" if style else c.summary)
+            console.print(tbl)
+            for c in db.blockers:
+                if c.detail:
+                    console.print(f"  [red]✗ {c.name}[/red] — {c.detail}")
+        console.print()
+        if report.ready:
+            console.rule(f"[bold green]{report.summary}")
+        else:
+            console.rule(f"[bold red]{report.summary}")
+
+    if not report.ready:
+        raise typer.Exit(code=exits.REPLICATION_UNHEALTHY)
 
 
 @app.command()

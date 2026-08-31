@@ -7,6 +7,7 @@ differences.  Optionally generates and applies corrective DDL.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import asyncpg
 
@@ -70,8 +71,14 @@ async def _renormalize_viewdef(tgt, definition: str) -> str | None:
     except Exception:
         return None
     try:
+        # The pretty flag must match the one the definitions being compared
+        # were read with (_VIEWS_SQL uses pg_get_viewdef(oid, true)).  Pretty
+        # and non-pretty differ by more than whitespace — non-pretty
+        # parenthesises expressions that pretty leaves bare — so mixing them
+        # defeats the whole point of re-deparsing and reports every
+        # cross-major-version view as drift.
         return await tgt.fetchval(
-            "SELECT pg_get_viewdef('pg_temp._pgem_viewnorm'::regclass)"
+            "SELECT pg_get_viewdef('pg_temp._pgem_viewnorm'::regclass, true)"
         )
     finally:
         await tgt.execute("DROP VIEW IF EXISTS pg_temp._pgem_viewnorm")
@@ -159,8 +166,13 @@ async def detect_drift(
                 fix_ddl=f"CREATE SCHEMA IF NOT EXISTS {qi(schema)};",
             ))
 
-        src_tables = await get_tables(src, schemas)
-        tgt_tables = await get_tables(tgt, schemas)
+        # Excluded tables are outside this migration's definition of the
+        # target, so their absence is not drift — reporting it would make
+        # every run of detect-ddl show a permanent, unfixable difference for
+        # something that was left out on purpose (and 'detect-ddl --apply'
+        # would then dutifully create it).
+        src_tables = await get_tables(src, schemas, cfg.exclude_tables)
+        tgt_tables = await get_tables(tgt, schemas, cfg.exclude_tables)
 
         src_table_set = {(t["schema_name"], t["table_name"]) for t in src_tables}
         tgt_table_set = {(t["schema_name"], t["table_name"]) for t in tgt_tables}
@@ -402,8 +414,8 @@ async def detect_drift(
 
         # Triggers — compared on definition AND enable state (tgenabled),
         # which pg_get_triggerdef never includes.
-        src_trigs = await get_triggers(src, schemas)
-        tgt_trigs = await get_triggers(tgt, schemas)
+        src_trigs = await get_triggers(src, schemas, cfg.exclude_tables)
+        tgt_trigs = await get_triggers(tgt, schemas, cfg.exclude_tables)
         tgt_trig_map = {
             (t["schema_name"], t["table_name"], t["trigger_name"]): t
             for t in tgt_trigs
@@ -455,10 +467,10 @@ async def detect_drift(
                 ))
 
         # Row-level security: ENABLE/FORCE flags per table, then policies.
-        src_rls_tables = await get_row_security_tables(src, schemas)
+        src_rls_tables = await get_row_security_tables(src, schemas, cfg.exclude_tables)
         tgt_rls_map = {
             (r["schema_name"], r["table_name"]): r
-            for r in await get_row_security_tables(tgt, schemas)
+            for r in await get_row_security_tables(tgt, schemas, cfg.exclude_tables)
         }
         for t in src_rls_tables:
             if not (t["rowsecurity"] or t["force_rowsecurity"]):
@@ -484,8 +496,8 @@ async def detect_drift(
                     fix_ddl="\n".join(stmts),
                 ))
 
-        src_policies = await get_policies(src, schemas)
-        tgt_policies = await get_policies(tgt, schemas)
+        src_policies = await get_policies(src, schemas, cfg.exclude_tables)
+        tgt_policies = await get_policies(tgt, schemas, cfg.exclude_tables)
         tgt_policy_map = {
             (p["schema_name"], p["table_name"], p["policy_name"]): p for p in tgt_policies
         }
@@ -590,8 +602,12 @@ async def detect_drift(
                 ))
 
         # Ownership drift
-        src_owners_list = await get_object_owners(src, schemas, dbname=dbname)
-        tgt_owners_list = await get_object_owners(tgt, schemas, dbname=dbname)
+        src_owners_list = await get_object_owners(
+            src, schemas, dbname=dbname, exclude_tables=cfg.exclude_tables
+        )
+        tgt_owners_list = await get_object_owners(
+            tgt, schemas, dbname=dbname, exclude_tables=cfg.exclude_tables
+        )
         src_owners_map = {(r["schema_name"], r["object_name"], r["kind"]): r for r in src_owners_list}
         tgt_owners_map = {
             (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
@@ -635,8 +651,12 @@ async def detect_drift(
         # (an extra grant on target) is reported but only fixed by the
         # existing --apply --drop-extra flag, consistent with how every other
         # "extra on target" case already works.
-        src_privs = await get_privileges(src, schemas, dbname=dbname)
-        tgt_privs = await get_privileges(tgt, schemas, dbname=dbname)
+        src_privs = await get_privileges(
+            src, schemas, dbname=dbname, exclude_tables=cfg.exclude_tables
+        )
+        tgt_privs = await get_privileges(
+            tgt, schemas, dbname=dbname, exclude_tables=cfg.exclude_tables
+        )
 
         def _priv_key(r: dict) -> tuple:
             return (
@@ -717,8 +737,12 @@ async def detect_ownership_drift(
     items: list[DriftItem] = []
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
         schemas = await discover_schemas(src, cfg)
-        src_owners_list = await get_object_owners(src, schemas, dbname=dbname)
-        tgt_owners_list = await get_object_owners(tgt, schemas, dbname=dbname)
+        src_owners_list = await get_object_owners(
+            src, schemas, dbname=dbname, exclude_tables=cfg.exclude_tables
+        )
+        tgt_owners_list = await get_object_owners(
+            tgt, schemas, dbname=dbname, exclude_tables=cfg.exclude_tables
+        )
         src_owners = {(r["schema_name"], r["object_name"], r["kind"]): r for r in src_owners_list}
         tgt_owners = {
             (r["schema_name"], r["object_name"], r["kind"]): r["owner"]
@@ -759,13 +783,38 @@ async def detect_ownership_drift(
     return items
 
 
+@dataclass
+class DriftFixResult:
+    """Outcome of applying drift fixes.
+
+    Carries the failures as well as the count, because a repair pass that
+    could not apply half its DDL and reported only "applied 4 fixes" leaves the
+    operator believing the target is now correct.  ``detect-ddl --apply`` exits
+    non-zero when this is not clean.
+    """
+
+    applied: int = 0
+    failures: list[str] = field(default_factory=list)
+
+    @property
+    def clean(self) -> bool:
+        return not self.failures
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "failed": len(self.failures),
+            "failures": self.failures,
+        }
+
+
 async def apply_drift_fixes(
     cfg: ReplicatorConfig,
     dbname: str,
     report: DriftReport,
     drop_extra: bool = False,
-) -> int:
-    """Apply corrective DDL for fixable drift items.  Returns count of applied fixes.
+) -> DriftFixResult:
+    """Apply corrective DDL for fixable drift items.
 
     For newly created tables (missing_on_target) the subscription is refreshed
     with ``copy_data = true`` so that PostgreSQL's built-in tablesync mechanism
@@ -778,7 +827,7 @@ async def apply_drift_fixes(
     """
     from pg_emigrant.replication import refresh_subscription
 
-    applied = 0
+    outcome = DriftFixResult()
     new_tables: list[tuple[str, str]] = []  # (schema, table) of tables we just created
 
     # Apply foreign-key constraints last, after every table (including
@@ -801,7 +850,7 @@ async def apply_drift_fixes(
                 try:
                     await tgt.execute(item.fix_ddl)
                     log.info("Applied fix for %s %s.%s", item.object_type, item.schema, item.name)
-                    applied += 1
+                    outcome.applied += 1
                     if item.object_type == "table":
                         new_tables.append((item.schema, item.table))
                 except Exception as exc:
@@ -809,25 +858,34 @@ async def apply_drift_fixes(
                         "Failed to apply DDL for %s %s.%s — %s",
                         item.object_type, item.schema, item.name, exc,
                     )
+                    outcome.failures.append(
+                        f"{item.object_type} {item.schema}.{item.name}: {exc}"
+                    )
             elif item.drift_type == "missing_on_source" and drop_extra:
                 try:
                     await tgt.execute(item.fix_ddl)
                     log.info("Dropped extra %s %s.%s from target", item.object_type, item.schema, item.name)
-                    applied += 1
+                    outcome.applied += 1
                 except Exception as exc:
                     log.error(
                         "Failed to drop %s %s.%s — %s",
                         item.object_type, item.schema, item.name, exc,
                     )
+                    outcome.failures.append(
+                        f"drop {item.object_type} {item.schema}.{item.name}: {exc}"
+                    )
             elif item.drift_type == "different":
                 try:
                     await tgt.execute(item.fix_ddl)
                     log.info("Applied fix for %s %s.%s", item.object_type, item.schema, item.name)
-                    applied += 1
+                    outcome.applied += 1
                 except Exception as exc:
                     log.error(
                         "Failed to apply DDL for %s %s.%s — %s",
                         item.object_type, item.schema, item.name, exc,
+                    )
+                    outcome.failures.append(
+                        f"{item.object_type} {item.schema}.{item.name}: {exc}"
                     )
 
     # Refresh the subscription with copy_data=true so PostgreSQL's tablesync
@@ -843,6 +901,10 @@ async def apply_drift_fixes(
                 ", ".join(f"{s}.{t}" for s, t in new_tables),
             )
         except Exception as exc:
-            log.warning("Could not refresh subscription for %s — %s", dbname, exc)
+            # A table created but never scheduled for tablesync stays empty on
+            # the target while looking present, so this is a failure, not a
+            # warning.
+            log.error("Could not refresh subscription for %s — %s", dbname, exc)
+            outcome.failures.append(f"subscription refresh for new tables: {exc}")
 
-    return applied
+    return outcome

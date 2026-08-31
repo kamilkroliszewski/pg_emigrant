@@ -25,3 +25,9 @@ config.yaml
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code local state / worktrees
+.claude/
+
+# Test/dev virtualenv
+.venv/

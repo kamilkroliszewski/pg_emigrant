@@ -50,7 +50,7 @@
       <table class="kv-table">
         <tr><th>Publication</th><td><code>{{ config_data.publication_name }}</code></td></tr>
         <tr><th>Subscription</th><td><code>{{ config_data.subscription_name }}</code></td></tr>
-        <tr><th>Slot name</th><td><code>{{ config_data.replication_slot_name }}</code> <span class="muted small">(inactive)</span></td></tr>
+        <tr><th>Slot name</th><td><code>{{ config_data.slot_name_pattern }}</code> <span class="muted small">(derived from the subscription name)</span></td></tr>
         <tr><th>parallel_workers</th><td>{{ config_data.parallel_workers }}</td></tr>
         <tr><th>table_parallel_workers</th><td>{{ config_data.table_parallel_workers }}</td></tr>
         <tr><th>sequence_sync_interval</th><td>{{ config_data.sequence_sync_interval }} s</td></tr>

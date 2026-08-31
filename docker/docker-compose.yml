@@ -1,0 +1,87 @@
+# Long-lived PostgreSQL clusters for manual testing and exploration.
+#
+# The automated integration suite does NOT use this file — it starts and tears
+# down its own containers per session (see tests/helpers/pg.py), so a test run
+# needs no prior setup and leaves nothing behind. This compose file is for the
+# other case: bringing up a stable set of servers to point a real config.yaml
+# at while working on the tool by hand.
+#
+#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml down -v
+#
+# The password comes from the environment so that nothing here is a credential:
+#
+#   export PG_EMIGRANT_TEST_PG_PASSWORD=$(openssl rand -hex 16)
+#
+# Every server is configured for logical replication (wal_level=logical) so any
+# of them can act as the source. Ports are the PostgreSQL default plus the major
+# version, so 15432 is PG14, 15433 is PG15, and so on.
+
+x-common: &common
+  environment:
+    POSTGRES_PASSWORD: ${PG_EMIGRANT_TEST_PG_PASSWORD:?set PG_EMIGRANT_TEST_PG_PASSWORD before starting}
+    POSTGRES_USER: ${PG_EMIGRANT_TEST_PG_USER:-postgres}
+    POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_replication_slots=20
+    - -c
+    - max_wal_senders=20
+    - -c
+    - max_worker_processes=20
+    - -c
+    - max_logical_replication_workers=16
+    # The subscriber-side feedback interval. The default 10s makes the source
+    # slot's confirmed_flush_lsn — the only signal that means "the target has
+    # applied this" — lag by up to ten seconds, which makes lag readings during
+    # hand testing far more confusing than they need to be.
+    - -c
+    - wal_receiver_status_interval=1s
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ${PG_EMIGRANT_TEST_PG_USER:-postgres}"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+  labels:
+    pg_emigrant_test: "1"
+
+services:
+  pg14:
+    <<: *common
+    image: postgres:14-alpine
+    ports: ["127.0.0.1:15432:5432"]
+    volumes: ["pg14:/var/lib/postgresql/data"]
+
+  pg15:
+    <<: *common
+    image: postgres:15-alpine
+    ports: ["127.0.0.1:15433:5432"]
+    volumes: ["pg15:/var/lib/postgresql/data"]
+
+  pg16:
+    <<: *common
+    image: postgres:16-alpine
+    ports: ["127.0.0.1:15434:5432"]
+    volumes: ["pg16:/var/lib/postgresql/data"]
+
+  pg17:
+    <<: *common
+    image: postgres:17-alpine
+    ports: ["127.0.0.1:15435:5432"]
+    volumes: ["pg17:/var/lib/postgresql/data"]
+
+  pg18:
+    <<: *common
+    image: postgres:18-alpine
+    ports: ["127.0.0.1:15436:5432"]
+    volumes: ["pg18:/var/lib/postgresql"]
+
+volumes:
+  pg14:
+  pg15:
+  pg16:
+  pg17:
+  pg18:

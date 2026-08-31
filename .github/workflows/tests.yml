@@ -1,0 +1,71 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    # Pure logic, no database. Fast enough to gate everything else on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[web,test]"
+      - run: pytest tests/unit -q
+
+  integration:
+    # The PostgreSQL version matrix. Each pair is a separate job so that a
+    # failure names the version combination that broke, and so the matrix
+    # finishes in the time of its slowest pair rather than their sum.
+    needs: unit
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pair:
+          - "14->18"
+          - "15->18"
+          - "16->18"
+          - "17->18"
+          - "17->17"
+          - "18->18"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[web,test]"
+
+      - name: Pull the PostgreSQL images
+        run: |
+          for v in $(echo "${{ matrix.pair }}" | tr '>-' '  '); do
+            docker pull "postgres:${v}-alpine"
+          done
+
+      - name: Run the integration suite
+        env:
+          # Generated per run: nothing in this repository is a credential, and
+          # the containers live for the length of one job.
+          PG_EMIGRANT_TEST_PG_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-pgem
+        run: pytest tests/integration -q --pg-matrix "${{ matrix.pair }}"
+
+      - name: Leave no containers behind
+        if: always()
+        run: docker rm -f $(docker ps -aq --filter label=pg_emigrant_test=1) || true
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      # Errors and undefined names only. This is a correctness gate, not a
+      # style one — a formatting opinion failing CI on an unrelated change
+      # teaches people to ignore the whole job.
+      - run: ruff check pg_emigrant tests --select F,E9

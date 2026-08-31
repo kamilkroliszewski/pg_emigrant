@@ -28,9 +28,10 @@ from typing import Any
 import asyncpg
 
 from pg_emigrant.config import ReplicatorConfig
-from pg_emigrant.db import _SYSTEM_SCHEMAS, connect, discover_databases, discover_schemas
-from pg_emigrant.replication import _UNSTABLE_HOSTS, pub_name, sub_name
+from pg_emigrant.db import connect, discover_databases, discover_schemas
+from pg_emigrant.replication import _UNSTABLE_HOSTS, sub_name
 from pg_emigrant.schema_sync import get_columns, get_tables
+from pg_emigrant.scope import check_exclusions_are_safe, is_excluded, resolve_excluded
 from pg_emigrant.tde import (
     TDE_ACCESS_METHOD,
     TDE_EXTENSION,
@@ -651,27 +652,59 @@ async def _check_naming_collisions(
     Slots and subscriptions live in *cluster-wide* catalogs, so one query each
     covers every database.
     """
-    slot_rows = await src.fetch("SELECT slot_name FROM pg_replication_slots")
-    existing_slots = {r["slot_name"] for r in slot_rows}
+    slot_rows = await src.fetch(
+        "SELECT slot_name, active, database FROM pg_replication_slots"
+    )
+    existing_slots = {r["slot_name"]: r for r in slot_rows}
     sub_rows = await tgt.fetch("SELECT subname FROM pg_subscription")
     existing_subs = {r["subname"] for r in sub_rows}
 
     for db in databases:
         slot = sub_name(cfg, db)
         collisions = []
-        if slot in existing_slots:
-            collisions.append(f"replication slot '{slot}' already exists on the source")
+        slot_row = existing_slots.get(slot)
+        if slot_row is not None:
+            collisions.append(
+                f"replication slot '{slot}' already exists on the source "
+                f"(database {slot_row['database']!r}, "
+                f"{'ACTIVE' if slot_row['active'] else 'inactive'})"
+            )
         if slot in existing_subs:
             collisions.append(f"subscription '{slot}' already exists on the target")
 
         if collisions:
+            # Two quite different situations produce the same collision, and
+            # the remedy differs, so the message distinguishes them.  Slot
+            # names come from the configuration and slots are cluster-wide, so
+            # a second migration configured with the same names — pointing at
+            # a *different* target — collides here without either side having
+            # been misconfigured in any obvious way.
+            rival = (
+                slot_row is not None
+                and slot_row["active"]
+                and slot not in existing_subs
+            )
+            if rival:
+                advice = (
+                    "The slot is ACTIVE but this target has no matching "
+                    "subscription, so something else is streaming from it — "
+                    "most likely another pg_emigrant migration from this same "
+                    "source, configured with the same 'subscription_name'. "
+                    "Bootstrap will refuse rather than take it over (doing so "
+                    "would silently break that migration). Give this migration "
+                    "a distinct 'subscription_name'."
+                )
+            else:
+                advice = (
+                    f"This database looks already bootstrapped — bootstrap "
+                    f"refuses to re-run over a live subscription. Use "
+                    f"'pg_emigrant status --database {db}' to inspect it, or "
+                    f"'pg_emigrant teardown --database {db}' to start over."
+                )
             report.add(
                 "naming_collision", "naming", ERROR,
                 f"name already in use for '{db}'",
-                "; ".join(collisions) + ". This database looks already bootstrapped "
-                "— bootstrap refuses to re-run over a live subscription. Use "
-                f"'pg_emigrant status --database {db}' to inspect it, or "
-                f"'pg_emigrant teardown --database {db}' to start over.",
+                "; ".join(collisions) + ". " + advice,
                 database=db,
             )
         else:
@@ -762,6 +795,33 @@ async def _check_db_local(
                 add("publication_creatable", "privileges", OK,
                     f"can CREATE PUBLICATION in '{dbname}'")
 
+            # -- exclude_tables: what it actually leaves behind -----------------
+            if cfg.exclude_tables:
+                excluded = await resolve_excluded(src, schemas, cfg.exclude_tables)
+                unsafe = await check_exclusions_are_safe(src, schemas, cfg.exclude_tables)
+                if unsafe:
+                    add("exclude_tables", "schema", ERROR,
+                        f"{len(unsafe)} foreign key(s) point at an excluded table",
+                        "; ".join(unsafe)
+                        + ". A migrated table cannot reference a table that is "
+                          "never copied — the constraint could not be satisfied on "
+                          "the target. Either drop those tables from "
+                          "'exclude_tables', or exclude the referencing tables too.")
+                elif excluded:
+                    add("exclude_tables", "schema", WARN,
+                        f"{len(excluded)} table(s) will NOT be migrated",
+                        ", ".join(f"{s}.{t}" for s, t in excluded)
+                        + ". Their data is never copied and their changes are never "
+                          "replicated, so the target is knowingly not a faithful "
+                          "copy of the source. Confirm this is intended before "
+                          "cutover.")
+                else:
+                    add("exclude_tables", "schema", WARN,
+                        "'exclude_tables' matches no table in this database",
+                        f"Configured patterns: {', '.join(cfg.exclude_tables)}. "
+                        f"Nothing here matches them, so nothing is being excluded "
+                        f"— check for a typo if you expected otherwise.")
+
             # -- extensions -----------------------------------------------------
             ext_rows = await src.fetch(
                 "SELECT e.extname, e.extversion, n.nspname AS schema"
@@ -839,6 +899,10 @@ async def _check_db_local(
                 """,
                 schemas,
             )
+            unreadable = [
+                r for r in unreadable
+                if not is_excluded(r["nspname"], r["relname"], cfg.exclude_tables)
+            ]
             if unreadable:
                 names = ", ".join(f"{r['nspname']}.{r['relname']}" for r in unreadable[:10])
                 more = f" (+{len(unreadable) - 10} more)" if len(unreadable) > 10 else ""
@@ -861,6 +925,10 @@ async def _check_db_local(
                 """,
                 schemas,
             )
+            unlogged = [
+                r for r in unlogged
+                if not is_excluded(r["nspname"], r["relname"], cfg.exclude_tables)
+            ]
             if unlogged:
                 names = ", ".join(f"{r['nspname']}.{r['relname']}" for r in unlogged[:10])
                 more = f" (+{len(unlogged) - 10} more)" if len(unlogged) > 10 else ""
@@ -888,6 +956,10 @@ async def _check_db_local(
                 """,
                 schemas,
             )
+            no_identity = [
+                r for r in no_identity
+                if not is_excluded(r["nspname"], r["relname"], cfg.exclude_tables)
+            ]
             if no_identity:
                 names = ", ".join(f"{r['nspname']}.{r['relname']}" for r in no_identity[:10])
                 more = f" (+{len(no_identity) - 10} more)" if len(no_identity) > 10 else ""
@@ -927,8 +999,14 @@ async def _compare_columns(cfg, dbname, src, schemas, add) -> None:
     """
     try:
         async with connect(cfg.target, dbname) as tgt:
-            src_tables = {(t["schema_name"], t["table_name"]) for t in await get_tables(src, schemas)}
-            tgt_tables = {(t["schema_name"], t["table_name"]) for t in await get_tables(tgt, schemas)}
+            src_tables = {
+                (t["schema_name"], t["table_name"])
+                for t in await get_tables(src, schemas, cfg.exclude_tables)
+            }
+            tgt_tables = {
+                (t["schema_name"], t["table_name"])
+                for t in await get_tables(tgt, schemas, cfg.exclude_tables)
+            }
             common = sorted(src_tables & tgt_tables)
             if not common:
                 add("column_compatibility", "schema", OK,

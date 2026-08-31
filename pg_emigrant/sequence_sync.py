@@ -80,7 +80,7 @@ async def sync_sequences_once(
     """
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
         schemas = await discover_schemas(src, cfg)
-        sequences = await get_sequences(src, schemas)
+        sequences = await get_sequences(src, schemas, cfg.exclude_tables)
         if not sequences:
             return []
 
@@ -123,7 +123,26 @@ async def sync_sequences_once(
                 log.warning("Cannot read source sequence %s: not found in pg_sequences", fqn)
                 continue
             if tgt_row is None:
-                log.warning("Sequence %s not found on target, skipping", fqn)
+                # Not a skippable detail: a sequence that does not exist on the
+                # target cannot be advanced, so the first insert after cutover
+                # starts from 1 and collides with the copied rows.  Report it
+                # so the caller can treat the run as incomplete rather than
+                # discovering it as a duplicate-key outage.
+                log.error(
+                    "Sequence %s exists on the source but NOT on the target, so its "
+                    "value cannot be synchronized — inserts after cutover would "
+                    "restart from the sequence's start value and collide with "
+                    "copied rows. Re-run bootstrap (or 'detect-ddl --apply') to "
+                    "create it.",
+                    fqn,
+                )
+                report.append({
+                    "schema": schema,
+                    "sequence": name,
+                    "source_value": _effective_value(src_row)[0],
+                    "target_value": None,
+                    "status": "missing_on_target",
+                })
                 continue
             if _unreadable(src_row) or _unreadable(tgt_row):
                 side = "source" if _unreadable(src_row) else "target"
@@ -293,7 +312,7 @@ async def get_sequence_status(
     """
     async with src_tgt_conns(cfg, dbname, src, tgt) as (src, tgt):
         schemas = await discover_schemas(src, cfg)
-        sequences = await get_sequences(src, schemas)
+        sequences = await get_sequences(src, schemas, cfg.exclude_tables)
         if not sequences:
             return []
 

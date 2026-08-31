@@ -17,7 +17,8 @@ import psycopg2.extras
 
 from pg_emigrant.config import DatabaseConfig, ReplicatorConfig
 from pg_emigrant.db import connect, discover_schemas
-from pg_emigrant.utils import get_logger, qi, ql
+from pg_emigrant.scope import filter_pairs
+from pg_emigrant.utils import get_logger, qi, ql, redact_conninfo
 
 log = get_logger(__name__)
 
@@ -225,20 +226,75 @@ async def _verify_apply_worker_streaming(
     return False, detail
 
 
-async def _drop_slot_if_present(conn: asyncpg.Connection, slot_name: str) -> bool:
-    """Terminate the holding backend (if any) and drop *slot_name* if it exists.
+class SlotInUse(Exception):
+    """A replication slot of this name exists and something is streaming from it."""
 
-    Shared by every place that needs to clean up a stale/orphaned replication
-    slot before creating a fresh one (a previous bootstrap or subscription
-    attempt may have been interrupted before teardown).  Returns True if a
-    slot was found.
+
+async def _drop_slot_if_present(
+    conn: asyncpg.Connection,
+    slot_name: str,
+    *,
+    force: bool = False,
+) -> bool:
+    """Drop *slot_name* if it exists.  Returns True if a slot was found.
+
+    Shared by every place that needs to clean up a stale slot before creating a
+    fresh one, because a previous bootstrap or subscription attempt may have
+    been interrupted before teardown.
+
+    ``force`` is the difference between cleaning up an orphan and stealing a
+    live slot, and defaults to refusing:
+
+    * An **inactive** slot has nothing streaming from it — the orphan an
+      interrupted run leaves behind — and is dropped.
+    * An **active** slot has a walsender attached, which means some subscription
+      somewhere is streaming from it right now.  Terminating that walsender and
+      dropping the slot destroys *that* migration: its apply worker can never
+      reconnect, and its target silently stops receiving changes while
+      continuing to look healthy.  Reproduced directly with two migrations from
+      one source to two different targets under the same configured names — the
+      second run took the first one's slot and reported success.  Refused
+      unless the caller is an operation the user explicitly asked for
+      (``teardown``, or ``reinit-sync --allow-data-gap``).
+    * A slot belonging to a **different database** is never this migration's,
+      whatever its state: a logical slot decodes only the database it was
+      created in.
+
+    Even with ``force``, the drop is only attempted after the holding backend
+    has actually gone: ``pg_terminate_backend`` is asynchronous and the slot
+    stays active for a moment after the signal.
     """
     slot_row = await conn.fetchrow(
-        "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = $1",
+        "SELECT active, active_pid, database FROM pg_replication_slots"
+        " WHERE slot_name = $1",
         slot_name,
     )
     if not slot_row:
         return False
+
+    current_db = await conn.fetchval("SELECT current_database()")
+    if slot_row["database"] is not None and slot_row["database"] != current_db:
+        raise SlotInUse(
+            f"replication slot {slot_name!r} already exists on this source but "
+            f"belongs to database {slot_row['database']!r}, not {current_db!r}. "
+            f"A logical slot only decodes the database it was created in, so "
+            f"this one is not this migration's to reuse — and dropping it would "
+            f"break whatever is using it. Give this migration a distinct "
+            f"'subscription_name' in its config."
+        )
+
+    if slot_row["active"] and not force:
+        raise SlotInUse(
+            f"replication slot {slot_name!r} already exists on the source and is "
+            f"ACTIVE (walsender pid {slot_row['active_pid']}) — something is "
+            f"streaming from it right now. Taking it over would terminate that "
+            f"walsender and drop the slot, leaving that subscription unable to "
+            f"reconnect and its target silently missing every subsequent change "
+            f"while still reporting itself healthy. Nothing was changed. Either "
+            f"that migration is still wanted (give this one a distinct "
+            f"'subscription_name'), or it is not — in which case tear it down "
+            f"explicitly with 'pg_emigrant teardown' first."
+        )
 
     if slot_row["active"] and slot_row["active_pid"]:
         await conn.execute("SELECT pg_terminate_backend($1);", slot_row["active_pid"])
@@ -345,11 +401,19 @@ async def create_replication_slot_with_snapshot(
         await _warn_replication_slot_blockers(probe)
 
     conninfo = _libpq_conninfo(cfg.source, dbname, replication=True)
-    conn = await asyncio.to_thread(
-        psycopg2.connect,
-        conninfo,
-        connection_factory=psycopg2.extras.LogicalReplicationConnection,
-    )
+    try:
+        conn = await asyncio.to_thread(
+            psycopg2.connect,
+            conninfo,
+            connection_factory=psycopg2.extras.LogicalReplicationConnection,
+        )
+    except Exception as exc:
+        # psycopg2 can quote the connection string it was given, password and
+        # all, back into the error text.
+        raise RuntimeError(
+            f"could not open a replication connection to the source for "
+            f"{dbname}: {redact_conninfo(str(exc))}"
+        ) from None
     try:
         cur = conn.cursor()
         # asyncio.shield: on timeout we still want to await the (now-cancelled)
@@ -395,14 +459,19 @@ async def create_replication_slot_with_snapshot(
     )
 
 
-async def drop_replication_slot(cfg: ReplicatorConfig, dbname: str, slot_name: str) -> None:
+async def drop_replication_slot(
+    cfg: ReplicatorConfig, dbname: str, slot_name: str, *, force: bool = True
+) -> None:
     """Drop a replication slot on the source by name, with no subscription involved.
 
     Used to clean up a slot created by :func:`create_replication_slot_with_snapshot`
-    when bootstrap aborts before a subscription is ever created for it.
+    when bootstrap aborts before a subscription is ever created for it — a slot
+    this run made moments ago and is entitled to remove, hence the ``force``
+    default.  Pass ``force=False`` where ownership cannot be proven, so that a
+    slot something else is streaming from is left alone.
     """
     async with connect(cfg.source, dbname) as conn:
-        await _drop_slot_if_present(conn, slot_name)
+        await _drop_slot_if_present(conn, slot_name, force=force)
 
 
 async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
@@ -495,7 +564,9 @@ async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
 
 
 async def _publishable_tables(
-    conn: asyncpg.Connection, schemas: list[str]
+    conn: asyncpg.Connection,
+    schemas: list[str],
+    exclude_tables: list[str] | None = None,
 ) -> set[tuple[str, str]]:
     """(schema, table) pairs in *schemas* eligible for direct publication
     membership: ordinary tables and partitioned parents.  Partition children
@@ -512,11 +583,12 @@ async def _publishable_tables(
         """,
         schemas,
     )
-    return {(r["nspname"], r["relname"]) for r in rows}
+    return filter_pairs(((r["nspname"], r["relname"]) for r in rows), exclude_tables)
 
 
 async def _create_publication_on(
-    conn, pub: str, schemas: list[str], dbname: str
+    conn, pub: str, schemas: list[str], dbname: str,
+    exclude_tables: list[str] | None = None,
 ) -> None:
     """CREATE PUBLICATION for all tables in *schemas*, source-version-aware.
 
@@ -526,23 +598,39 @@ async def _create_publication_on(
     tables (and, on <15, schemas) created after this point are picked up
     automatically by :func:`sync_new_tables`, which runs on every tick of
     ``sync-sequences --loop`` — no manual ``ALTER PUBLICATION`` needed.
+
+    ``exclude_tables`` forces the enumerated form on every version:
+    ``FOR TABLES IN SCHEMA`` is all-or-nothing and cannot leave one table out,
+    and publishing an excluded table would hand the subscriber changes for a
+    table that was deliberately never created on the target — its tablesync
+    worker would then fail and retry forever.
     """
     major = conn.get_server_version().major
-    if major >= 15:
+    excluded_here = await _excluded_in_schemas(conn, schemas, exclude_tables)
+    if excluded_here:
+        log.info(
+            "Publication %s in %s enumerates tables explicitly because "
+            "exclude_tables leaves out %d table(s) here (%s) — FOR TABLES IN "
+            "SCHEMA cannot exclude individual tables. New tables are still "
+            "picked up automatically by the 'sync-sequences --loop' process.",
+            pub, dbname, len(excluded_here),
+            ", ".join(f"{s}.{t}" for s, t in excluded_here),
+        )
+    if major >= 15 and not excluded_here:
         schema_list = ", ".join(qi(s) for s in schemas)
         await conn.execute(
             f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
         )
         return
 
-    table_set = await _publishable_tables(conn, schemas)
+    table_set = await _publishable_tables(conn, schemas, exclude_tables)
     if table_set:
         table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in sorted(table_set))
         await conn.execute(f"CREATE PUBLICATION {qi(pub)} FOR TABLE {table_list};")
     else:
         await conn.execute(f"CREATE PUBLICATION {qi(pub)};")
     log.info(
-        "Source database %s is PostgreSQL %d (< 15): publication %s enumerates "
+        "Source database %s is PostgreSQL %d: publication %s enumerates "
         "the %d current top-level tables (FOR TABLES IN SCHEMA is unavailable "
         "before PG15). Tables and schemas created later are picked up "
         "automatically by the 'sync-sequences --loop' process — no manual "
@@ -551,15 +639,29 @@ async def _create_publication_on(
     )
 
 
+async def _excluded_in_schemas(
+    conn: asyncpg.Connection, schemas: list[str], exclude_tables: list[str] | None
+) -> list[tuple[str, str]]:
+    from pg_emigrant.scope import resolve_excluded
+
+    return await resolve_excluded(conn, schemas, exclude_tables)
+
+
 async def create_publication(
     cfg: ReplicatorConfig,
     dbname: str,
     schemas: list[str] | None = None,
-) -> None:
+) -> bool:
     """Create a publication for all tables in *schemas*.
 
     *schemas* defaults to ``cfg.schemas`` when not provided.  Pass an explicit
     list when schemas were auto-discovered per-database during bootstrap.
+
+    Returns True only when THIS call created the publication.  The caller uses
+    that to decide what it may roll back on failure: a publication that was
+    already there belongs to something else — another migration configured with
+    the same names, most plausibly — and dropping it on the way out of a failed
+    run would stop that migration's subscription dead.
     """
     pub = pub_name(cfg, dbname)
     resolved_schemas = schemas if schemas is not None else cfg.schemas
@@ -569,10 +671,13 @@ async def create_publication(
         )
         if exists:
             log.info("Publication %s already exists in %s", pub, dbname)
-            return
+            return False
 
-        await _create_publication_on(conn, pub, resolved_schemas, dbname)
+        await _create_publication_on(
+            conn, pub, resolved_schemas, dbname, cfg.exclude_tables
+        )
         log.info("Created publication %s in %s for schemas %s", pub, dbname, resolved_schemas)
+        return True
 
 
 async def drop_publication(
@@ -665,8 +770,13 @@ async def create_subscription(
             # the WAL receiver cannot reach the source (e.g. pg_hba.conf replication
             # entry missing for the target host, max_wal_senders exhausted, or network
             # change).
+            #
+            # The statement embeds the source password (that is what CONNECTION
+            # is), and a server error can carry the failing statement back in
+            # its context — so anything raised from here is re-raised with the
+            # text redacted rather than allowed to reach a log or the GUI.
             await conn.execute(sql, timeout=60)
-        except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError) as exc:
+        except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError):
             log.error(
                 "CREATE SUBSCRIPTION %s timed out after 60 s — "
                 "check pg_hba.conf (replication entry for the target host) and "
@@ -677,14 +787,22 @@ async def create_subscription(
                 # PostgreSQL creates the replication slot on the source first,
                 # then opens the WAL receiver connection — if that second step
                 # hangs we must clean up the orphaned slot it already made.
+                # force=True: PostgreSQL created this slot moments ago as part
+                # of the statement that just timed out, so it is unambiguously
+                # this run's to remove.
                 async with connect(cfg.source, dbname) as src_conn:
-                    if await _drop_slot_if_present(src_conn, sub):
+                    if await _drop_slot_if_present(src_conn, sub, force=True):
                         log.info("Dropped orphaned slot %s after subscription timeout", sub)
             raise RuntimeError(
                 f"CREATE SUBSCRIPTION {sub} timed out — verify that the source "
                 f"pg_hba.conf has a 'replication' entry for the target host "
                 f"and that max_wal_senders is not exhausted"
-            ) from exc
+            ) from None
+        except Exception as exc:
+            raise RuntimeError(
+                f"CREATE SUBSCRIPTION {sub} failed in {dbname}: "
+                f"{redact_conninfo(str(exc))}"
+            ) from None
         log.info("Created subscription %s in %s", sub, dbname)
 
         # CREATE SUBSCRIPTION succeeding proves NOTHING about whether
@@ -733,7 +851,8 @@ async def create_subscription(
                 f"literal string to ITSELF, not to the source; (2) 'source' is a "
                 f"load-balanced endpoint that routed pg_emigrant's own "
                 f"connections and the apply worker's connection to different "
-                f"physical nodes. The stored connection string is: {subconninfo!r} "
+                f"physical nodes. The stored connection string is: "
+                f"{redact_conninfo(subconninfo)!r} "
                 f"— log into the TARGET machine itself and confirm THIS EXACT "
                 f"string, from there, reaches the real source (not the target "
                 f"itself, not a different node). 'source.host' must be a fixed "
@@ -776,9 +895,11 @@ async def drop_subscription(
         await conn.execute(f"DROP SUBSCRIPTION IF EXISTS {qi(sub)};")
         log.info("Dropped subscription %s in %s", sub, dbname)
 
-    # Clean up the replication slot on the source
+    # Clean up the replication slot on the source.  force=True because
+    # dropping this migration's replication objects is exactly what the caller
+    # asked for — the guard exists to stop an *implicit* takeover.
     async with connect(cfg.source, dbname) as conn:
-        await _drop_slot_if_present(conn, sub)
+        await _drop_slot_if_present(conn, sub, force=True)
 
 
 async def enable_subscription(
@@ -972,8 +1093,16 @@ async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
         )
         published_tables = {(r["schemaname"], r["tablename"]) for r in published_rows}
 
-        if major < 15:
-            current_tables = await _publishable_tables(src, schemas)
+        # Whether the publication auto-includes new tables depends on how it
+        # was created, not on the server version alone: exclude_tables forces
+        # the enumerated FOR TABLE form on 15+ too (see _create_publication_on).
+        pub_has_schemas = bool(await src.fetchval(
+            "SELECT 1 FROM pg_publication_namespace pn"
+            " JOIN pg_publication p ON p.oid = pn.pnpubid WHERE p.pubname = $1",
+            pub,
+        ))
+        if major < 15 or not pub_has_schemas:
+            current_tables = await _publishable_tables(src, schemas, cfg.exclude_tables)
             new_tables = sorted(current_tables - published_tables)
             if new_tables:
                 table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in new_tables)
@@ -984,7 +1113,7 @@ async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
                 )
                 log.info(
                     "sync_new_tables [%s]: added %d new table(s) to publication %s "
-                    "(PostgreSQL %d source has no FOR TABLES IN SCHEMA auto-inclusion): %s",
+                    "(this publication enumerates its tables; PostgreSQL %d source): %s",
                     dbname, len(new_tables), pub, major, new_tables,
                 )
                 published_tables |= set(new_tables)
@@ -1224,7 +1353,9 @@ async def reinit_sync(
             # in the disaster-recovery path.  Resolve the actual schema list
             # the same way bootstrap does.
             schemas = await discover_schemas(conn, cfg)
-            await _create_publication_on(conn, pub, schemas, dbname)
+            await _create_publication_on(
+                conn, pub, schemas, dbname, cfg.exclude_tables
+            )
         actions.append(f"Recreated publication '{pub}' on source")
         log.info("reinit_sync [%s]: recreated publication %s", dbname, pub)
     else:
@@ -1419,8 +1550,10 @@ async def reinit_sync(
             )
 
             # Drop the dead/lost slot that might still linger on source.
+            # force=True: --allow-data-gap is the caller having explicitly
+            # accepted the consequences of recreating replication from scratch.
             async with connect(cfg.source, dbname) as conn:
-                if await _drop_slot_if_present(conn, sub):
+                if await _drop_slot_if_present(conn, sub, force=True):
                     log.info("reinit_sync [%s]: dropped orphaned slot %s", dbname, sub)
 
             # Create a fresh subscription — PostgreSQL will also create the
