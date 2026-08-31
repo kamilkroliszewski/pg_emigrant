@@ -123,9 +123,11 @@ async def test_long_running_write_transaction_blocks_slot_creation_and_fails_clo
             " FROM generate_series(1, 20) AS i"
         )
 
-        with pytest.raises(RuntimeError) as excinfo:
+        from pg_emigrant.report import BootstrapIncomplete, Outcome
+
+        with pytest.raises(BootstrapIncomplete) as excinfo:
             await bootstrap(cfg, database=source_db)
-        assert "Bootstrap failed" in str(excinfo.value)
+        assert excinfo.value.report.outcome is Outcome.FAILED
 
         await tx.rollback()
 

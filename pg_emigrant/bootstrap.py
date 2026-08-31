@@ -27,9 +27,22 @@ stream (starts later) — a silent, permanent data loss window. Creating the
 slot first and copying data with ITS exported snapshot makes the copy and the
 start of replication the exact same consistent point.
 
-Object-sync failures (functions/views/triggers) are collected and summarized
-in red at the end of the run; databases with an incomplete data copy make the
-whole command fail with a non-zero exit code.
+Every database ends in exactly one terminal state, and the run reports the
+worst of them (see :mod:`pg_emigrant.report`):
+
+  * ``success``    — copied, replicating, nothing outstanding.
+  * ``incomplete`` — copied and replicating, but something the migration was
+    asked to reproduce is missing (a view that would not compile, a trigger,
+    a sequence that could not be read, residual drift).  The subscription is
+    deliberately LEFT RUNNING — tearing it down would force a needless full
+    re-copy — but the run exits non-zero and the target must not be cut over
+    to until the listed problems are resolved.
+  * ``failed``     — aborted before replication; the slot and publication this
+    run created on the source were rolled back.
+  * ``refused``    — refused up front because proceeding would be unsafe.
+
+None of these is ever downgraded to a warning on a zero exit: a bootstrap that
+did not fully reproduce the source is not a successful bootstrap.
 
 ``use_pg_tde`` (``--using-pg-tde``) adds three steps to the sequence above,
 and changes nothing when it is off:
@@ -54,9 +67,15 @@ from __future__ import annotations
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from pg_emigrant.config import ReplicatorConfig
-from pg_emigrant.data_copy import copy_all_tables, verify_copy_counts
+from pg_emigrant.data_copy import (
+    IncompatibleTargetColumns,
+    UnsafeTruncate,
+    copy_all_tables,
+    verify_copy_counts,
+)
 from pg_emigrant.db import connect, discover_databases, discover_schemas
 from pg_emigrant.ddl_detector import detect_drift
+from pg_emigrant.report import BootstrapIncomplete, BootstrapReport, DatabaseResult
 from pg_emigrant.replication import (
     create_publication,
     create_replication_slot_with_snapshot,
@@ -185,13 +204,18 @@ async def bootstrap(
     database: str | None = None,
     *,
     use_pg_tde: bool = False,
-) -> None:
+) -> BootstrapReport:
     """Run the full bootstrap migration.
 
     ``use_pg_tde`` migrates into pg_tde-encrypted storage on the target: every
     table is created ``USING tde_heap``, pre-existing target tables are
     converted, and a target that cannot encrypt aborts the database before
     anything is created on the source.  See the module docstring.
+
+    Returns the :class:`~pg_emigrant.report.BootstrapReport` on full success,
+    and raises :class:`~pg_emigrant.report.BootstrapIncomplete` (carrying the
+    same report) otherwise — so a caller that only checks for an exception
+    still cannot mistake a partial migration for a complete one.
     """
     console.rule("[bold green]pg_emigrant bootstrap")
     if use_pg_tde:
@@ -213,16 +237,7 @@ async def bootstrap(
         databases = await discover_databases(cfg)
     console.print(f"Databases to migrate: {databases}")
 
-    # Databases whose initial data copy failed — replication is NOT set up for
-    # them and the whole command exits with an error at the end.
-    failed_dbs: list[str] = []
-    # Per-database object-sync failures (functions/views/triggers) — summarized
-    # loudly at the end so they cannot drown in the scrollback.
-    object_warnings: dict[str, dict[str, list[str]]] = {}
-    # Per-database schema drift found by the built-in post-bootstrap check.
-    drift_warnings: dict[str, str] = {}
-    # Per-database relations left unencrypted despite --using-pg-tde.
-    tde_warnings: dict[str, list[str]] = {}
+    report = BootstrapReport()
 
     with Progress(
         SpinnerColumn(),
@@ -230,6 +245,7 @@ async def bootstrap(
         console=console,
     ) as progress:
         for dbname in databases:
+            result = report.add(dbname)
             task = progress.add_task(f"Migrating {dbname}…", total=None)
             # Tracks whether the publication/slot for this database have been
             # created yet, so the except-handler below knows what it needs to
@@ -394,6 +410,8 @@ async def bootstrap(
                         # not.  This does NOT drop the slot itself.
                         await slot.aclose()
                     total_rows = sum(c for c in results.values() if c >= 0)
+                    result.rows_copied = total_rows
+                    result.tables_copied = len(results)
                     console.print(
                         f"  [{dbname}] Copied {total_rows:,} rows across {len(results)} tables"
                     )
@@ -437,13 +455,17 @@ async def bootstrap(
                     obj_failures = await sync_post_copy_constraints(src, tgt, schemas)
                 obj_failures = {k: v for k, v in obj_failures.items() if v}
                 if obj_failures:
-                    object_warnings[dbname] = obj_failures
+                    # NOT a warning.  A missing foreign key, function, view,
+                    # trigger or RLS policy means the target is not the source,
+                    # and the failure shows up after cutover as an application
+                    # error rather than as anything a row count would catch.
                     console.print(
-                        f"  [bold red]⚠ [{dbname}] Some schema objects could NOT be created:[/bold red]"
+                        f"  [bold red]✗ [{dbname}] Some schema objects could NOT be created:[/bold red]"
                     )
                     for kind, entries in obj_failures.items():
                         for entry in entries:
                             console.print(f"    [red]✗ {kind} {entry}[/red]")
+                            result.incomplete(f"{kind} not created: {entry}")
 
                 # Step 4d: synchronize ownership (tables, sequences, views, functions, types, database)
                 progress.update(task, description=f"[{dbname}] Syncing ownership…")
@@ -492,6 +514,24 @@ async def bootstrap(
                 )
                 if n_seq:
                     console.print(f"  [{dbname}] Advanced {n_seq} sequence value(s)")
+                # A sequence left behind on the target hands out already-used
+                # values the moment the application starts writing there, so an
+                # unsynchronised one is a duplicate-key outage waiting for the
+                # cutover — never a warning.
+                seq_bad = [
+                    r for r in seq_report
+                    if r["status"] in ("permission_denied", "missing_on_target",
+                                       "orphaned_unknown", "orphaned_error")
+                ]
+                for r in seq_bad:
+                    console.print(
+                        f"  [bold red]✗ [{dbname}] sequence {r['schema']}.{r['sequence']}: "
+                        f"{r['status']}[/bold red]"
+                    )
+                    result.incomplete(
+                        f"sequence {r['schema']}.{r['sequence']} not synchronised "
+                        f"({r['status']}) — duplicate-key risk at cutover"
+                    )
 
                 # Step 5: create the subscription, attached to the slot created
                 # in step 3d — NOT creating a new one (create_slot=False).
@@ -507,10 +547,13 @@ async def bootstrap(
                 progress.update(task, description=f"[{dbname}] Verifying (detect-ddl)…")
                 drift_report = await detect_drift(cfg, dbname)
                 if drift_report.has_drift:
-                    drift_warnings[dbname] = drift_report.summary
                     console.print(
-                        f"  [bold yellow]⚠ [{dbname}] Post-bootstrap drift check: "
-                        f"{drift_report.summary}[/bold yellow]"
+                        f"  [bold red]✗ [{dbname}] Post-bootstrap drift check: "
+                        f"{drift_report.summary}[/bold red]"
+                    )
+                    result.incomplete(
+                        f"schema drift remains after bootstrap ({drift_report.summary}) "
+                        f"— run 'detect-ddl --database {dbname}' for the itemised report"
                     )
                 else:
                     console.print(f"  [{dbname}] Post-bootstrap drift check: clean")
@@ -523,10 +566,14 @@ async def bootstrap(
                     progress.update(task, description=f"[{dbname}] Verifying encryption…")
                     unencrypted = await verify_encrypted(cfg, dbname, schemas)
                     if unencrypted:
-                        tde_warnings[dbname] = unencrypted
                         console.print(
-                            f"  [bold yellow]⚠ [{dbname}] {len(unencrypted)} relation(s) "
-                            f"are NOT stored as {TDE_ACCESS_METHOD}[/bold yellow]"
+                            f"  [bold red]✗ [{dbname}] {len(unencrypted)} relation(s) "
+                            f"are NOT stored as {TDE_ACCESS_METHOD}[/bold red]"
+                        )
+                        result.incomplete(
+                            f"{len(unencrypted)} relation(s) are readable on disk "
+                            f"without the pg_tde key despite --using-pg-tde: "
+                            + ", ".join(unencrypted)
                         )
                     else:
                         console.print(
@@ -542,7 +589,12 @@ async def bootstrap(
                 # included) is the more useful thing to show.
                 reason = (
                     str(exc)
-                    if isinstance(exc, (_DatabaseBootstrapFailed, TdeNotAvailable))
+                    if isinstance(exc, (
+                        _DatabaseBootstrapFailed,
+                        TdeNotAvailable,
+                        IncompatibleTargetColumns,
+                        UnsafeTruncate,
+                    ))
                     else repr(exc)
                 )
                 console.print(
@@ -596,53 +648,50 @@ async def bootstrap(
                             log.warning(
                                 "Could not clean up publication for %s: %s", dbname, cleanup_exc,
                             )
-                failed_dbs.append(dbname)
+                result.fail(reason)
             finally:
                 progress.remove_task(task)
 
-    if object_warnings:
-        console.rule("[bold yellow]Object sync warnings")
-        for db, kinds in object_warnings.items():
-            for kind, entries in kinds.items():
-                for entry in entries:
-                    console.print(f"  [yellow]{db}: {kind} {entry}[/yellow]")
-        console.print(
-            "[yellow]These objects are missing or stale on the target. "
-            "Fix the causes (see warnings above) and re-run "
-            "'pg_emigrant detect-ddl --apply' before cutover.[/yellow]"
-        )
+    _print_summary(report)
+    if not report.passed:
+        raise BootstrapIncomplete(report)
+    return report
 
-    if drift_warnings:
-        console.rule("[bold yellow]Post-bootstrap drift check")
-        for db, summary in drift_warnings.items():
-            console.print(f"  [yellow]{db}: {summary}[/yellow]")
-        console.print(
-            "[yellow]Run 'pg_emigrant detect-ddl --database <db>' for the full "
-            "itemised report, and 'detect-ddl --apply' to fix it, before "
-            "cutover.[/yellow]"
-        )
 
-    if tde_warnings:
-        console.rule(f"[bold yellow]Relations not encrypted with {TDE_ACCESS_METHOD}")
-        for db, rels in tde_warnings.items():
-            for rel in rels:
-                console.print(f"  [yellow]{db}: {rel}[/yellow]")
-        console.print(
-            f"[yellow]These relations are readable on disk without the pg_tde key. "
-            f"Convert them with  ALTER TABLE <name> SET ACCESS METHOD {TDE_ACCESS_METHOD};  "
-            f"(a full rewrite, so schedule it) before cutover.[/yellow]"
-        )
+def _print_summary(report: BootstrapReport) -> None:
+    """Final, unmissable statement of what each database ended up as.
 
-    if failed_dbs:
-        console.rule("[bold red]Bootstrap FAILED")
-        raise RuntimeError(
-            "Bootstrap failed for database(s): "
-            + ", ".join(failed_dbs)
-            + " — initial data copy incomplete; replication was NOT configured "
-            "for them. Fix the cause and re-run bootstrap."
-        )
+    Printed after the per-database detail so that the last thing on screen is
+    the conclusion, not the scrollback of a long run.
+    """
+    from pg_emigrant.report import Outcome
 
-    if object_warnings or drift_warnings or tde_warnings:
-        console.rule("[bold yellow]Bootstrap complete — with warnings")
+    refused = report.by_outcome(Outcome.REFUSED)
+    failed = report.by_outcome(Outcome.FAILED)
+    incomplete = report.by_outcome(Outcome.INCOMPLETE)
+
+    for group, title, advice in (
+        (refused, "REFUSED — nothing was changed",
+         "Resolve the condition above and re-run bootstrap for these databases."),
+        (failed, "FAILED — replication was NOT configured",
+         "The replication objects this run created on the source were rolled "
+         "back. Fix the cause and re-run bootstrap for these databases."),
+        (incomplete, "INCOMPLETE — replicating, but NOT ready to cut over",
+         "The data copy and replication succeeded and are deliberately left "
+         "running, but the items above are missing on the target. Resolve them "
+         "(often 'pg_emigrant detect-ddl --apply') and confirm with "
+         "'pg_emigrant cutover-check' before cutting over."),
+    ):
+        if not group:
+            continue
+        console.rule(f"[bold red]{title}")
+        for db in group:
+            console.print(f"  [bold red]{db.database}[/bold red]")
+            for problem in db.problems:
+                console.print(f"    [red]• {problem}[/red]")
+        console.print(f"[red]{advice}[/red]")
+
+    if report.passed:
+        console.rule(f"[bold green]Bootstrap complete — {report.summary}")
     else:
-        console.rule("[bold green]Bootstrap complete")
+        console.rule(f"[bold red]Bootstrap did NOT complete — {report.summary}")

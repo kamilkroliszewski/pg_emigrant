@@ -88,11 +88,71 @@ def load_fixture(container: PgContainer, db: str, *, with_data: bool = True) -> 
 
 
 @pytest.fixture
-def source_db(source_pg, dbname) -> str:
-    """A source database with the full migration fixture loaded."""
+def source_db(source_pg, target_pg, dbname) -> str:
+    """A source database with the full migration fixture loaded.
+
+    Teardown is thorough on purpose.  A subscription left behind on the target
+    keeps an apply worker (and a walsender on the source) alive, retrying
+    forever against a database that no longer exists — and the clusters are
+    shared for the whole session, so a handful of those exhaust
+    max_logical_replication_workers and the *next* test fails for a reason
+    that has nothing to do with what it is testing.
+    """
     load_fixture(source_pg, dbname)
     yield dbname
+    drop_subscription_if_present(target_pg, dbname)
+    drop_database(target_pg, dbname)
+    drop_orphan_slots(source_pg, dbname)
     drop_database(source_pg, dbname)
+
+
+def drop_subscription_if_present(container: PgContainer, db: str) -> None:
+    """Detach and drop every pg_emigrant subscription in *db*.
+
+    ``slot_name = NONE`` first: DROP SUBSCRIPTION otherwise tries to drop the
+    slot on the source through the connection stored in the subscription, and
+    hangs if that source database is already gone.
+    """
+    try:
+        exists = container.psql(
+            f"SELECT 1 FROM pg_database WHERE datname = {_lit(db)}"
+        )
+    except subprocess.CalledProcessError:
+        return
+    if not exists:
+        return
+    try:
+        names = container.psql(
+            "SELECT subname FROM pg_subscription WHERE subdbid ="
+            " (SELECT oid FROM pg_database WHERE datname = current_database())",
+            dbname=db,
+        ).split()
+        for sub in names:
+            container.psql(
+                f'ALTER SUBSCRIPTION "{sub}" DISABLE;'
+                f'ALTER SUBSCRIPTION "{sub}" SET (slot_name = NONE);'
+                f'DROP SUBSCRIPTION "{sub}";',
+                dbname=db,
+            )
+    except subprocess.CalledProcessError:
+        pass
+
+
+def drop_orphan_slots(container: PgContainer, db: str) -> None:
+    """Drop any replication slot still attached to *db* on this cluster."""
+    try:
+        rows = container.psql(
+            "SELECT slot_name FROM pg_replication_slots WHERE database = "
+            + _lit(db)
+        ).split()
+        for slot in rows:
+            container.psql(
+                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots"
+                f" WHERE slot_name = {_lit(slot)} AND active_pid IS NOT NULL"
+            )
+            container.psql(f"SELECT pg_drop_replication_slot({_lit(slot)})")
+    except subprocess.CalledProcessError:
+        pass
 
 
 def _lit(s: str) -> str:
@@ -106,7 +166,7 @@ def drop_database(container: PgContainer, db: str) -> None:
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
             f"WHERE datname = {_lit(db)} AND pid <> pg_backend_pid()"
         )
-        container.psql(f'DROP DATABASE IF EXISTS "{db}"')
+        container.psql(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
     except subprocess.CalledProcessError:
         pass  # best-effort teardown; the container dies with the session anyway
 

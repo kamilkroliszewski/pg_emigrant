@@ -8,9 +8,13 @@ check sensitive to every column, including the ones a naive Python comparison
 tends to normalise away (numeric scale, timestamptz offsets, bytea escapes,
 jsonb key order, array boundaries, NULL vs empty string).
 
-Ordering is never left to the planner: checksums are order-independent
-aggregates (``sum`` over per-row hashes), so a parallel or differently-ordered
-scan on one side cannot produce a spurious mismatch.
+Two kinds of ordering are deliberately taken out of the picture.  *Row* order
+is irrelevant because the aggregate is a sum over per-row hashes, so a parallel
+or differently-ordered scan cannot produce a spurious mismatch.  *Column* order
+is irrelevant because the row is rebuilt from an explicit, name-sorted column
+list rather than the whole-row cast: a target table that was pre-created and
+then had its missing columns appended holds identical data in a different
+physical order, and ``row::text`` would call that a mismatch.
 """
 
 from __future__ import annotations
@@ -21,17 +25,39 @@ from pg_emigrant.utils import qi, qt
 
 # Order-independent whole-table checksum.
 #
-# Each row is rendered with the row-to-text cast (every column, in physical
-# order), hashed, folded to a 64-bit signed integer and summed.  Summation is
-# commutative, so scan order is irrelevant; ``count(*)`` is carried alongside
-# so that a table of all-identical rows still detects a cardinality
-# difference, which a pure sum of equal hashes would not.
+# Each row is rendered as an explicit ROW() of its columns in a canonical
+# (name-sorted) order, hashed, folded to a 64-bit signed integer and summed.
+# Summation is commutative, so scan order is irrelevant; ``count(*)`` is
+# carried alongside so that a table of all-identical rows still detects a
+# cardinality difference, which a pure sum of equal hashes would not.
 _CHECKSUM_SQL = """
 SELECT count(*)::bigint AS n_rows,
-       COALESCE(sum(('x' || substr(md5(t.*::text), 1, 15))::bit(60)::bigint), 0)::numeric
+       COALESCE(sum(('x' || substr(md5(ROW({cols})::text), 1, 15))::bit(60)::bigint), 0)::numeric
            AS checksum
 FROM ONLY {fqn} AS t
 """
+
+
+async def comparable_columns(
+    conn: asyncpg.Connection, schema: str, table: str
+) -> list[str]:
+    """Column names to compare, canonically ordered.
+
+    Generated columns are excluded: the target recomputes them from its own
+    copy of the expression, so they are a consequence of the data rather than
+    part of it.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT a.attname
+        FROM pg_attribute a
+        WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass
+          AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+        ORDER BY a.attname
+        """,
+        schema, table,
+    )
+    return [r["attname"] for r in rows]
 
 
 async def table_row_count(conn: asyncpg.Connection, schema: str, table: str) -> int:
@@ -39,10 +65,23 @@ async def table_row_count(conn: asyncpg.Connection, schema: str, table: str) -> 
 
 
 async def table_checksum(
-    conn: asyncpg.Connection, schema: str, table: str
+    conn: asyncpg.Connection,
+    schema: str,
+    table: str,
+    columns: list[str] | None = None,
 ) -> tuple[int, int]:
-    """Return ``(row_count, order-independent checksum)`` for one table."""
-    row = await conn.fetchrow(_CHECKSUM_SQL.format(fqn=qt(schema, table)))
+    """Return ``(row_count, order-independent checksum)`` for one table.
+
+    *columns* pins exactly which columns take part, in exactly which order —
+    pass the same list for both sides so the two checksums are computed over
+    the same thing even when the physical layouts differ.
+    """
+    if columns is None:
+        columns = await comparable_columns(conn, schema, table)
+    cols = ", ".join(f"t.{qi(c)}" for c in columns)
+    row = await conn.fetchrow(
+        _CHECKSUM_SQL.format(fqn=qt(schema, table), cols=cols)
+    )
     return int(row["n_rows"]), int(row["checksum"])
 
 
@@ -203,8 +242,18 @@ async def assert_tables_identical(
         if (schema, table) not in tgt_tables:
             problems.append(f"{key}: MISSING on target")
             continue
-        s_n, s_sum = await table_checksum(src, schema, table)
-        t_n, t_sum = await table_checksum(tgt, schema, table)
+        src_cols = await comparable_columns(src, schema, table)
+        tgt_cols = set(await comparable_columns(tgt, schema, table))
+        absent = [c for c in src_cols if c not in tgt_cols]
+        if absent:
+            problems.append(f"{key}: target is missing column(s) {', '.join(absent)}")
+            continue
+        # Compare over the SOURCE's columns, in the same canonical order on
+        # both sides.  A target-only column is not a divergence of the source
+        # data (a pre-provisioned target may legitimately carry one), while a
+        # source column the target lacks is, and is reported above.
+        s_n, s_sum = await table_checksum(src, schema, table, src_cols)
+        t_n, t_sum = await table_checksum(tgt, schema, table, src_cols)
         evidence[key] = (s_n, s_sum)
         if s_n != t_n or s_sum != t_sum:
             detail = f"{key}: source ({s_n} rows, checksum {s_sum}) != target ({t_n} rows, checksum {t_sum})"

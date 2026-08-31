@@ -8,6 +8,7 @@ from typing import Optional
 import typer
 from rich.table import Table
 
+from pg_emigrant import exits
 from pg_emigrant.config import load_config
 from pg_emigrant.utils import console, setup_logging
 
@@ -136,6 +137,10 @@ def bootstrap(
             "table with ALTER TABLE … SET ACCESS METHOD tde_heap."
         ),
     ),
+    format: str = typer.Option(
+        "rich", "--format", "-f",
+        help="Output format: rich (default) or json (machine-readable result on stdout)",
+    ),
 ):
     """Run full bootstrap migration: discover → schema sync → data copy → replication setup.
 
@@ -146,8 +151,11 @@ def bootstrap(
     live) that belong to you. The readiness check runs before anything is
     created on the source, so a target that cannot encrypt costs nothing.
     """
+    import json as _json
+
     from pg_emigrant.bootstrap import bootstrap as do_bootstrap
     from pg_emigrant.preflight import run_preflight
+    from pg_emigrant.report import BootstrapIncomplete
 
     cfg = load_config(config)
 
@@ -169,7 +177,7 @@ def bootstrap(
                 "\n[dim]Nothing was modified. Run 'pg_emigrant preflight' for the full "
                 "report, or re-run with --skip-preflight to override.[/dim]"
             )
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=exits.PREFLIGHT_FAILED)
         if report.warnings:
             console.print(
                 f"[yellow]⚠ Preflight passed with {len(report.warnings)} warning(s)[/yellow] "
@@ -177,10 +185,17 @@ def bootstrap(
             )
 
     try:
-        _run(do_bootstrap(cfg, database=database, use_pg_tde=using_pg_tde))
+        result = _run(do_bootstrap(cfg, database=database, use_pg_tde=using_pg_tde))
+    except BootstrapIncomplete as exc:
+        if format == "json":
+            print(_json.dumps(exc.report.to_dict(), indent=2))
+        raise typer.Exit(code=exc.report.exit_code)
     except RuntimeError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
+
+    if format == "json":
+        print(_json.dumps(result.to_dict(), indent=2))
 
 
 @app.command()

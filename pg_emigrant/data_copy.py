@@ -18,6 +18,37 @@ from pg_emigrant.utils import get_logger, qi, qt
 log = get_logger(__name__)
 
 
+class IncompatibleTargetColumns(Exception):
+    """A target table cannot faithfully hold the source table's rows.
+
+    Raised before any data moves, for two shapes of mismatch:
+
+    * a source column with no counterpart on the target — copying only the
+      columns the two sides have in common produces a target that passes every
+      row-count check while permanently missing a column's worth of data;
+    * a column whose type differs — CSV COPY happily loads a bigint into a
+      text column and an enum into text, so the copy "succeeds" and the target
+      quietly stops being the same data.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+    @classmethod
+    def aggregate(cls, problems: list[str]) -> "IncompatibleTargetColumns":
+        return cls(
+            f"{len(problems)} target column mismatch(es) would make the copy "
+            f"lose or silently alter data while reporting a clean migration: "
+            + "; ".join(problems)
+            + ". Align the target schema — or drop those target tables and let "
+              "bootstrap recreate them — and re-run."
+        )
+
+
+class UnsafeTruncate(Exception):
+    """Clearing the target tables would destroy data outside the migration."""
+
+
 async def copy_table_data_pipe(
     source_cfg,
     target_cfg,
@@ -64,6 +95,18 @@ async def copy_table_data_pipe(
             or 0
         )
         tgt_col_rows = await tgt.fetch(_col_query, schema, table)
+
+    tgt_cols = {r["column_name"] for r in tgt_col_rows}
+    # A source column with nowhere to land is silent data loss: every row
+    # copies, the row counts match, the run reports success, and one column's
+    # worth of data is simply gone.  Refuse instead.  (Generated columns are
+    # already excluded on both sides by _col_query — the target recomputes
+    # them, so they are not expected to be copied.)
+    dropped = sorted(src_cols - tgt_cols)
+    if dropped:
+        raise IncompatibleTargetColumns.aggregate(
+            [f"{schema}.{table}: target is missing column(s) {', '.join(dropped)}"]
+        )
 
     # Preserve target column order; skip columns absent from source.
     common_columns = [r["column_name"] for r in tgt_col_rows if r["column_name"] in src_cols]
@@ -195,6 +238,117 @@ async def copy_table_data_pipe(
     return row_count
 
 
+async def _assert_target_columns_compatible(cfg, dbname: str, tables: list[dict]) -> None:
+    """Verify each target table can faithfully hold its source rows.
+
+    Checked up front rather than per table so the operator sees the complete
+    list in one message, and — more importantly — so it is discovered *before*
+    the target tables are cleared.  Finding it half way through would leave an
+    emptied target behind for a problem that was knowable beforehand.
+    """
+    # format_type resolves to a fully schema-qualified name because every
+    # connection runs with an empty search_path (see db.connect), so 'app.email'
+    # on one side never compares equal to a bare 'email' on the other.
+    _q = """
+        SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS coltype
+        FROM pg_attribute a
+        WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass
+          AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+    """
+    problems: list[str] = []
+    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+        for t in tables:
+            schema, table = t["schema_name"], t["table_name"]
+            src_cols = {r["attname"]: r["coltype"] for r in await src.fetch(_q, schema, table)}
+            try:
+                tgt_cols = {r["attname"]: r["coltype"] for r in await tgt.fetch(_q, schema, table)}
+            except Exception as exc:
+                problems.append(f"{schema}.{table}: cannot inspect on target ({exc})")
+                continue
+            missing = sorted(set(src_cols) - set(tgt_cols))
+            if missing:
+                problems.append(
+                    f"{schema}.{table}: target is missing column(s) {', '.join(missing)}"
+                )
+            for col in sorted(set(src_cols) & set(tgt_cols)):
+                if src_cols[col] != tgt_cols[col]:
+                    problems.append(
+                        f"{schema}.{table}.{col}: source is {src_cols[col]}, "
+                        f"target is {tgt_cols[col]}"
+                    )
+    if problems:
+        raise IncompatibleTargetColumns.aggregate(problems)
+
+
+async def _outside_scope_referencing_rows(
+    conn, tables: list[dict]
+) -> list[tuple[str, int]]:
+    """Tables OUTSIDE the copy set that hold rows and reference a table inside it.
+
+    ``TRUNCATE ... CASCADE`` empties these too.  When they belong to the
+    migration they are in the set already and CASCADE changes nothing; when
+    they do not — an application co-located on the same target cluster, a
+    schema this run was told to exclude — CASCADE destroys live data that the
+    migration's own consistency checks never look at, so nothing would report
+    the loss.
+    """
+    in_scope = {(t["schema_name"], t["table_name"]) for t in tables}
+    edges = await conn.fetch(
+        """
+        SELECT rn.nspname AS ref_schema, rc.relname AS ref_table,   -- referencing
+               fn.nspname AS tgt_schema, fc.relname AS tgt_table    -- referenced
+        FROM pg_constraint con
+        JOIN pg_class rc ON rc.oid = con.conrelid
+        JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+        JOIN pg_class fc ON fc.oid = con.confrelid
+        JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+        WHERE con.contype = 'f'
+        """
+    )
+    outside = sorted({
+        (e["ref_schema"], e["ref_table"])
+        for e in edges
+        if (e["tgt_schema"], e["tgt_table"]) in in_scope
+        and (e["ref_schema"], e["ref_table"]) not in in_scope
+    })
+
+    populated: list[tuple[str, int]] = []
+    for schema, table in outside:
+        n = await conn.fetchval(f"SELECT count(*) FROM ONLY {qt(schema, table)}")
+        if n:
+            populated.append((f"{schema}.{table}", n))
+    return populated
+
+
+async def _clear_target_tables(conn, tables: list[dict], dbname: str) -> None:
+    """Empty every target table about to be loaded — and nothing else.
+
+    One statement for the whole set, so PostgreSQL resolves the foreign keys
+    *among* those tables itself instead of the caller having to order them (and
+    without the deadlocks that parallel per-table TRUNCATEs produce).
+
+    CASCADE is still needed for the set's own dependency closure, so the
+    dangerous case — a populated table outside the set referencing one inside
+    it — is checked first and refused.  Cascading into it would silently empty
+    data this migration does not own and never looks at again.
+    """
+    collateral = await _outside_scope_referencing_rows(conn, tables)
+    if collateral:
+        detail = ", ".join(f"{name} ({n:,} rows)" for name, n in collateral)
+        raise UnsafeTruncate(
+            f"refusing to clear the target tables in {dbname}: {len(collateral)} "
+            f"table(s) outside this migration's scope hold data and reference "
+            f"tables inside it, so emptying those tables would destroy them "
+            f"too: {detail}. Either bring those tables into scope (they are "
+            f"part of the same data set), or drop/empty them on the target "
+            f"first if they are obsolete."
+        )
+    table_list = ", ".join(
+        f"{qi(t['schema_name'])}.{qi(t['table_name'])}" for t in tables
+    )
+    await conn.execute(f"TRUNCATE {table_list} CASCADE;")
+
+
 async def copy_all_tables(
     cfg: ReplicatorConfig,
     dbname: str,
@@ -227,13 +381,11 @@ async def copy_all_tables(
         log.info("No tables to copy for database %s", dbname)
         return results
 
-    # Truncate all target tables in one shot with CASCADE to avoid
-    # deadlocks and FK-reference errors from parallel per-table TRUNCATEs.
+    # Both of these run BEFORE anything is cleared or copied, so a target that
+    # cannot faithfully hold the data is refused while it is still untouched.
+    await _assert_target_columns_compatible(cfg, dbname, tables)
     async with connect(cfg.target, dbname) as tgt_conn:
-        table_list = ", ".join(
-            f"{qi(t['schema_name'])}.{qi(t['table_name'])}" for t in tables
-        )
-        await tgt_conn.execute(f"TRUNCATE {table_list} CASCADE;")
+        await _clear_target_tables(tgt_conn, tables, dbname)
 
     sem = asyncio.Semaphore(workers)
 
