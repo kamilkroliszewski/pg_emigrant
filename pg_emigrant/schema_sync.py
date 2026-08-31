@@ -7,6 +7,7 @@ import asyncio
 import asyncpg
 
 from pg_emigrant._testhooks import maybe_fail
+from pg_emigrant.scope import filter_tables, is_excluded
 from pg_emigrant.utils import console, get_logger, qi, ql, qt
 
 log = get_logger(__name__)
@@ -164,6 +165,8 @@ _SEQUENCES_SQL = """
 SELECT
     n.nspname AS schema_name,
     c.relname AS sequence_name,
+    n2.nspname AS owner_schema,
+    t.relname  AS owner_table,
     pg_get_serial_sequence(quote_ident(n2.nspname) || '.' || quote_ident(t.relname), a.attname) AS owned_by,
     EXISTS (
         SELECT 1 FROM pg_depend di
@@ -173,7 +176,11 @@ SELECT
     ) AS is_identity
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
-LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype = 'a'
+-- 'a' is a serial-style OWNED BY link, 'i' an identity column's internal
+-- one.  Only matching 'a' would leave every identity sequence looking
+-- standalone, so a table excluded from the migration would keep its identity
+-- sequence in scope and be reported as missing on the target forever.
+LEFT JOIN pg_depend d ON d.objid = c.oid AND d.deptype IN ('a', 'i')
 LEFT JOIN pg_class t ON t.oid = d.refobjid
 LEFT JOIN pg_namespace n2 ON n2.oid = t.relnamespace
 LEFT JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
@@ -312,10 +319,19 @@ ORDER BY n.nspname, c.relname;
 # ---------------------------------------------------------------------------
 
 async def get_tables(
-    conn: asyncpg.Connection, schemas: list[str]
+    conn: asyncpg.Connection,
+    schemas: list[str],
+    exclude: list[str] | None = None,
 ) -> list[dict]:
-    """Return a list of tables in the given schemas."""
-    return [dict(r) for r in await conn.fetch(_TABLES_SQL, schemas)]
+    """Return a list of tables in the given schemas.
+
+    *exclude* is ``cfg.exclude_tables``; matching tables are dropped from the
+    result, which is what keeps every caller (schema creation, the copy,
+    constraint sync, drift detection) working from the same definition of
+    scope.  See :mod:`pg_emigrant.scope`.
+    """
+    rows = [dict(r) for r in await conn.fetch(_TABLES_SQL, schemas)]
+    return filter_tables(rows, exclude)
 
 
 async def get_columns(
@@ -350,10 +366,28 @@ async def get_not_null_constraints(
 
 
 async def get_sequences(
-    conn: asyncpg.Connection, schemas: list[str]
+    conn: asyncpg.Connection,
+    schemas: list[str],
+    exclude: list[str] | None = None,
 ) -> list[dict]:
-    """Return sequences in the given schemas."""
-    return [dict(r) for r in await conn.fetch(_SEQUENCES_SQL, schemas)]
+    """Return sequences in the given schemas.
+
+    A sequence owned by an excluded table is excluded with it: the table is
+    never created on the target, so the sequence is not either, and treating
+    it as missing would report an unfixable difference for something left out
+    on purpose.  A standalone sequence is never excluded by a table pattern —
+    it belongs to no table.
+    """
+    rows = [dict(r) for r in await conn.fetch(_SEQUENCES_SQL, schemas)]
+    if not exclude:
+        return rows
+    return [
+        r for r in rows
+        if not (
+            r.get("owner_table")
+            and is_excluded(r["owner_schema"], r["owner_table"], exclude)
+        )
+    ]
 
 
 async def get_functions(
@@ -364,10 +398,11 @@ async def get_functions(
 
 
 async def get_triggers(
-    conn: asyncpg.Connection, schemas: list[str]
+    conn: asyncpg.Connection, schemas: list[str], exclude: list[str] | None = None
 ) -> list[dict]:
     """Return triggers (excluding internal ones) in the given schemas."""
-    return [dict(r) for r in await conn.fetch(_TRIGGERS_SQL, schemas)]
+    rows = [dict(r) for r in await conn.fetch(_TRIGGERS_SQL, schemas)]
+    return filter_tables(rows, exclude)
 
 
 async def get_views(
@@ -876,6 +911,8 @@ async def sync_triggers(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
+    *,
+    exclude_tables: list[str] | None = None,
 ) -> list[str]:
     """Create or replace triggers on the target.
 
@@ -951,14 +988,20 @@ ORDER BY 1, 2, 3;
 _POLICY_CMD_KEYWORD = {"r": "SELECT", "a": "INSERT", "w": "UPDATE", "d": "DELETE", "*": "ALL"}
 
 
-async def get_row_security_tables(conn: asyncpg.Connection, schemas: list[str]) -> list[dict]:
+async def get_row_security_tables(
+    conn: asyncpg.Connection, schemas: list[str], exclude: list[str] | None = None
+) -> list[dict]:
     """Return RLS enable/force flags for every table in *schemas*."""
-    return [dict(r) for r in await conn.fetch(_ROW_SECURITY_TABLES_SQL, schemas)]
+    rows = [dict(r) for r in await conn.fetch(_ROW_SECURITY_TABLES_SQL, schemas)]
+    return filter_tables(rows, exclude)
 
 
-async def get_policies(conn: asyncpg.Connection, schemas: list[str]) -> list[dict]:
+async def get_policies(
+    conn: asyncpg.Connection, schemas: list[str], exclude: list[str] | None = None
+) -> list[dict]:
     """Return row-security policies for every table in *schemas*."""
-    return [dict(r) for r in await conn.fetch(_POLICIES_SQL, schemas)]
+    rows = [dict(r) for r in await conn.fetch(_POLICIES_SQL, schemas)]
+    return filter_tables(rows, exclude)
 
 
 def make_policy_ddl(row: dict) -> str:
@@ -982,6 +1025,8 @@ async def sync_row_security(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
+    *,
+    exclude_tables: list[str] | None = None,
 ) -> list[str]:
     """Reproduce row-level security on the target: ``ENABLE``/``FORCE ROW LEVEL
     SECURITY`` per table, and every policy (``CREATE POLICY``).
@@ -1000,7 +1045,7 @@ async def sync_row_security(
     """
     failures: list[str] = []
 
-    tables = await get_row_security_tables(source_conn, schemas)
+    tables = await get_row_security_tables(source_conn, schemas, exclude_tables)
     for t in tables:
         if not (t["rowsecurity"] or t["force_rowsecurity"]):
             continue
@@ -1016,7 +1061,7 @@ async def sync_row_security(
                 t["schema_name"], t["table_name"], exc,
             )
 
-    policies = await get_policies(source_conn, schemas)
+    policies = await get_policies(source_conn, schemas, exclude_tables)
     for row in policies:
         schema, table, name = row["schema_name"], row["table_name"], row["policy_name"]
         fqn = f"{qi(schema)}.{qi(table)}"
@@ -1865,7 +1910,9 @@ async def sync_replica_identity(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
-) -> None:
+    *,
+    exclude_tables: list[str] | None = None,
+) -> list[str]:
     """Set REPLICA IDENTITY FULL on tables that have no primary key.
 
     Logical replication requires a way to identify updated/deleted rows.
@@ -1892,6 +1939,14 @@ async def sync_replica_identity(
     table decoded from a slot created before this ALTER would carry no old-row
     identity and the subscriber would reject it.  Requires the target tables
     to already exist, so it must run after (pre-copy) ``sync_schemas``.
+
+    Returns a list of tables the ALTER could not be applied to.  A caller must
+    treat a non-empty result as fatal *before* creating the publication: once
+    a PK-less table with no usable replica identity is published, PostgreSQL
+    starts REJECTING every UPDATE and DELETE against it — on the production
+    source.  A failure here is therefore not a migration inconvenience but an
+    imminent outage of the system being migrated away from, and the only safe
+    moment to stop is before the publication exists.
     """
     no_pk_tables = await source_conn.fetch(
         """
@@ -1909,8 +1964,17 @@ async def sync_replica_identity(
         """,
         schemas,
     )
+    failures: list[str] = []
     for row in no_pk_tables:
-        fqn = f"{qi(row['schema_name'])}.{qi(row['table_name'])}"
+        schema, table = row["schema_name"], row["table_name"]
+        if is_excluded(schema, table, exclude_tables):
+            # Never touch the source on behalf of a table this migration was
+            # told to leave alone.  REPLICA IDENTITY FULL is a real change to
+            # a production table (an ACCESS EXCLUSIVE lock, and every later
+            # UPDATE/DELETE logging the full old row).
+            log.debug("Skipping replica identity for excluded table %s.%s", schema, table)
+            continue
+        fqn = f"{qi(schema)}.{qi(table)}"
         console.print(
             f"  [bold yellow]⚠ No PRIMARY KEY:[/bold yellow] {fqn} — setting REPLICA IDENTITY FULL"
         )
@@ -1922,10 +1986,14 @@ async def sync_replica_identity(
                     "Set REPLICA IDENTITY FULL on %s (%s)", fqn, label
                 )
             except Exception as exc:
-                log.warning(
-                    "Could not set REPLICA IDENTITY FULL on %s (%s): %s",
-                    fqn, label, exc,
+                log.error(
+                    "Could not set REPLICA IDENTITY FULL on %s (%s): %s. Publishing "
+                    "this table would make PostgreSQL reject every UPDATE and "
+                    "DELETE against it on the %s.",
+                    fqn, label, exc, label,
                 )
+                failures.append(f"{schema}.{table} ({label}): {exc}")
+    return failures
 
 
 async def sync_extensions(
@@ -2027,6 +2095,7 @@ async def sync_schemas(
     schemas: list[str],
     *,
     access_method: str | None = None,
+    exclude_tables: list[str] | None = None,
 ) -> None:
     """Pre-copy schema sync: extensions → types → sequences → tables (PK/UNIQUE/CHECK only).
 
@@ -2082,7 +2151,7 @@ async def sync_schemas(
     # a phantom that sequence value sync (matching by name) never updates,
     # causing duplicate-key errors after cutover.  Their values are synced by the
     # final sequence pass at the end of bootstrap, once the tables exist.
-    sequences = await get_sequences(source_conn, schemas)
+    sequences = await get_sequences(source_conn, schemas, exclude_tables)
     for seq in sequences:
         if seq.get("is_identity"):
             log.debug(
@@ -2127,7 +2196,7 @@ async def sync_schemas(
 
     # Create tables with PK + UNIQUE + CHECK constraints.
     # FK constraints are intentionally deferred to sync_post_copy_constraints.
-    tables = await get_tables(source_conn, schemas)
+    tables = await get_tables(source_conn, schemas, exclude_tables)
     maybe_fail("table_create")
     for t in tables:
         await _sync_table_structure(
@@ -2154,6 +2223,8 @@ async def sync_post_copy_constraints(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
+    *,
+    exclude_tables: list[str] | None = None,
 ) -> dict[str, list[str]]:
     """Post-copy phase: FK constraints, functions, views, and triggers.
 
@@ -2176,7 +2247,7 @@ async def sync_post_copy_constraints(
     (``function`` / ``view`` / ``trigger``), each a list of
     ``"identifier: error"`` strings.  Empty lists mean full success.
     """
-    tables = await get_tables(source_conn, schemas)
+    tables = await get_tables(source_conn, schemas, exclude_tables)
 
     # FK constraints — pg_get_constraintdef returns unqualified table names, so
     # set search_path to all migrated schemas before executing FK DDL.
@@ -2210,12 +2281,16 @@ async def sync_post_copy_constraints(
     # insert, and after every function pass so their functions already exist.
     # (Triggers with ENABLE ALWAYS fire even under session_replication_role=replica.)
     maybe_fail("trigger_create")
-    trigger_failures = await sync_triggers(source_conn, target_conn, schemas)
+    trigger_failures = await sync_triggers(
+        source_conn, target_conn, schemas, exclude_tables=exclude_tables
+    )
 
     # Row-level security LAST, after the copy for the same reason as triggers
     # (see sync_row_security's docstring: FORCE ROW LEVEL SECURITY enabled too
     # early could block a non-superuser migration role's own bulk COPY).
-    policy_failures = await sync_row_security(source_conn, target_conn, schemas)
+    policy_failures = await sync_row_security(
+        source_conn, target_conn, schemas, exclude_tables=exclude_tables
+    )
 
     log.info("Post-copy constraint sync complete for schemas: %s", schemas)
     return {
@@ -2433,11 +2508,26 @@ ORDER BY n.nspname, p.proname;
 """
 
 
+def _relation_is_excluded(rec: dict, exclude: list[str] | None) -> bool:
+    """Does this relation-shaped ACL/owner record belong to an excluded table?
+
+    Relations are matched by their own name; a sequence carries its owning
+    table separately (``owner_table``) and is judged by that, so a serial
+    column's sequence follows the table it belongs to.
+    """
+    if not exclude:
+        return False
+    if rec.get("owner_table"):
+        return is_excluded(rec["owner_schema"], rec["owner_table"], exclude)
+    return is_excluded(rec["schema_name"], rec["object_name"], exclude)
+
+
 async def get_object_owners(
     conn: asyncpg.Connection,
     schemas: list[str],
     *,
     dbname: str | None = None,
+    exclude_tables: list[str] | None = None,
 ) -> list[dict]:
     """Return owner metadata for all schema objects in *schemas*.
 
@@ -2445,7 +2535,12 @@ async def get_object_owners(
     user-defined types (enums, domains), and functions/procedures.
     When *dbname* is given the database-level owner is also included.
     """
-    rows: list[dict] = [dict(r) for r in await conn.fetch(_OBJECT_OWNERS_SQL, schemas)]
+    rows: list[dict] = [
+        r for r in (dict(x) for x in await conn.fetch(_OBJECT_OWNERS_SQL, schemas))
+        # An excluded table is never created on the target, so neither its
+        # ownership nor (below) its grants have anywhere to be applied.
+        if not _relation_is_excluded(r, exclude_tables)
+    ]
 
     schema_rows = [
         {"schema_name": r["schema_name"], "object_name": r["schema_name"],
@@ -2519,6 +2614,7 @@ async def sync_ownership(
     schemas: list[str],
     *,
     dbname: str | None = None,
+    exclude_tables: list[str] | None = None,
 ) -> int:
     """Synchronize ownership of all schema objects from source to target.
 
@@ -2531,8 +2627,12 @@ async def sync_ownership(
 
     Returns the number of ownership changes applied.
     """
-    src_list = await get_object_owners(source_conn, schemas, dbname=dbname)
-    tgt_list = await get_object_owners(target_conn, schemas, dbname=dbname)
+    src_list = await get_object_owners(
+        source_conn, schemas, dbname=dbname, exclude_tables=exclude_tables
+    )
+    tgt_list = await get_object_owners(
+        target_conn, schemas, dbname=dbname, exclude_tables=exclude_tables
+    )
 
     src_owners = {(r["schema_name"], r["object_name"], r["kind"]): r for r in src_list}
     tgt_owners = {(r["schema_name"], r["object_name"], r["kind"]): r["owner"] for r in tgt_list}
@@ -2726,6 +2826,7 @@ async def get_privileges(
     schemas: list[str],
     *,
     dbname: str | None = None,
+    exclude_tables: list[str] | None = None,
 ) -> list[dict]:
     """Return non-owner ACL entries for all schema objects in *schemas*.
 
@@ -2737,6 +2838,8 @@ async def get_privileges(
     rows: list[dict] = []
 
     for r in await conn.fetch(_TABLE_ACL_SQL, schemas):
+        if _relation_is_excluded(dict(r), exclude_tables):
+            continue
         rows.append({
             "acl_kind": "relation", "kind": r["kind"],
             "schema_name": r["schema_name"], "object_name": r["object_name"],
@@ -2879,6 +2982,7 @@ async def sync_privileges(
     schemas: list[str],
     *,
     dbname: str | None = None,
+    exclude_tables: list[str] | None = None,
 ) -> int:
     """Grant every non-owner privilege present on the source but missing on
     the target: tables/views/materialized views, sequences, schemas (e.g.
@@ -2898,8 +3002,12 @@ async def sync_privileges(
 
     Returns the number of statements applied.
     """
-    src_list = await get_privileges(source_conn, schemas, dbname=dbname)
-    tgt_list = await get_privileges(target_conn, schemas, dbname=dbname)
+    src_list = await get_privileges(
+        source_conn, schemas, dbname=dbname, exclude_tables=exclude_tables
+    )
+    tgt_list = await get_privileges(
+        target_conn, schemas, dbname=dbname, exclude_tables=exclude_tables
+    )
 
     def _key(r: dict) -> tuple:
         return (
@@ -3034,6 +3142,8 @@ async def sync_deferred_indexes(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
+    *,
+    exclude_tables: list[str] | None = None,
 ) -> None:
     """Create non-unique indexes for all tables in *schemas*.
 
@@ -3041,7 +3151,7 @@ async def sync_deferred_indexes(
     a single pass rather than updating it row-by-row during bulk insert.
     PK and UNIQUE indexes are already present from the schema-sync phase.
     """
-    tables = await get_tables(source_conn, schemas)
+    tables = await get_tables(source_conn, schemas, exclude_tables)
     for t in tables:
         # Indexes on a partitioned parent propagate to its partitions, so the
         # children must be skipped to avoid duplicate-index errors.

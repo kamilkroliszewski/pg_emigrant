@@ -17,6 +17,7 @@ import psycopg2.extras
 
 from pg_emigrant.config import DatabaseConfig, ReplicatorConfig
 from pg_emigrant.db import connect, discover_schemas
+from pg_emigrant.scope import filter_pairs
 from pg_emigrant.utils import get_logger, qi, ql
 
 log = get_logger(__name__)
@@ -495,7 +496,9 @@ async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
 
 
 async def _publishable_tables(
-    conn: asyncpg.Connection, schemas: list[str]
+    conn: asyncpg.Connection,
+    schemas: list[str],
+    exclude_tables: list[str] | None = None,
 ) -> set[tuple[str, str]]:
     """(schema, table) pairs in *schemas* eligible for direct publication
     membership: ordinary tables and partitioned parents.  Partition children
@@ -512,11 +515,12 @@ async def _publishable_tables(
         """,
         schemas,
     )
-    return {(r["nspname"], r["relname"]) for r in rows}
+    return filter_pairs(((r["nspname"], r["relname"]) for r in rows), exclude_tables)
 
 
 async def _create_publication_on(
-    conn, pub: str, schemas: list[str], dbname: str
+    conn, pub: str, schemas: list[str], dbname: str,
+    exclude_tables: list[str] | None = None,
 ) -> None:
     """CREATE PUBLICATION for all tables in *schemas*, source-version-aware.
 
@@ -526,29 +530,53 @@ async def _create_publication_on(
     tables (and, on <15, schemas) created after this point are picked up
     automatically by :func:`sync_new_tables`, which runs on every tick of
     ``sync-sequences --loop`` — no manual ``ALTER PUBLICATION`` needed.
+
+    ``exclude_tables`` forces the enumerated form on every version:
+    ``FOR TABLES IN SCHEMA`` is all-or-nothing and cannot leave one table out,
+    and publishing an excluded table would hand the subscriber changes for a
+    table that was deliberately never created on the target — its tablesync
+    worker would then fail and retry forever.
     """
     major = conn.get_server_version().major
-    if major >= 15:
+    excluded_here = await _excluded_in_schemas(conn, schemas, exclude_tables)
+    if excluded_here:
+        log.info(
+            "Publication %s in %s enumerates tables explicitly because "
+            "exclude_tables leaves out %d table(s) here (%s) — FOR TABLES IN "
+            "SCHEMA cannot exclude individual tables. New tables are still "
+            "picked up automatically by the 'sync-sequences --loop' process.",
+            pub, dbname, len(excluded_here),
+            ", ".join(f"{s}.{t}" for s, t in excluded_here),
+        )
+    if major >= 15 and not excluded_here:
         schema_list = ", ".join(qi(s) for s in schemas)
         await conn.execute(
             f"CREATE PUBLICATION {qi(pub)} FOR TABLES IN SCHEMA {schema_list};"
         )
         return
 
-    table_set = await _publishable_tables(conn, schemas)
+    table_set = await _publishable_tables(conn, schemas, exclude_tables)
     if table_set:
         table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in sorted(table_set))
         await conn.execute(f"CREATE PUBLICATION {qi(pub)} FOR TABLE {table_list};")
     else:
         await conn.execute(f"CREATE PUBLICATION {qi(pub)};")
     log.info(
-        "Source database %s is PostgreSQL %d (< 15): publication %s enumerates "
+        "Source database %s is PostgreSQL %d: publication %s enumerates "
         "the %d current top-level tables (FOR TABLES IN SCHEMA is unavailable "
         "before PG15). Tables and schemas created later are picked up "
         "automatically by the 'sync-sequences --loop' process — no manual "
         "action needed as long as that loop is running.",
         dbname, major, pub, len(table_set),
     )
+
+
+async def _excluded_in_schemas(
+    conn: asyncpg.Connection, schemas: list[str], exclude_tables: list[str] | None
+) -> list[tuple[str, str]]:
+    from pg_emigrant.scope import resolve_excluded
+
+    return await resolve_excluded(conn, schemas, exclude_tables)
 
 
 async def create_publication(
@@ -571,7 +599,9 @@ async def create_publication(
             log.info("Publication %s already exists in %s", pub, dbname)
             return
 
-        await _create_publication_on(conn, pub, resolved_schemas, dbname)
+        await _create_publication_on(
+            conn, pub, resolved_schemas, dbname, cfg.exclude_tables
+        )
         log.info("Created publication %s in %s for schemas %s", pub, dbname, resolved_schemas)
 
 
@@ -972,8 +1002,16 @@ async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
         )
         published_tables = {(r["schemaname"], r["tablename"]) for r in published_rows}
 
-        if major < 15:
-            current_tables = await _publishable_tables(src, schemas)
+        # Whether the publication auto-includes new tables depends on how it
+        # was created, not on the server version alone: exclude_tables forces
+        # the enumerated FOR TABLE form on 15+ too (see _create_publication_on).
+        pub_has_schemas = bool(await src.fetchval(
+            "SELECT 1 FROM pg_publication_namespace pn"
+            " JOIN pg_publication p ON p.oid = pn.pnpubid WHERE p.pubname = $1",
+            pub,
+        ))
+        if major < 15 or not pub_has_schemas:
+            current_tables = await _publishable_tables(src, schemas, cfg.exclude_tables)
             new_tables = sorted(current_tables - published_tables)
             if new_tables:
                 table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in new_tables)
@@ -984,7 +1022,7 @@ async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
                 )
                 log.info(
                     "sync_new_tables [%s]: added %d new table(s) to publication %s "
-                    "(PostgreSQL %d source has no FOR TABLES IN SCHEMA auto-inclusion): %s",
+                    "(this publication enumerates its tables; PostgreSQL %d source): %s",
                     dbname, len(new_tables), pub, major, new_tables,
                 )
                 published_tables |= set(new_tables)
@@ -1224,7 +1262,9 @@ async def reinit_sync(
             # in the disaster-recovery path.  Resolve the actual schema list
             # the same way bootstrap does.
             schemas = await discover_schemas(conn, cfg)
-            await _create_publication_on(conn, pub, schemas, dbname)
+            await _create_publication_on(
+                conn, pub, schemas, dbname, cfg.exclude_tables
+            )
         actions.append(f"Recreated publication '{pub}' on source")
         log.info("reinit_sync [%s]: recreated publication %s", dbname, pub)
     else:

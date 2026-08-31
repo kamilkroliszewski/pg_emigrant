@@ -29,8 +29,22 @@ exclude_databases:
   - postgres
 
 publication_name: pg_emigrant_pub
+# The replication slot on the source is named after the subscription, one per
+# database: <subscription_name>_<database>. There is no separate slot-name
+# setting — bootstrap creates the slot first (to copy from its exported
+# snapshot) and then attaches the subscription to it by that exact name.
 subscription_name: pg_emigrant_sub
-replication_slot_name: pg_emigrant_slot
+
+# Tables to leave out of the migration entirely: not created on the target,
+# not copied, not published, not replicated, and not reported as drift.
+# Entries are "schema.table" (fnmatch globs allowed in either half) or a bare
+# "table" name, which matches that table in any migrated schema.
+#
+# An excluded table's data never reaches the target, so the target is
+# knowingly not a faithful copy. pg_emigrant refuses to exclude a table that a
+# migrated table references by foreign key, because the target's constraint
+# could never be satisfied.
+exclude_tables: []
 
 parallel_workers: 4
 sequence_sync_interval: 10

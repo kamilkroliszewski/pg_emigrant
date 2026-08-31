@@ -309,7 +309,11 @@ async def bootstrap(
                     schemas = await discover_schemas(src, cfg)
                     console.print(f"  [{dbname}] Schemas: {schemas}")
                     maybe_fail("schema_create")
-                    await sync_schemas(src, tgt, schemas, access_method=access_method)
+                    await sync_schemas(
+                        src, tgt, schemas,
+                        access_method=access_method,
+                        exclude_tables=cfg.exclude_tables,
+                    )
 
                 # Step 3a-tde: convert relations that already existed on the
                 # target (a pre-created schema, or a re-run) — CREATE TABLE IF
@@ -337,7 +341,25 @@ async def bootstrap(
                 progress.update(task, description=f"[{dbname}] Setting replica identity…")
                 maybe_fail("replica_identity")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    await sync_replica_identity(src, tgt, schemas)
+                    ri_failures = await sync_replica_identity(
+                        src, tgt, schemas, exclude_tables=cfg.exclude_tables
+                    )
+                if ri_failures:
+                    # Deliberately fatal, and deliberately here — before the
+                    # publication exists.  See sync_replica_identity: a PK-less
+                    # published table with no usable replica identity makes
+                    # PostgreSQL reject every UPDATE/DELETE against it on the
+                    # production SOURCE.  Stopping now costs nothing; carrying
+                    # on would take the source down.
+                    raise _DatabaseBootstrapFailed(
+                        "could not set REPLICA IDENTITY FULL on "
+                        f"{len(ri_failures)} PK-less table(s): "
+                        + "; ".join(ri_failures)
+                        + ". Publishing them would make PostgreSQL reject every "
+                        "UPDATE/DELETE against them on the SOURCE, so nothing "
+                        "was published. Give those tables a primary key, or "
+                        "grant the migration role the privilege to ALTER them."
+                    )
 
                 # Step 3c/3d: publication, then the replication slot — BEFORE the
                 # data copy, so the copy can use the slot's own exported snapshot.
@@ -353,7 +375,7 @@ async def bootstrap(
                 # Step 4: copy initial data, using the slot's exported snapshot
                 progress.update(task, description=f"[{dbname}] Copying data…")
                 async with connect(cfg.source, dbname) as src:
-                    all_tables = await get_tables(src, schemas)
+                    all_tables = await get_tables(src, schemas, cfg.exclude_tables)
                 # Partitioned parents (relkind 'p') hold no rows of their own —
                 # the data physically lives in the leaf partitions, which are
                 # copied individually.  Copying the parent too would duplicate
@@ -442,7 +464,9 @@ async def bootstrap(
                 progress.update(task, description=f"[{dbname}] Creating indexes…")
                 maybe_fail("index_create")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    await sync_deferred_indexes(src, tgt, schemas)
+                    await sync_deferred_indexes(
+                        src, tgt, schemas, exclude_tables=cfg.exclude_tables
+                    )
 
                 # Step 4c: FK constraints, functions, views, triggers — post-COPY
                 # so that PostgreSQL validates referential integrity across the
@@ -452,7 +476,9 @@ async def bootstrap(
                 progress.update(task, description=f"[{dbname}] Applying constraints…")
                 maybe_fail("foreign_key")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    obj_failures = await sync_post_copy_constraints(src, tgt, schemas)
+                    obj_failures = await sync_post_copy_constraints(
+                        src, tgt, schemas, exclude_tables=cfg.exclude_tables
+                    )
                 obj_failures = {k: v for k, v in obj_failures.items() if v}
                 if obj_failures:
                     # NOT a warning.  A missing foreign key, function, view,
@@ -471,7 +497,10 @@ async def bootstrap(
                 progress.update(task, description=f"[{dbname}] Syncing ownership…")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                     maybe_fail("ownership_sync")
-                    own_count = await sync_ownership(src, tgt, schemas, dbname=dbname)
+                    own_count = await sync_ownership(
+                        src, tgt, schemas, dbname=dbname,
+                        exclude_tables=cfg.exclude_tables,
+                    )
                     if own_count:
                         console.print(f"  [{dbname}] Applied {own_count} ownership change(s)")
 
@@ -481,7 +510,10 @@ async def bootstrap(
                 progress.update(task, description=f"[{dbname}] Syncing privileges…")
                 async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
                     maybe_fail("privilege_sync")
-                    priv_count = await sync_privileges(src, tgt, schemas, dbname=dbname)
+                    priv_count = await sync_privileges(
+                        src, tgt, schemas, dbname=dbname,
+                        exclude_tables=cfg.exclude_tables,
+                    )
                     if priv_count:
                         console.print(f"  [{dbname}] Applied {priv_count} privilege grant(s)")
 

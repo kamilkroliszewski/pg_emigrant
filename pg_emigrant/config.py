@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DatabaseConfig(BaseModel):
@@ -82,8 +82,12 @@ class ReplicatorConfig(BaseModel):
     schemas: list[str] = Field(default_factory=list)  # empty = auto-discover (all non-system schemas)
     databases: list[str] = Field(default_factory=list)  # empty = auto-discover
     publication_name: str = "pg_emigrant_pub"
+    # The replication slot is named after the subscription, per database — the
+    # two must match, because bootstrap creates the slot up front (to copy from
+    # its exported snapshot) and then attaches the subscription to it by name
+    # with create_slot = false.  There is deliberately no separate slot-name
+    # setting; see the validator below.
     subscription_name: str = "pg_emigrant_sub"
-    replication_slot_name: str = "pg_emigrant_slot"
     parallel_workers: int = 4
     table_parallel_workers: int = 4
     sequence_sync_interval: int = 10  # seconds
@@ -97,6 +101,39 @@ class ReplicatorConfig(BaseModel):
     exclude_tables: list[str] = Field(default_factory=list)
     # Web GUI settings; ignored by every CLI command except `pg_emigrant web`.
     web: WebConfig = Field(default_factory=WebConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_options(cls, values: object) -> object:
+        """Refuse a configuration that sets an option this tool does not honour.
+
+        ``replication_slot_name`` used to appear in the config model and in
+        ``config.yaml.example``, and was never read by anything: the slot has
+        always been named after the subscription.  Silently ignoring a setting
+        that looks load-bearing is how an operator ends up looking for a slot
+        that is not there — during an incident, on a production primary.
+
+        This is a hard error rather than a rename because honouring the value
+        would CHANGE the slot name for every existing installation (they all
+        carry the example file's ``pg_emigrant_slot``), orphaning the live slot
+        on the source, where it would go on retaining WAL until someone noticed.
+        Refusing costs one line in a config file; the alternative costs a
+        production incident.
+        """
+        if isinstance(values, dict) and "replication_slot_name" in values:
+            raise ValueError(
+                "'replication_slot_name' is no longer a configuration option and "
+                "never took effect: the replication slot is named after the "
+                "subscription, one per database "
+                "(<subscription_name>_<database>), because bootstrap attaches "
+                "the subscription to a slot it created earlier by that exact "
+                "name. Delete the 'replication_slot_name:' line from your config "
+                "file. To change the slot name, change 'subscription_name' — but "
+                "only while no migration is in flight, since existing slots keep "
+                "their old names and would be left behind, retaining WAL on the "
+                "source."
+            )
+        return values
 
 
 def load_config(path: Optional[str] = None) -> ReplicatorConfig:

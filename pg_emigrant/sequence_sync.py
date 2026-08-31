@@ -80,7 +80,7 @@ async def sync_sequences_once(
     """
     async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
         schemas = await discover_schemas(src, cfg)
-        sequences = await get_sequences(src, schemas)
+        sequences = await get_sequences(src, schemas, cfg.exclude_tables)
         if not sequences:
             return []
 
@@ -312,7 +312,7 @@ async def get_sequence_status(
     """
     async with src_tgt_conns(cfg, dbname, src, tgt) as (src, tgt):
         schemas = await discover_schemas(src, cfg)
-        sequences = await get_sequences(src, schemas)
+        sequences = await get_sequences(src, schemas, cfg.exclude_tables)
         if not sequences:
             return []
 
