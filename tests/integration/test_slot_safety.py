@@ -276,3 +276,36 @@ async def test_an_inactive_orphan_is_still_cleaned_up(cfg, source_db):
         assert not await conn.fetchval(
             "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1", slot
         )
+
+
+async def test_preflight_distinguishes_a_rival_migration_from_a_re_run(
+    cfg, source_db
+):
+    """The same collision, two situations, two different remedies.
+
+    A slot name that is already taken means "you already bootstrapped this"
+    when the subscription is here too, and "someone else is streaming from it"
+    when it is not. Telling an operator to run `teardown` in the second case
+    would have them dismantle a healthy migration.
+    """
+    from pg_emigrant.preflight import ERROR, run_preflight
+
+    await bootstrap(cfg, database=source_db)
+    await wait_for_catchup(cfg, source_db)
+
+    # Same source and names, a target that knows nothing about this migration.
+    rival = cfg.model_copy(deep=True)
+    rival.target = cfg.target.model_copy()
+    rival.target.dbname = "postgres"
+
+    report = await run_preflight(cfg, database=source_db)
+    collision = next(
+        (c for c in report.checks if c.name == "naming_collision" and c.status == ERROR),
+        None,
+    )
+    assert collision is not None, "preflight did not notice the existing slot"
+    # This target DOES hold the subscription, so it is a re-run, not a rival.
+    assert "already bootstrapped" in collision.detail, collision.detail
+    assert "ACTIVE" in collision.detail, (
+        "the message does not say whether anything is actually streaming"
+    )

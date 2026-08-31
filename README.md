@@ -1003,6 +1003,29 @@ roll back the replication objects it created on the source, within a bounded 60
 seconds. `SIGKILL` cannot clean up after itself by definition — there, the
 guarantee moves to recovery: the next `bootstrap` run adopts the orphan.
 
+### Reconciliation: what happens when the target already has something
+
+The intended target is a freshly provisioned cluster whose roles, databases and
+sometimes schemas were created by configuration management, so "the target
+already contains things" is the normal case. Per object type:
+
+| Target state | What happens |
+|---|---|
+| **Database** exists | Reused. Not recreated, not dropped. (Created with the source's encoding/collation when absent.) |
+| **Schema** exists | Reused. |
+| **Table** missing | Created from the source definition. |
+| **Table** exists, same columns | Reused; its rows are cleared and reloaded by the copy. |
+| **Table** exists, missing a column | The column is added (`ALTER TABLE … ADD COLUMN`), then the table is loaded in full. |
+| **Table** exists, column type differs | **Refused** before anything is cleared. Nothing reconciles this, and CSV `COPY` would load the wrong type without complaint. |
+| **Table** exists outside the migration's scope, referencing one inside it, and holding rows | **Refused** — clearing the in-scope table would cascade into it. |
+| **Index / constraint** missing | Created. |
+| **Function / view / trigger / policy** missing | Created; a failure makes the run `incomplete`. |
+| **Ownership / grants** differ | Ownership is aligned to the source. Grants are **additive only** — a privilege present on the target and absent on the source is left alone rather than revoked. |
+| **Sequence** exists but behind | Advanced. Never rewound: a target sequence that is *ahead* is left ahead. |
+| **Anything on the target that the source does not have** | Left alone. `detect-ddl` reports it as `missing_on_source`; only `detect-ddl --apply --drop-extra` removes it, and only because you asked. |
+| **A live subscription for this database** | Bootstrap **refuses**. Re-running would drop the live slot and truncate the target mid-replication. `teardown` first. |
+| **An active replication slot with this name** | **Refused** — see above. |
+
 ### What is *not* guaranteed
 
 - **Nothing is guaranteed about an excluded table** — that is what

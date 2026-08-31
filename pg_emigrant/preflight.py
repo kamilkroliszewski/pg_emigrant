@@ -652,27 +652,59 @@ async def _check_naming_collisions(
     Slots and subscriptions live in *cluster-wide* catalogs, so one query each
     covers every database.
     """
-    slot_rows = await src.fetch("SELECT slot_name FROM pg_replication_slots")
-    existing_slots = {r["slot_name"] for r in slot_rows}
+    slot_rows = await src.fetch(
+        "SELECT slot_name, active, database FROM pg_replication_slots"
+    )
+    existing_slots = {r["slot_name"]: r for r in slot_rows}
     sub_rows = await tgt.fetch("SELECT subname FROM pg_subscription")
     existing_subs = {r["subname"] for r in sub_rows}
 
     for db in databases:
         slot = sub_name(cfg, db)
         collisions = []
-        if slot in existing_slots:
-            collisions.append(f"replication slot '{slot}' already exists on the source")
+        slot_row = existing_slots.get(slot)
+        if slot_row is not None:
+            collisions.append(
+                f"replication slot '{slot}' already exists on the source "
+                f"(database {slot_row['database']!r}, "
+                f"{'ACTIVE' if slot_row['active'] else 'inactive'})"
+            )
         if slot in existing_subs:
             collisions.append(f"subscription '{slot}' already exists on the target")
 
         if collisions:
+            # Two quite different situations produce the same collision, and
+            # the remedy differs, so the message distinguishes them.  Slot
+            # names come from the configuration and slots are cluster-wide, so
+            # a second migration configured with the same names — pointing at
+            # a *different* target — collides here without either side having
+            # been misconfigured in any obvious way.
+            rival = (
+                slot_row is not None
+                and slot_row["active"]
+                and slot not in existing_subs
+            )
+            if rival:
+                advice = (
+                    f"The slot is ACTIVE but this target has no matching "
+                    f"subscription, so something else is streaming from it — "
+                    f"most likely another pg_emigrant migration from this same "
+                    f"source, configured with the same 'subscription_name'. "
+                    f"Bootstrap will refuse rather than take it over (doing so "
+                    f"would silently break that migration). Give this migration "
+                    f"a distinct 'subscription_name'."
+                )
+            else:
+                advice = (
+                    f"This database looks already bootstrapped — bootstrap "
+                    f"refuses to re-run over a live subscription. Use "
+                    f"'pg_emigrant status --database {db}' to inspect it, or "
+                    f"'pg_emigrant teardown --database {db}' to start over."
+                )
             report.add(
                 "naming_collision", "naming", ERROR,
                 f"name already in use for '{db}'",
-                "; ".join(collisions) + ". This database looks already bootstrapped "
-                "— bootstrap refuses to re-run over a live subscription. Use "
-                f"'pg_emigrant status --database {db}' to inspect it, or "
-                f"'pg_emigrant teardown --database {db}' to start over.",
+                "; ".join(collisions) + ". " + advice,
                 database=db,
             )
         else:
