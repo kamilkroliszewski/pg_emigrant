@@ -190,6 +190,71 @@ def _wait_ready(container: PgContainer, timeout: float = 90.0) -> None:
     raise TimeoutError(f"{container.name} not ready after {timeout}s")
 
 
+def start_physical_standby(primary: PgContainer) -> PgContainer:
+    """Stream a physical replica of *primary* and start it in recovery.
+
+    This is the closest reproduction of a Patroni failover that does not
+    require running Patroni: a real streaming standby, promoted for real.  What
+    makes it faithful is the part that matters — logical replication slots are
+    *local* to the instance that created them and are not carried by physical
+    replication before PostgreSQL 17's failover slots, so the promoted node
+    genuinely has no slot, exactly as a promoted Patroni leader would not.
+    """
+    name = f"pgem-standby-{primary.version}-{uuid.uuid4().hex[:10]}"
+    port = _free_port()
+    datadir = "/var/lib/postgresql/standby"
+
+    # -R writes the primary_conninfo/standby.signal that put it in recovery;
+    # -X stream keeps the WAL flowing so the base backup is self-consistent.
+    script = (
+        f"set -e; "
+        f"mkdir -p {datadir}; chmod 0700 {datadir}; "
+        f"pg_basebackup -h 127.0.0.1 -p {primary.port} -U {TEST_PG_USER} "
+        f"  -D {datadir} -R -X stream -c fast; "
+        f"exec postgres -D {datadir} -c port={port} "
+        + " ".join(f"-c {a}" for a in _SERVER_ARGS if a != "-c")
+    )
+    subprocess.run(
+        [
+            "docker", "run", "-d", "--name", name, "--label", LABEL,
+            "--network", "host", "--user", "postgres",
+            "-e", f"PGPASSWORD={TEST_PG_PASSWORD}",
+            f"postgres:{primary.version}-alpine",
+            "sh", "-c", script,
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    standby = PgContainer(
+        name=name, version=primary.version, port=port,
+        image=f"postgres:{primary.version}-alpine",
+    )
+    try:
+        _wait_ready(standby)
+    except Exception:
+        logs = subprocess.run(["docker", "logs", "--tail", "40", name],
+                              capture_output=True, text=True)
+        standby.stop()
+        raise RuntimeError(
+            f"physical standby did not come up:\n{logs.stdout}\n{logs.stderr}"
+        )
+    return standby
+
+
+def promote(standby: PgContainer, timeout: float = 60.0) -> None:
+    """Promote a standby to primary and wait for it to leave recovery."""
+    subprocess.run(
+        ["docker", "exec", standby.name, "pg_ctl", "-D", "/var/lib/postgresql/standby",
+         "promote"],
+        check=True, capture_output=True, text=True,
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if standby.psql("SELECT pg_is_in_recovery()") == "f":
+            return
+        time.sleep(0.3)
+    raise TimeoutError(f"{standby.name} did not leave recovery within {timeout}s")
+
+
 def docker_available() -> bool:
     try:
         return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
