@@ -70,3 +70,32 @@ def test_arming_is_not_reachable_from_configuration():
 
     fields = set(ReplicatorConfig.model_fields)
     assert not {f for f in fields if "fail" in f or "inject" in f or "hook" in f}
+
+
+def test_the_pause_variable_alone_does_not_arm_it(monkeypatch):
+    from pg_emigrant._testhooks import PAUSE_VAR
+
+    monkeypatch.delenv(ARM_VAR, raising=False)
+    monkeypatch.setenv(PAUSE_VAR, "index_create")
+    assert active_phase(PAUSE_VAR) is None
+    maybe_fail("index_create")  # must return immediately, not block
+
+
+def test_pausing_and_failing_are_independent_phases(monkeypatch):
+    from pg_emigrant._testhooks import PAUSE_VAR
+
+    monkeypatch.setenv(ARM_VAR, "1")
+    monkeypatch.setenv(PAUSE_VAR, "index_create")
+    monkeypatch.setenv(PHASE_VAR, "data_copy")
+    assert active_phase(PAUSE_VAR) == "index_create"
+    assert active_phase(PHASE_VAR) == "data_copy"
+    with pytest.raises(InjectedFailure):
+        maybe_fail("data_copy")
+    maybe_fail("table_create")  # neither armed phase: no block, no raise
+
+
+def test_the_pause_is_bounded(monkeypatch):
+    """A test that forgets to signal must fail on its own timeout, not hang."""
+    from pg_emigrant._testhooks import PAUSE_SECONDS
+
+    assert 0 < PAUSE_SECONDS <= 300

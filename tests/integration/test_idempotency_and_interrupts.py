@@ -135,6 +135,67 @@ def test_signalled_bootstrap_leaves_no_orphaned_slot(tmp_path, cfg, source_db, s
     )
 
 
+@pytest.mark.parametrize(
+    "phase",
+    ["data_copy", "index_create", "foreign_key", "sequence_sync", "subscription_create"],
+)
+def test_signalled_at_each_later_phase_leaves_no_orphaned_slot(
+    tmp_path, cfg, source_db, phase
+):
+    """The same invariant, at each phase after the slot exists.
+
+    Signalling "somewhere during the run" only ever lands in whichever phase
+    happens to be slowest — the index build and the sequence sync take
+    milliseconds on a fixture this size, so a timing-based test would never
+    reach them and would pass while asserting nothing. The pause hook stops the
+    run *at* the named phase so the signal is delivered exactly there.
+    """
+    path = write_config(tmp_path / "config.yaml", cfg)
+    proc = spawn_cli(
+        "bootstrap", "-c", str(path), "--skip-preflight",
+        env={"PG_EMIGRANT_TEST_HOOKS_ENABLED": "1", "PG_EMIGRANT_TEST_PAUSE_AT": phase},
+    )
+    try:
+        _wait_for_pause(cfg, source_db, proc, phase)
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=90)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+
+    assert proc.returncode != 0, f"interrupting at {phase} reported success"
+    leftover = asyncio.run(all_slots(cfg))
+    assert leftover == [], (
+        f"SIGTERM at phase {phase} stranded replication slot(s) {leftover}"
+    )
+
+
+def _wait_for_pause(cfg, dbname, proc, phase, timeout: float = 90.0) -> None:
+    """Block until the run reaches the paused phase.
+
+    The slot is created before every phase this is used with, so its existence
+    plus a moment's settling is a sufficient signal that the run has got at
+    least that far; the pause itself then holds it there.
+    """
+    slot = sub_name(cfg, dbname)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"bootstrap exited ({proc.returncode}) before pausing at {phase}; "
+                f"stderr: {proc.stderr.read()[-2000:]}"
+            )
+        if slot in asyncio.run(all_slots(cfg)):
+            # The phases tested here all follow slot creation, and the pause is
+            # a hard block, so once the slot exists the run is either at the
+            # pause already or on its way there within a copy's worth of time.
+            time.sleep(3)
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"bootstrap never reached the paused phase {phase}")
+
+
 def test_sigkilled_bootstrap_is_recoverable_by_rerunning(tmp_path, cfg, source_db):
     """SIGKILL cannot clean up after itself; the *next* run must.
 
