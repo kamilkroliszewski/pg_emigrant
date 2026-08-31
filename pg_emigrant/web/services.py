@@ -155,9 +155,13 @@ def masked_config(cfg: ReplicatorConfig) -> dict[str, Any]:
 def _build_bootstrap(cfg: ReplicatorConfig, db: Optional[str], _opts: dict) -> CoroFactory:
     from pg_emigrant.bootstrap import bootstrap
 
+    # Mirrors the CLI's --using-pg-tde: migrate into pg_tde-encrypted storage.
+    use_pg_tde = bool(_opts.get("use_pg_tde"))
+
     async def _coro() -> Any:
-        await bootstrap(cfg, database=db)
-        return {"message": f"Bootstrap finished for {db or 'all databases'}"}
+        await bootstrap(cfg, database=db, use_pg_tde=use_pg_tde)
+        suffix = " (pg_tde)" if use_pg_tde else ""
+        return {"message": f"Bootstrap finished for {db or 'all databases'}{suffix}"}
 
     return _coro
 

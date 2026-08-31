@@ -35,6 +35,14 @@ def preflight(
     database: Optional[str] = typer.Option(None, "--database", "-d", help="Check only this database (default: all discovered)"),
     format: str = typer.Option("rich", "--format", "-f", help="Output format: rich (default), simple, json"),
     strict: bool = typer.Option(False, "--strict", help="Exit non-zero on warnings too, not just errors"),
+    using_pg_tde: bool = typer.Option(
+        False, "--using-pg-tde", "--using_pg_tde",
+        help=(
+            "Also check the pg_tde prerequisites a 'bootstrap --using-pg-tde' "
+            "needs on the target: extension availability, shared_preload_libraries, "
+            "the tde_heap access method, and a principal key per database."
+        ),
+    ),
 ):
     """Verify a migration will work — WITHOUT changing anything.
 
@@ -55,7 +63,7 @@ def preflight(
     from pg_emigrant.preflight import ERROR, OK, SKIP, WARN, run_preflight
 
     cfg = load_config(config)
-    report = _run(run_preflight(cfg, database=database))
+    report = _run(run_preflight(cfg, database=database, use_pg_tde=using_pg_tde))
 
     if format == "json":
         print(_json.dumps(report.to_dict(), indent=2))
@@ -119,8 +127,25 @@ def bootstrap(
         False, "--skip-preflight",
         help="Do not run the read-only preflight checks before migrating (not recommended)",
     ),
+    using_pg_tde: bool = typer.Option(
+        False, "--using-pg-tde", "--using_pg_tde",
+        help=(
+            "Migrate into pg_tde-encrypted storage: verify the target can encrypt, "
+            "create every table USING tde_heap, set the database's "
+            "default_table_access_method, and convert any pre-existing target "
+            "table with ALTER TABLE … SET ACCESS METHOD tde_heap."
+        ),
+    ),
 ):
-    """Run full bootstrap migration: discover → schema sync → data copy → replication setup."""
+    """Run full bootstrap migration: discover → schema sync → data copy → replication setup.
+
+    With --using-pg-tde the target must have pg_tde in shared_preload_libraries
+    and a principal key configured for each target database; pg_emigrant
+    installs the extension itself but never creates a key provider or key —
+    those are security decisions (file / Vault / KMIP, and where the secrets
+    live) that belong to you. The readiness check runs before anything is
+    created on the source, so a target that cannot encrypt costs nothing.
+    """
     from pg_emigrant.bootstrap import bootstrap as do_bootstrap
     from pg_emigrant.preflight import run_preflight
 
@@ -132,7 +157,7 @@ def bootstrap(
     # the same cluster) is knowable up front — and far cheaper to fix before a
     # slot exists on the production source and data has been copied.
     if not skip_preflight:
-        report = _run(run_preflight(cfg, database=database))
+        report = _run(run_preflight(cfg, database=database, use_pg_tde=using_pg_tde))
         if not report.passed:
             console.rule("[bold red]Preflight FAILED — bootstrap not started")
             for c in report.errors:
@@ -152,7 +177,7 @@ def bootstrap(
             )
 
     try:
-        _run(do_bootstrap(cfg, database=database))
+        _run(do_bootstrap(cfg, database=database, use_pg_tde=using_pg_tde))
     except RuntimeError as exc:
         console.print(f"[bold red]{exc}[/bold red]")
         raise typer.Exit(code=1)

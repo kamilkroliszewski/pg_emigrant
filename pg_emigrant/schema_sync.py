@@ -384,6 +384,37 @@ def _collate_clause(col: dict) -> str:
     return f"COLLATE {_qualified_collation(col.get('collation_schema'), name)} "
 
 
+#: Naming a table access method on a *partitioned parent* is only accepted
+#: from PostgreSQL 17 onward, where it sets the default for future partitions.
+_MIN_PARTITIONED_AM_MAJOR = 17
+
+
+def _access_method_clause(
+    access_method: str | None,
+    *,
+    is_partitioned: bool,
+    target_major: int | None,
+) -> str:
+    """Return a trailing ``USING <method>`` clause, or ``""`` when it must be omitted.
+
+    ``access_method`` is None for every ordinary migration, which makes this a
+    no-op and leaves the generated DDL byte-for-byte unchanged; it is only set
+    when the caller asked for a specific storage (``--using-pg-tde`` →
+    ``tde_heap``).
+
+    A partitioned parent holds no rows of its own, and PostgreSQL below 17
+    rejects an access method on one outright ("specifying a table access
+    method is not supported on a partitioned table").  Omitting the clause
+    there loses nothing: the data lives in the leaf partitions, and those are
+    emitted with it.
+    """
+    if not access_method:
+        return ""
+    if is_partitioned and (target_major is None or target_major < _MIN_PARTITIONED_AM_MAJOR):
+        return ""
+    return f" USING {qi(access_method)}"
+
+
 async def _get_partition_info(
     conn: asyncpg.Connection, schema: str, table: str
 ) -> dict:
@@ -427,7 +458,12 @@ async def _get_partition_info(
 
 
 async def _generate_create_table_ddl(
-    conn: asyncpg.Connection, schema: str, table: str
+    conn: asyncpg.Connection,
+    schema: str,
+    table: str,
+    *,
+    access_method: str | None = None,
+    target_major: int | None = None,
 ) -> str:
     """Generate a CREATE TABLE statement by introspecting the source.
 
@@ -439,6 +475,13 @@ async def _generate_create_table_ddl(
     children are emitted as ``CREATE TABLE … PARTITION OF parent FOR VALUES …``
     (columns, constraints and indexes are inherited from the parent, so they
     are not repeated here).
+
+    ``access_method`` (default None — no change to the emitted DDL) appends a
+    ``USING <method>`` clause, which is how ``--using-pg-tde`` gets its tables
+    created directly as encrypted ``tde_heap`` relations rather than as plain
+    heap ones that would then need a full rewrite.  ``target_major`` is the
+    target's PostgreSQL major version, needed to decide whether a partitioned
+    parent may carry the clause at all.
     """
     fqn = f"{qi(schema)}.{qi(table)}"
 
@@ -454,6 +497,12 @@ async def _generate_create_table_ddl(
         if part.get("is_partitioned") and part.get("partition_by"):
             # Sub-partitioned: this child is itself partitioned further.
             ddl += f" PARTITION BY {part['partition_by']}"
+        # USING comes after PARTITION BY in PostgreSQL's CREATE TABLE grammar.
+        ddl += _access_method_clause(
+            access_method,
+            is_partitioned=bool(part.get("is_partitioned")),
+            target_major=target_major,
+        )
         return ddl + ";"
 
     columns = await get_columns(conn, fqn)
@@ -501,6 +550,11 @@ async def _generate_create_table_ddl(
     ddl = f"CREATE TABLE IF NOT EXISTS {fqn} (\n  " + ",\n  ".join(col_defs) + "\n)"
     if part.get("is_partitioned") and part.get("partition_by"):
         ddl += f" PARTITION BY {part['partition_by']}"
+    ddl += _access_method_clause(
+        access_method,
+        is_partitioned=bool(part.get("is_partitioned")),
+        target_major=target_major,
+    )
     return ddl + ";"
 
 
@@ -1827,6 +1881,8 @@ async def sync_schemas(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
     schemas: list[str],
+    *,
+    access_method: str | None = None,
 ) -> None:
     """Pre-copy schema sync: extensions → types → sequences → tables (PK/UNIQUE/CHECK only).
 
@@ -1839,6 +1895,10 @@ async def sync_schemas(
       hard errors.
     * Triggers created post-COPY avoid side-effects during bulk insert
       (triggers with ENABLE ALWAYS fire even under session_replication_role=replica).
+
+    ``access_method`` (default None — unchanged behaviour) is passed through to
+    every ``CREATE TABLE``; ``--using-pg-tde`` sets it to ``tde_heap`` so the
+    tables are encrypted from the moment they are created.
     """
     # Sync extensions FIRST — extensions like timescaledb / anon create their own
     # schemas on installation; creating those schemas beforehand causes the install
@@ -1926,6 +1986,7 @@ async def sync_schemas(
     for t in tables:
         await _sync_table_structure(
             source_conn, target_conn, t["schema_name"], t["table_name"],
+            access_method=access_method,
         )
 
     # Second function pass now that tables exist.
@@ -2017,9 +2078,19 @@ async def _sync_table_structure(
     target_conn: asyncpg.Connection,
     schema: str,
     table: str,
+    *,
+    access_method: str | None = None,
 ) -> None:
-    """Create/update table + columns + non-FK constraints + indexes."""
+    """Create/update table + columns + non-FK constraints + indexes.
+
+    ``access_method`` (default None — unchanged behaviour) is the storage the
+    table should be CREATEd with, e.g. ``tde_heap`` under ``--using-pg-tde``.
+    It only affects tables this call *creates*: a table that already exists on
+    the target keeps whatever storage it has, and is converted separately by
+    ``pg_emigrant.tde.enforce_access_method`` while it is still empty.
+    """
     fqn = f"{qi(schema)}.{qi(table)}"
+    target_major = target_conn.get_server_version().major
 
     exists = await target_conn.fetchval(
         "SELECT EXISTS ("
@@ -2038,13 +2109,19 @@ async def _sync_table_structure(
     # work that would otherwise fail with duplicate-object errors.
     if part.get("is_partition"):
         if not exists:
-            ddl = await _generate_create_table_ddl(source_conn, schema, table)
+            ddl = await _generate_create_table_ddl(
+                source_conn, schema, table,
+                access_method=access_method, target_major=target_major,
+            )
             log.info("Attaching partition %s", fqn)
             await target_conn.execute(ddl)
         return
 
     if not exists:
-        ddl = await _generate_create_table_ddl(source_conn, schema, table)
+        ddl = await _generate_create_table_ddl(
+            source_conn, schema, table,
+            access_method=access_method, target_major=target_major,
+        )
         log.info("Creating table %s", fqn)
         await target_conn.execute(ddl)
     else:
