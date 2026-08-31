@@ -104,6 +104,24 @@ WHERE ix.indrelid = $1::regclass
 ORDER BY i.relname;
 """
 
+# NOT NULL is deliberately excluded (contype 'n').  PostgreSQL 18 gave NOT NULL
+# real pg_constraint rows; before that it was only pg_attribute.attnotnull.  On
+# an 18+ source those rows would flow into the generic "ALTER TABLE … ADD
+# CONSTRAINT" path below — but the column definition already carries its NOT
+# NULL, and PostgreSQL 18 allows a column at most ONE not-null constraint, so
+# adding a second one fails outright:
+#
+#   ERROR: cannot create not-null constraint "x" on column "id" of table "t"
+#   DETAIL: A not-null constraint named "t_id_not_null" already exists for this column.
+#
+# It only bites when the two names differ — i.e. when the source's constraint is
+# not called "<table>_<column>_not_null", which happens when it was named
+# explicitly or when the column was renamed after the table was created (a
+# rename does not rename the constraint).  Every other table survives by
+# coincidence, because the name the target auto-generates happens to match.
+#
+# Names are still reproduced faithfully — see sync_not_null_constraints(), which
+# renames the target's auto-generated constraint instead of adding a second one.
 _CONSTRAINTS_SQL = """
 SELECT
     con.conname       AS constraint_name,
@@ -111,7 +129,34 @@ SELECT
     pg_get_constraintdef(con.oid) AS constraint_def
 FROM pg_constraint con
 WHERE con.conrelid = $1::regclass
+  AND con.contype <> 'n'
 ORDER BY con.conname;
+"""
+
+# The NOT NULL constraints themselves, read separately so their *names* can be
+# aligned on the target.  Returns nothing before PostgreSQL 18 (no contype 'n'
+# rows exist there), which makes every caller a no-op on older servers without
+# any version branching.
+#
+# conislocal filters out constraints a partition inherited from its parent:
+# renaming one on the parent recurses to the children on its own, and a child
+# cannot be renamed independently.
+_NOT_NULL_CONSTRAINTS_SQL = """
+SELECT
+    n.nspname        AS schema_name,
+    c.relname        AS table_name,
+    a.attname        AS column_name,
+    con.conname      AS constraint_name,
+    con.convalidated AS validated
+FROM pg_constraint con
+JOIN pg_class c     ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[1]
+WHERE con.contype = 'n'
+  AND con.conislocal
+  AND c.relkind IN ('r', 'p')
+  AND n.nspname = ANY($1::text[])
+ORDER BY n.nspname, c.relname, a.attname;
 """
 
 _SEQUENCES_SQL = """
@@ -291,6 +336,16 @@ async def get_constraints(
 ) -> list[dict]:
     """Return constraints for a table."""
     return [dict(r) for r in await conn.fetch(_CONSTRAINTS_SQL, fqn)]
+
+
+async def get_not_null_constraints(
+    conn: asyncpg.Connection, schemas: list[str]
+) -> list[dict]:
+    """Return locally-defined NOT NULL constraints for tables in *schemas*.
+
+    Empty on PostgreSQL 17 and below, where NOT NULL has no pg_constraint row.
+    """
+    return [dict(r) for r in await conn.fetch(_NOT_NULL_CONSTRAINTS_SQL, schemas)]
 
 
 async def get_sequences(
@@ -1663,6 +1718,94 @@ async def _exec_with_lock_timeout(
         await conn.execute("RESET lock_timeout;")
 
 
+async def sync_not_null_constraints(
+    source_conn: asyncpg.Connection,
+    target_conn: asyncpg.Connection,
+    schemas: list[str],
+) -> int:
+    """Give the target's NOT NULL constraints the same *names* as the source's.
+
+    PostgreSQL 18 turned NOT NULL into a real ``pg_constraint`` row, so it now
+    has a name that scripts and migration tools can refer to
+    (``ALTER TABLE … DROP CONSTRAINT <name>``).  pg_emigrant reproduces the NOT
+    NULL itself through the column definition, which means PostgreSQL picks the
+    default ``<table>_<column>_not_null`` name on the target — correct
+    semantics, but a different name whenever the source used another one
+    (explicitly named, or the column was renamed after creation, which leaves
+    the constraint's original name behind).
+
+    Aligning them is a catalog-only ``RENAME``: no rewrite, no validation scan.
+    It deliberately does NOT add missing constraints — a column that is nullable
+    on the target has nothing to rename, and forcing NOT NULL onto it here would
+    be a schema change this function has no business making.
+
+    Returns the number of constraints renamed.  A no-op on PostgreSQL 17 and
+    below, and on any database where every name already matches.
+    """
+    src_rows = await get_not_null_constraints(source_conn, schemas)
+    if not src_rows:
+        return 0
+    tgt_rows = await get_not_null_constraints(target_conn, schemas)
+
+    def _key(r: dict) -> tuple[str, str, str]:
+        return (r["schema_name"], r["table_name"], r["column_name"])
+
+    tgt_map = {_key(r): r for r in tgt_rows}
+
+    # A NOT VALID not-null constraint is a PostgreSQL 18 feature this function
+    # cannot reproduce and must not paper over: the source may hold rows
+    # predating the constraint that violate it, while the constraint still
+    # rejects every NEW insert — so those rows exist on the source and the
+    # initial COPY of them into the target fails.  Naming the tables up front
+    # turns a confusing mid-copy not-null violation into something actionable.
+    unvalidated = [
+        f"{r['schema_name']}.{r['table_name']}.{r['column_name']} ({r['constraint_name']})"
+        for r in src_rows if not r["validated"]
+    ]
+    if unvalidated:
+        log.warning(
+            "Source has %d NOT VALID not-null constraint(s): %s. pg_emigrant "
+            "creates the target column as plain NOT NULL, so if the source "
+            "still holds rows that violate the constraint, the initial COPY of "
+            "those tables will fail with a not-null violation. Validate the "
+            "constraint on the source (ALTER TABLE ... VALIDATE CONSTRAINT ...) "
+            "or clean up the offending rows before bootstrapping these tables.",
+            len(unvalidated), ", ".join(unvalidated),
+        )
+
+    renamed = 0
+    for src in src_rows:
+        tgt = tgt_map.get(_key(src))
+        if tgt is None or tgt["constraint_name"] == src["constraint_name"]:
+            continue
+        fqn = qt(src["schema_name"], src["table_name"])
+        stmt = (
+            f"ALTER TABLE {fqn} RENAME CONSTRAINT "
+            f"{qi(tgt['constraint_name'])} TO {qi(src['constraint_name'])};"
+        )
+        try:
+            await target_conn.execute(stmt)
+            log.debug(
+                "Renamed not-null constraint on %s.%s: %s -> %s",
+                fqn, src["column_name"], tgt["constraint_name"], src["constraint_name"],
+            )
+            renamed += 1
+        except Exception as exc:
+            # A name already taken by another constraint on the same table is
+            # the realistic case (two columns whose names were swapped).  The
+            # NOT NULL itself is already correct either way, so this is
+            # cosmetic — warn and carry on rather than failing the bootstrap.
+            log.warning(
+                "Could not rename not-null constraint %s to %s on %s: %s. The "
+                "column is still NOT NULL; only the constraint's name differs "
+                "from the source.",
+                tgt["constraint_name"], src["constraint_name"], fqn, exc,
+            )
+    if renamed:
+        log.info("Aligned %d not-null constraint name(s) with the source", renamed)
+    return renamed
+
+
 async def sync_replica_identity(
     source_conn: asyncpg.Connection,
     target_conn: asyncpg.Connection,
@@ -1927,6 +2070,11 @@ async def sync_schemas(
         await _sync_table_structure(
             source_conn, target_conn, t["schema_name"], t["table_name"],
         )
+
+    # Now that every table exists, align NOT NULL constraint NAMES with the
+    # source (PostgreSQL 18+; a no-op below that).  The NOT NULL itself came
+    # from each column definition above — this only fixes up the names.
+    await sync_not_null_constraints(source_conn, target_conn, schemas)
 
     # Second function pass now that tables exist.
     await sync_functions(source_conn, target_conn, schemas, silent=True)
