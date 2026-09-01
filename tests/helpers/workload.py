@@ -94,9 +94,18 @@ class ConcurrentWriter:
 
             # UPDATE and DELETE on pre-existing rows, so the workload exercises
             # more than append-only traffic.
+            # balance is numeric(18,4) and the fixture deliberately seeds one
+            # row at the type's boundary (99999999999999.9999) to exercise
+            # COPY's handling of it.  Incrementing that row overflows — which
+            # only ever happens once the workload has run long enough to walk
+            # the id order down to it, i.e. in the soak test and not in the
+            # short ones.  The increment is guarded rather than dropped: the
+            # UPDATE still has to change a numeric column, which is the shape
+            # being replicated.
             updated = await conn.fetchval(
                 "UPDATE app.customers SET display_name = display_name || '*',"
-                " balance = balance + 1 WHERE id = ("
+                " balance = CASE WHEN balance < 1e13 THEN balance + 1 ELSE balance END"
+                " WHERE id = ("
                 "  SELECT id FROM app.customers WHERE display_name NOT LIKE '%*'"
                 "  ORDER BY id LIMIT 1) RETURNING 1"
             )

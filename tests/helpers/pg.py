@@ -44,6 +44,17 @@ TEST_PG_USER = os.environ.get("PG_EMIGRANT_TEST_PG_USER", "postgres")
 
 LABEL = "pg_emigrant_test=1"
 
+# Size of the tmpfs each throw-away cluster keeps its data directory on.  1 GiB
+# is ample for the fixture and keeps a full version-matrix run off the
+# developer's disk, but a real stress run (PG_EMIGRANT_STRESS_ROWS in the
+# millions) needs room for the table, its indexes and the WAL the load
+# generates — and a datadir that runs out of space surfaces as a bare
+# "connection was closed in the middle of operation", which looks like a
+# pg_emigrant bug and is not one.  Raise it alongside the row count:
+#
+#   PG_EMIGRANT_STRESS_ROWS=5000000 PG_EMIGRANT_TEST_TMPFS_SIZE=8g pytest …
+TMPFS_SIZE = os.environ.get("PG_EMIGRANT_TEST_TMPFS_SIZE", "1g")
+
 # Server settings every test cluster needs: logical decoding on the source
 # side, and enough slots/workers that a multi-database test does not hit a
 # limit unrelated to what it is testing.
@@ -151,8 +162,8 @@ def start_pg(version: str, *, extra_args: list[str] | None = None) -> PgContaine
             # full version-matrix run off the developer's disk.  Mounted at
             # the parent, not at PGDATA, because PGDATA moved between the
             # supported images (14-17: /var/lib/postgresql/data, 18:
-            # /var/lib/postgresql/18/docker).
-            "--tmpfs", "/var/lib/postgresql:rw,size=1g,mode=1777",
+            # /var/lib/postgresql/18/docker).  Size: see TMPFS_SIZE.
+            "--tmpfs", f"/var/lib/postgresql:rw,size={TMPFS_SIZE},mode=1777",
             image, "postgres", "-c", f"port={port}",
             *_SERVER_ARGS, *(extra_args or []),
         ],
