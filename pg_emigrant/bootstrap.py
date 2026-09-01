@@ -77,8 +77,13 @@ from pg_emigrant.data_copy import (
 )
 from pg_emigrant.db import connect, discover_databases, discover_schemas
 from pg_emigrant.ddl_detector import detect_drift
-from pg_emigrant.guards import assert_distinct_clusters
+from pg_emigrant.guards import (
+    ConcurrentMigration,
+    assert_distinct_clusters,
+    migration_lock,
+)
 from pg_emigrant.report import BootstrapIncomplete, BootstrapReport
+from pg_emigrant.scope import ExcludedTableIsReferenced, check_exclusions_are_safe
 from pg_emigrant.replication import (
     SlotInUse,
     create_publication,
@@ -116,6 +121,31 @@ log = get_logger(__name__)
 
 class _DatabaseBootstrapFailed(Exception):
     """Raised to abort one database's bootstrap; caught by the per-database loop."""
+
+
+class _DatabaseRefused(_DatabaseBootstrapFailed):
+    """Aborted because proceeding would be unsafe, not because something broke.
+
+    The distinction is the exit code, and the exit code is what a runbook
+    branches on: ``failed`` (4) means "the cause is transient or fixable —
+    fix it and re-run bootstrap", while ``refused`` (7) means "the request
+    itself is unsafe as configured; re-running it unchanged will refuse
+    again".  A script that retries on 4 would otherwise loop forever against a
+    condition no retry can clear.
+    """
+
+
+# Aborts that are refusals rather than failures: each is a state or a
+# configuration that the run declined to act on, decided before the target's
+# data was touched, and unchanged by re-running.
+_REFUSALS = (
+    ConcurrentMigration,
+    _DatabaseRefused,
+    ExcludedTableIsReferenced,
+    IncompatibleTargetColumns,
+    SlotInUse,
+    UnsafeTruncate,
+)
 
 
 async def ensure_database_exists(cfg: ReplicatorConfig, dbname: str) -> None:
@@ -258,7 +288,6 @@ async def bootstrap(
         for dbname in databases:
             result = report.add(dbname)
             task = progress.add_task(f"Migrating {dbname}…", total=None)
-            # Tracks whether the publication/slot for this database have been
             # Tracks what THIS run created on the source, so the except-handler
             # below rolls back only its own work.  Both are deliberately about
             # authorship, not existence: rolling back an object another
@@ -268,369 +297,388 @@ async def bootstrap(
             pub_created = False
 
             try:
-                # Step 2: ensure database exists on target
-                progress.update(task, description=f"[{dbname}] Creating database…")
-                await maybe_fail("database_create")
-                await ensure_database_exists(cfg, dbname)
+                # Held for this database's entire run, source-side, keyed by
+                # the slot name.  Two concurrent runs of the same config are
+                # indistinguishable from a killed run's debris by server state
+                # alone — see guards.migration_lock.
+                async with migration_lock(cfg, dbname, sub_name(cfg, dbname)):
+                    # Step 2: ensure database exists on target
+                    progress.update(task, description=f"[{dbname}] Creating database…")
+                    await maybe_fail("database_create")
+                    await ensure_database_exists(cfg, dbname)
 
-                # Step 2b: refuse to re-bootstrap a database that is already
-                # replicating.  Without this guard, a re-run would treat the
-                # LIVE slot as orphaned (terminating its walsender and
-                # recreating the slot at a new LSN) and then TRUNCATE the
-                # target while the still-enabled apply worker is running —
-                # guaranteeing duplicate-apply conflicts.  Tearing down must
-                # be an explicit, separate decision.
-                async with connect(cfg.target, dbname) as probe:
-                    already_subscribed = bool(await probe.fetchval(
-                        "SELECT 1 FROM pg_subscription WHERE subname = $1"
-                        " AND subdbid = (SELECT oid FROM pg_database"
-                        " WHERE datname = current_database())",
-                        sub_name(cfg, dbname),
-                    ))
-                if already_subscribed:
-                    raise _DatabaseBootstrapFailed(
-                        f"subscription {sub_name(cfg, dbname)!r} already exists — "
-                        f"this database is already replicating. Re-running "
-                        f"bootstrap would drop its live replication slot and "
-                        f"truncate the target mid-replication. Run "
-                        f"'pg_emigrant teardown --database {dbname}' first if "
-                        f"you really want to re-bootstrap it."
-                    )
+                    # Step 2b: refuse to re-bootstrap a database that is already
+                    # replicating.  Without this guard, a re-run would treat the
+                    # LIVE slot as orphaned (terminating its walsender and
+                    # recreating the slot at a new LSN) and then TRUNCATE the
+                    # target while the still-enabled apply worker is running —
+                    # guaranteeing duplicate-apply conflicts.  Tearing down must
+                    # be an explicit, separate decision.
+                    async with connect(cfg.target, dbname) as probe:
+                        already_subscribed = bool(await probe.fetchval(
+                            "SELECT 1 FROM pg_subscription WHERE subname = $1"
+                            " AND subdbid = (SELECT oid FROM pg_database"
+                            " WHERE datname = current_database())",
+                            sub_name(cfg, dbname),
+                        ))
+                    if already_subscribed:
+                        raise _DatabaseRefused(
+                            f"subscription {sub_name(cfg, dbname)!r} already exists — "
+                            f"this database is already replicating. Re-running "
+                            f"bootstrap would drop its live replication slot and "
+                            f"truncate the target mid-replication. Run "
+                            f"'pg_emigrant teardown --database {dbname}' first if "
+                            f"you really want to re-bootstrap it."
+                        )
 
-                # Step 2c: pg_tde readiness — deliberately BEFORE the publication
-                # and the replication slot.  A target that cannot encrypt must be
-                # rejected while nothing has been created on the production source
-                # yet; discovering it at the first CREATE TABLE would mean tearing
-                # a live slot back down.  Raises TdeNotAvailable, which the
-                # per-database handler below reports and cleans up after.
-                if use_pg_tde:
-                    progress.update(task, description=f"[{dbname}] Checking pg_tde…")
-                    tde_status = await ensure_tde_ready(cfg, dbname)
-                    console.print(
-                        f"  [{dbname}] pg_tde {tde_status.version} ready — "
-                        f"tables will use {TDE_ACCESS_METHOD}"
-                    )
-                    # Database-level default, so that relation-creating paths
-                    # that never see `access_method` (materialized views,
-                    # detect-ddl --apply, post-cutover application DDL) encrypt
-                    # too.  Re-asserted after sync_db_settings in step 4d-3.
-                    await set_database_default_access_method(cfg, dbname)
-
-                # Step 3: discover schemas for this database, then synchronize them
-                progress.update(task, description=f"[{dbname}] Syncing schemas…")
-                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    schemas = await discover_schemas(src, cfg)
-                    console.print(f"  [{dbname}] Schemas: {schemas}")
-                    await maybe_fail("schema_create")
-                    await sync_schemas(
-                        src, tgt, schemas,
-                        access_method=access_method,
-                        exclude_tables=cfg.exclude_tables,
-                    )
-
-                # Step 3a-tde: convert relations that already existed on the
-                # target (a pre-created schema, or a re-run) — CREATE TABLE IF
-                # NOT EXISTS leaves those with whatever storage they had.  Here
-                # they are still empty, so SET ACCESS METHOD's rewrite is free;
-                # after the copy it would rewrite the loaded table all over again.
-                if use_pg_tde:
-                    progress.update(task, description=f"[{dbname}] Applying {TDE_ACCESS_METHOD}…")
-                    converted, conv_failed = await enforce_access_method(cfg, dbname, schemas)
-                    if converted:
+                    # Step 2c: pg_tde readiness — deliberately BEFORE the publication
+                    # and the replication slot.  A target that cannot encrypt must be
+                    # rejected while nothing has been created on the production source
+                    # yet; discovering it at the first CREATE TABLE would mean tearing
+                    # a live slot back down.  Raises TdeNotAvailable, which the
+                    # per-database handler below reports and cleans up after.
+                    if use_pg_tde:
+                        progress.update(task, description=f"[{dbname}] Checking pg_tde…")
+                        tde_status = await ensure_tde_ready(cfg, dbname)
                         console.print(
-                            f"  [{dbname}] Converted {len(converted)} pre-existing "
-                            f"relation(s) to {TDE_ACCESS_METHOD}"
+                            f"  [{dbname}] pg_tde {tde_status.version} ready — "
+                            f"tables will use {TDE_ACCESS_METHOD}"
                         )
-                    if conv_failed:
+                        # Database-level default, so that relation-creating paths
+                        # that never see `access_method` (materialized views,
+                        # detect-ddl --apply, post-cutover application DDL) encrypt
+                        # too.  Re-asserted after sync_db_settings in step 4d-3.
+                        await set_database_default_access_method(cfg, dbname)
+
+                    # Step 3: discover schemas for this database, then synchronize them
+                    progress.update(task, description=f"[{dbname}] Syncing schemas…")
+                    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                        schemas = await discover_schemas(src, cfg)
+                        console.print(f"  [{dbname}] Schemas: {schemas}")
+                        # Enforced here and not only in the (skippable, CLI-only)
+                        # preflight: a foreign key pointing at a table this run was
+                        # told to leave behind cannot be created on the target by
+                        # any later step, so carrying on produces a target that is
+                        # missing a constraint the source has — and does it after
+                        # the target's tables have already been cleared and
+                        # reloaded.  Refuse while nothing has been touched.
+                        unsafe_exclusions = await check_exclusions_are_safe(
+                            src, schemas, cfg.exclude_tables
+                        )
+                        if unsafe_exclusions:
+                            raise ExcludedTableIsReferenced.aggregate(
+                                dbname, unsafe_exclusions
+                            )
+                        await maybe_fail("schema_create")
+                        await sync_schemas(
+                            src, tgt, schemas,
+                            access_method=access_method,
+                            exclude_tables=cfg.exclude_tables,
+                        )
+
+                    # Step 3a-tde: convert relations that already existed on the
+                    # target (a pre-created schema, or a re-run) — CREATE TABLE IF
+                    # NOT EXISTS leaves those with whatever storage they had.  Here
+                    # they are still empty, so SET ACCESS METHOD's rewrite is free;
+                    # after the copy it would rewrite the loaded table all over again.
+                    if use_pg_tde:
+                        progress.update(task, description=f"[{dbname}] Applying {TDE_ACCESS_METHOD}…")
+                        converted, conv_failed = await enforce_access_method(cfg, dbname, schemas)
+                        if converted:
+                            console.print(
+                                f"  [{dbname}] Converted {len(converted)} pre-existing "
+                                f"relation(s) to {TDE_ACCESS_METHOD}"
+                            )
+                        if conv_failed:
+                            raise _DatabaseBootstrapFailed(
+                                f"could not convert {len(conv_failed)} relation(s) to "
+                                f"{TDE_ACCESS_METHOD}: {'; '.join(conv_failed)}"
+                            )
+
+                    # Step 3b: REPLICA IDENTITY FULL for PK-less tables, on the SOURCE
+                    # before the slot exists — see the module docstring for why this
+                    # ordering is required (REPLICA IDENTITY is evaluated at WAL-write
+                    # time, not at slot-creation time).
+                    progress.update(task, description=f"[{dbname}] Setting replica identity…")
+                    await maybe_fail("replica_identity")
+                    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                        ri_failures = await sync_replica_identity(
+                            src, tgt, schemas, exclude_tables=cfg.exclude_tables
+                        )
+                    if ri_failures:
+                        # Deliberately fatal, and deliberately here — before the
+                        # publication exists.  See sync_replica_identity: a PK-less
+                        # published table with no usable replica identity makes
+                        # PostgreSQL reject every UPDATE/DELETE against it on the
+                        # production SOURCE.  Stopping now costs nothing; carrying
+                        # on would take the source down.
                         raise _DatabaseBootstrapFailed(
-                            f"could not convert {len(conv_failed)} relation(s) to "
-                            f"{TDE_ACCESS_METHOD}: {'; '.join(conv_failed)}"
+                            "could not set REPLICA IDENTITY FULL on "
+                            f"{len(ri_failures)} PK-less table(s): "
+                            + "; ".join(ri_failures)
+                            + ". Publishing them would make PostgreSQL reject every "
+                            "UPDATE/DELETE against them on the SOURCE, so nothing "
+                            "was published. Give those tables a primary key, or "
+                            "grant the migration role the privilege to ALTER them."
                         )
 
-                # Step 3b: REPLICA IDENTITY FULL for PK-less tables, on the SOURCE
-                # before the slot exists — see the module docstring for why this
-                # ordering is required (REPLICA IDENTITY is evaluated at WAL-write
-                # time, not at slot-creation time).
-                progress.update(task, description=f"[{dbname}] Setting replica identity…")
-                await maybe_fail("replica_identity")
-                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    ri_failures = await sync_replica_identity(
-                        src, tgt, schemas, exclude_tables=cfg.exclude_tables
-                    )
-                if ri_failures:
-                    # Deliberately fatal, and deliberately here — before the
-                    # publication exists.  See sync_replica_identity: a PK-less
-                    # published table with no usable replica identity makes
-                    # PostgreSQL reject every UPDATE/DELETE against it on the
-                    # production SOURCE.  Stopping now costs nothing; carrying
-                    # on would take the source down.
-                    raise _DatabaseBootstrapFailed(
-                        "could not set REPLICA IDENTITY FULL on "
-                        f"{len(ri_failures)} PK-less table(s): "
-                        + "; ".join(ri_failures)
-                        + ". Publishing them would make PostgreSQL reject every "
-                        "UPDATE/DELETE against them on the SOURCE, so nothing "
-                        "was published. Give those tables a primary key, or "
-                        "grant the migration role the privilege to ALTER them."
-                    )
+                    # Step 3c/3d: publication, then the replication slot — BEFORE the
+                    # data copy, so the copy can use the slot's own exported snapshot.
+                    progress.update(task, description=f"[{dbname}] Creating publication…")
+                    await maybe_fail("publication_create")
+                    # Only True when THIS run created it.  A publication that was
+                    # already there belongs to something else — most plausibly
+                    # another migration configured with the same names — and
+                    # dropping it during this run's rollback would stop that
+                    # migration's subscription dead.
+                    pub_created = await create_publication(cfg, dbname, schemas=schemas)
 
-                # Step 3c/3d: publication, then the replication slot — BEFORE the
-                # data copy, so the copy can use the slot's own exported snapshot.
-                progress.update(task, description=f"[{dbname}] Creating publication…")
-                await maybe_fail("publication_create")
-                # Only True when THIS run created it.  A publication that was
-                # already there belongs to something else — most plausibly
-                # another migration configured with the same names — and
-                # dropping it during this run's rollback would stop that
-                # migration's subscription dead.
-                pub_created = await create_publication(cfg, dbname, schemas=schemas)
+                    progress.update(task, description=f"[{dbname}] Creating replication slot…")
+                    await maybe_fail("slot_create")
+                    slot = await create_replication_slot_with_snapshot(cfg, dbname)
 
-                progress.update(task, description=f"[{dbname}] Creating replication slot…")
-                await maybe_fail("slot_create")
-                slot = await create_replication_slot_with_snapshot(cfg, dbname)
+                    # Step 4: copy initial data, using the slot's exported snapshot
+                    progress.update(task, description=f"[{dbname}] Copying data…")
+                    async with connect(cfg.source, dbname) as src:
+                        all_tables = await get_tables(src, schemas, cfg.exclude_tables)
+                    # Partitioned parents (relkind 'p') hold no rows of their own —
+                    # the data physically lives in the leaf partitions, which are
+                    # copied individually.  Copying the parent too would duplicate
+                    # every row.
+                    tables = [t for t in all_tables if t["relkind"] != "p"]
 
-                # Step 4: copy initial data, using the slot's exported snapshot
-                progress.update(task, description=f"[{dbname}] Copying data…")
-                async with connect(cfg.source, dbname) as src:
-                    all_tables = await get_tables(src, schemas, cfg.exclude_tables)
-                # Partitioned parents (relkind 'p') hold no rows of their own —
-                # the data physically lives in the leaf partitions, which are
-                # copied individually.  Copying the parent too would duplicate
-                # every row.
-                tables = [t for t in all_tables if t["relkind"] != "p"]
+                    if tables:
+                        n_total = len(tables)
+                        n_done = 0
+                        active: set[str] = set()
 
-                if tables:
-                    n_total = len(tables)
-                    n_done = 0
-                    active: set[str] = set()
+                        def _on_start(key: str) -> None:
+                            nonlocal active
+                            active.add(key)
+                            _active_str = ", ".join(sorted(active))
+                            progress.update(
+                                task,
+                                description=f"[{dbname}] Copying data… [{n_done}/{n_total}] → {_active_str}",
+                            )
 
-                    def _on_start(key: str) -> None:
-                        nonlocal active
-                        active.add(key)
-                        _active_str = ", ".join(sorted(active))
-                        progress.update(
-                            task,
-                            description=f"[{dbname}] Copying data… [{n_done}/{n_total}] → {_active_str}",
+                        def _on_done(key: str, rows: int) -> None:
+                            nonlocal n_done, active
+                            n_done += 1
+                            active.discard(key)
+                            if rows >= 0:
+                                console.print(f"    [{dbname}] ✓ {key} ({rows:,} rows)")
+                            else:
+                                console.print(f"    [{dbname}] ✗ {key} (failed)")
+                            _active_str = ", ".join(sorted(active)) if active else "…"
+                            progress.update(
+                                task,
+                                description=f"[{dbname}] Copying data… [{n_done}/{n_total}] → {_active_str}",
+                            )
+
+                        try:
+                            results = await copy_all_tables(
+                                cfg, dbname, tables, slot.snapshot_name,
+                                on_table_start=_on_start,
+                                on_table_done=_on_done,
+                            )
+                            # Cross-check row counts while the snapshot is still
+                            # valid: source counted under the EXACT snapshot the
+                            # copy used vs. what COPY reported landed on the
+                            # target.  Both sides are the same frozen point in
+                            # time, so any mismatch is a genuine copy bug, not a
+                            # race with concurrent writes.
+                            count_mismatches = await verify_copy_counts(
+                                cfg, dbname, tables, slot.snapshot_name, results,
+                            )
+                        finally:
+                            # The snapshot is only needed for the copy (and the
+                            # count check) above — release it (and the connection
+                            # holding it) as soon as both are done, success or
+                            # not.  This does NOT drop the slot itself.
+                            await slot.aclose()
+                        total_rows = sum(c for c in results.values() if c >= 0)
+                        result.rows_copied = total_rows
+                        result.tables_copied = len(results)
+                        console.print(
+                            f"  [{dbname}] Copied {total_rows:,} rows across {len(results)} tables"
                         )
 
-                    def _on_done(key: str, rows: int) -> None:
-                        nonlocal n_done, active
-                        n_done += 1
-                        active.discard(key)
-                        if rows >= 0:
-                            console.print(f"    [{dbname}] ✓ {key} ({rows:,} rows)")
-                        else:
-                            console.print(f"    [{dbname}] ✗ {key} (failed)")
-                        _active_str = ", ".join(sorted(active)) if active else "…"
-                        progress.update(
-                            task,
-                            description=f"[{dbname}] Copying data… [{n_done}/{n_total}] → {_active_str}",
-                        )
-
-                    try:
-                        results = await copy_all_tables(
-                            cfg, dbname, tables, slot.snapshot_name,
-                            on_table_start=_on_start,
-                            on_table_done=_on_done,
-                        )
-                        # Cross-check row counts while the snapshot is still
-                        # valid: source counted under the EXACT snapshot the
-                        # copy used vs. what COPY reported landed on the
-                        # target.  Both sides are the same frozen point in
-                        # time, so any mismatch is a genuine copy bug, not a
-                        # race with concurrent writes.
-                        count_mismatches = await verify_copy_counts(
-                            cfg, dbname, tables, slot.snapshot_name, results,
-                        )
-                    finally:
-                        # The snapshot is only needed for the copy (and the
-                        # count check) above — release it (and the connection
-                        # holding it) as soon as both are done, success or
-                        # not.  This does NOT drop the slot itself.
+                        # A failed table copy is fatal for this database: logical
+                        # replication only streams NEW changes and would never
+                        # backfill the missing rows.
+                        failed_tables = sorted(k for k, c in results.items() if c < 0)
+                        if failed_tables:
+                            raise _DatabaseBootstrapFailed(
+                                f"initial data copy FAILED for {len(failed_tables)} "
+                                f"table(s): {', '.join(failed_tables)}"
+                            )
+                        if count_mismatches:
+                            detail = ", ".join(
+                                f"{k} (source={s:,}, target={t:,})"
+                                for k, (s, t) in sorted(count_mismatches.items())
+                            )
+                            raise _DatabaseBootstrapFailed(
+                                f"row count MISMATCH after copy for "
+                                f"{len(count_mismatches)} table(s): {detail}"
+                            )
+                    else:
+                        console.print(f"  [{dbname}] No tables to copy")
                         await slot.aclose()
-                    total_rows = sum(c for c in results.values() if c >= 0)
-                    result.rows_copied = total_rows
-                    result.tables_copied = len(results)
-                    console.print(
-                        f"  [{dbname}] Copied {total_rows:,} rows across {len(results)} tables"
-                    )
 
-                    # A failed table copy is fatal for this database: logical
-                    # replication only streams NEW changes and would never
-                    # backfill the missing rows.
-                    failed_tables = sorted(k for k, c in results.items() if c < 0)
-                    if failed_tables:
-                        raise _DatabaseBootstrapFailed(
-                            f"initial data copy FAILED for {len(failed_tables)} "
-                            f"table(s): {', '.join(failed_tables)}"
+                    # Step 4b: create non-unique indexes after COPY (faster than during insert)
+                    progress.update(task, description=f"[{dbname}] Creating indexes…")
+                    await maybe_fail("index_create")
+                    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                        await sync_deferred_indexes(
+                            src, tgt, schemas, exclude_tables=cfg.exclude_tables
                         )
-                    if count_mismatches:
-                        detail = ", ".join(
-                            f"{k} (source={s:,}, target={t:,})"
-                            for k, (s, t) in sorted(count_mismatches.items())
+
+                    # Step 4c: FK constraints, functions, views, triggers — post-COPY
+                    # so that PostgreSQL validates referential integrity across the
+                    # fully-loaded dataset.  Triggers are created last, after the
+                    # final function pass, so they never fail on a not-yet-created
+                    # function.
+                    progress.update(task, description=f"[{dbname}] Applying constraints…")
+                    await maybe_fail("foreign_key")
+                    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                        obj_failures = await sync_post_copy_constraints(
+                            src, tgt, schemas, exclude_tables=cfg.exclude_tables
                         )
-                        raise _DatabaseBootstrapFailed(
-                            f"row count MISMATCH after copy for "
-                            f"{len(count_mismatches)} table(s): {detail}"
-                        )
-                else:
-                    console.print(f"  [{dbname}] No tables to copy")
-                    await slot.aclose()
-
-                # Step 4b: create non-unique indexes after COPY (faster than during insert)
-                progress.update(task, description=f"[{dbname}] Creating indexes…")
-                await maybe_fail("index_create")
-                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    await sync_deferred_indexes(
-                        src, tgt, schemas, exclude_tables=cfg.exclude_tables
-                    )
-
-                # Step 4c: FK constraints, functions, views, triggers — post-COPY
-                # so that PostgreSQL validates referential integrity across the
-                # fully-loaded dataset.  Triggers are created last, after the
-                # final function pass, so they never fail on a not-yet-created
-                # function.
-                progress.update(task, description=f"[{dbname}] Applying constraints…")
-                await maybe_fail("foreign_key")
-                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    obj_failures = await sync_post_copy_constraints(
-                        src, tgt, schemas, exclude_tables=cfg.exclude_tables
-                    )
-                obj_failures = {k: v for k, v in obj_failures.items() if v}
-                if obj_failures:
-                    # NOT a warning.  A missing foreign key, function, view,
-                    # trigger or RLS policy means the target is not the source,
-                    # and the failure shows up after cutover as an application
-                    # error rather than as anything a row count would catch.
-                    console.print(
-                        f"  [bold red]✗ [{dbname}] Some schema objects could NOT be created:[/bold red]"
-                    )
-                    for kind, entries in obj_failures.items():
-                        for entry in entries:
-                            console.print(f"    [red]✗ {kind} {entry}[/red]")
-                            result.incomplete(f"{kind} not created: {entry}")
-
-                # Step 4d: synchronize ownership (tables, sequences, views, functions, types, database)
-                progress.update(task, description=f"[{dbname}] Syncing ownership…")
-                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    await maybe_fail("ownership_sync")
-                    own_count = await sync_ownership(
-                        src, tgt, schemas, dbname=dbname,
-                        exclude_tables=cfg.exclude_tables,
-                    )
-                    if own_count:
-                        console.print(f"  [{dbname}] Applied {own_count} ownership change(s)")
-
-                # Step 4d-2: synchronize GRANTs (tables, sequences, schemas,
-                # functions, types, default privileges, database) — additive
-                # only, never revokes; see sync_privileges() docstring.
-                progress.update(task, description=f"[{dbname}] Syncing privileges…")
-                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    await maybe_fail("privilege_sync")
-                    priv_count = await sync_privileges(
-                        src, tgt, schemas, dbname=dbname,
-                        exclude_tables=cfg.exclude_tables,
-                    )
-                    if priv_count:
-                        console.print(f"  [{dbname}] Applied {priv_count} privilege grant(s)")
-
-                # Step 4d-3: per-database configuration (ALTER DATABASE … SET
-                # / ALTER ROLE … IN DATABASE … SET) — never carried by
-                # logical replication, and missing settings (a per-database
-                # search_path being the classic case) only surface after
-                # cutover as runtime misbehaviour.
-                progress.update(task, description=f"[{dbname}] Syncing database settings…")
-                async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
-                    set_count = await sync_db_settings(src, tgt, dbname)
-                    if set_count:
-                        console.print(f"  [{dbname}] Applied {set_count} per-database setting(s)")
-                # sync_db_settings copies the SOURCE's per-database settings, so a
-                # source that pins default_table_access_method (to plain 'heap',
-                # typically) has just overwritten the value set in step 2c.  The
-                # encrypted target's own storage default has to win.
-                if use_pg_tde:
-                    await set_database_default_access_method(cfg, dbname)
-
-                # Step 4e: final sequence value sync.  Identity-backed sequences
-                # are not pre-created (their tables create them), so their
-                # values can only be applied now — and every other sequence may
-                # have advanced on the source while the data was being copied.
-                progress.update(task, description=f"[{dbname}] Syncing sequence values…")
-                await maybe_fail("sequence_sync")
-                seq_report = await sync_sequences_once(cfg, dbname)
-                n_seq = sum(
-                    1 for r in seq_report if r["status"] in ("updated", "orphaned_fixed")
-                )
-                if n_seq:
-                    console.print(f"  [{dbname}] Advanced {n_seq} sequence value(s)")
-                # A sequence left behind on the target hands out already-used
-                # values the moment the application starts writing there, so an
-                # unsynchronised one is a duplicate-key outage waiting for the
-                # cutover — never a warning.
-                seq_bad = [
-                    r for r in seq_report
-                    if r["status"] in ("permission_denied", "missing_on_target",
-                                       "orphaned_unknown", "orphaned_error")
-                ]
-                for r in seq_bad:
-                    console.print(
-                        f"  [bold red]✗ [{dbname}] sequence {r['schema']}.{r['sequence']}: "
-                        f"{r['status']}[/bold red]"
-                    )
-                    result.incomplete(
-                        f"sequence {r['schema']}.{r['sequence']} not synchronised "
-                        f"({r['status']}) — duplicate-key risk at cutover"
-                    )
-
-                # Step 5: create the subscription, attached to the slot created
-                # in step 3d — NOT creating a new one (create_slot=False).
-                progress.update(task, description=f"[{dbname}] Setting up replication…")
-                await maybe_fail("subscription_create")
-                await create_subscription(cfg, dbname, create_slot=False)
-
-                # Step 6: built-in post-bootstrap verification — a full
-                # schema-drift scan, the same one 'detect-ddl' runs on demand,
-                # so any gap left by the migration is visible immediately
-                # rather than discovered later at cutover.  Report-only: never
-                # applies fixes automatically.
-                progress.update(task, description=f"[{dbname}] Verifying (detect-ddl)…")
-                drift_report = await detect_drift(cfg, dbname)
-                if drift_report.has_drift:
-                    console.print(
-                        f"  [bold red]✗ [{dbname}] Post-bootstrap drift check: "
-                        f"{drift_report.summary}[/bold red]"
-                    )
-                    result.incomplete(
-                        f"schema drift remains after bootstrap ({drift_report.summary}) "
-                        f"— run 'detect-ddl --database {dbname}' for the itemised report"
-                    )
-                else:
-                    console.print(f"  [{dbname}] Post-bootstrap drift check: clean")
-
-                # Step 6b: report-only encryption check.  Report-only because
-                # converting here would rewrite fully-loaded tables at the worst
-                # possible moment — a migration that asked for encryption and
-                # did not fully get it has to say so, not quietly paper over it.
-                if use_pg_tde:
-                    progress.update(task, description=f"[{dbname}] Verifying encryption…")
-                    unencrypted = await verify_encrypted(cfg, dbname, schemas)
-                    if unencrypted:
+                    obj_failures = {k: v for k, v in obj_failures.items() if v}
+                    if obj_failures:
+                        # NOT a warning.  A missing foreign key, function, view,
+                        # trigger or RLS policy means the target is not the source,
+                        # and the failure shows up after cutover as an application
+                        # error rather than as anything a row count would catch.
                         console.print(
-                            f"  [bold red]✗ [{dbname}] {len(unencrypted)} relation(s) "
-                            f"are NOT stored as {TDE_ACCESS_METHOD}[/bold red]"
+                            f"  [bold red]✗ [{dbname}] Some schema objects could NOT be created:[/bold red]"
+                        )
+                        for kind, entries in obj_failures.items():
+                            for entry in entries:
+                                console.print(f"    [red]✗ {kind} {entry}[/red]")
+                                result.incomplete(f"{kind} not created: {entry}")
+
+                    # Step 4d: synchronize ownership (tables, sequences, views, functions, types, database)
+                    progress.update(task, description=f"[{dbname}] Syncing ownership…")
+                    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                        await maybe_fail("ownership_sync")
+                        own_count = await sync_ownership(
+                            src, tgt, schemas, dbname=dbname,
+                            exclude_tables=cfg.exclude_tables,
+                        )
+                        if own_count:
+                            console.print(f"  [{dbname}] Applied {own_count} ownership change(s)")
+
+                    # Step 4d-2: synchronize GRANTs (tables, sequences, schemas,
+                    # functions, types, default privileges, database) — additive
+                    # only, never revokes; see sync_privileges() docstring.
+                    progress.update(task, description=f"[{dbname}] Syncing privileges…")
+                    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                        await maybe_fail("privilege_sync")
+                        priv_count = await sync_privileges(
+                            src, tgt, schemas, dbname=dbname,
+                            exclude_tables=cfg.exclude_tables,
+                        )
+                        if priv_count:
+                            console.print(f"  [{dbname}] Applied {priv_count} privilege grant(s)")
+
+                    # Step 4d-3: per-database configuration (ALTER DATABASE … SET
+                    # / ALTER ROLE … IN DATABASE … SET) — never carried by
+                    # logical replication, and missing settings (a per-database
+                    # search_path being the classic case) only surface after
+                    # cutover as runtime misbehaviour.
+                    progress.update(task, description=f"[{dbname}] Syncing database settings…")
+                    async with connect(cfg.source, dbname) as src, connect(cfg.target, dbname) as tgt:
+                        set_count = await sync_db_settings(src, tgt, dbname)
+                        if set_count:
+                            console.print(f"  [{dbname}] Applied {set_count} per-database setting(s)")
+                    # sync_db_settings copies the SOURCE's per-database settings, so a
+                    # source that pins default_table_access_method (to plain 'heap',
+                    # typically) has just overwritten the value set in step 2c.  The
+                    # encrypted target's own storage default has to win.
+                    if use_pg_tde:
+                        await set_database_default_access_method(cfg, dbname)
+
+                    # Step 4e: final sequence value sync.  Identity-backed sequences
+                    # are not pre-created (their tables create them), so their
+                    # values can only be applied now — and every other sequence may
+                    # have advanced on the source while the data was being copied.
+                    progress.update(task, description=f"[{dbname}] Syncing sequence values…")
+                    await maybe_fail("sequence_sync")
+                    seq_report = await sync_sequences_once(cfg, dbname)
+                    n_seq = sum(
+                        1 for r in seq_report if r["status"] in ("updated", "orphaned_fixed")
+                    )
+                    if n_seq:
+                        console.print(f"  [{dbname}] Advanced {n_seq} sequence value(s)")
+                    # A sequence left behind on the target hands out already-used
+                    # values the moment the application starts writing there, so an
+                    # unsynchronised one is a duplicate-key outage waiting for the
+                    # cutover — never a warning.
+                    seq_bad = [
+                        r for r in seq_report
+                        if r["status"] in ("permission_denied", "missing_on_target",
+                                           "orphaned_unknown", "orphaned_error")
+                    ]
+                    for r in seq_bad:
+                        console.print(
+                            f"  [bold red]✗ [{dbname}] sequence {r['schema']}.{r['sequence']}: "
+                            f"{r['status']}[/bold red]"
                         )
                         result.incomplete(
-                            f"{len(unencrypted)} relation(s) are readable on disk "
-                            f"without the pg_tde key despite --using-pg-tde: "
-                            + ", ".join(unencrypted)
-                        )
-                    else:
-                        console.print(
-                            f"  [{dbname}] Encryption check: all relations use "
-                            f"{TDE_ACCESS_METHOD}"
+                            f"sequence {r['schema']}.{r['sequence']} not synchronised "
+                            f"({r['status']}) — duplicate-key risk at cutover"
                         )
 
-                progress.update(task, description=f"[{dbname}] ✓ Done")
+                    # Step 5: create the subscription, attached to the slot created
+                    # in step 3d — NOT creating a new one (create_slot=False).
+                    progress.update(task, description=f"[{dbname}] Setting up replication…")
+                    await maybe_fail("subscription_create")
+                    await create_subscription(cfg, dbname, create_slot=False)
+
+                    # Step 6: built-in post-bootstrap verification — a full
+                    # schema-drift scan, the same one 'detect-ddl' runs on demand,
+                    # so any gap left by the migration is visible immediately
+                    # rather than discovered later at cutover.  Report-only: never
+                    # applies fixes automatically.
+                    progress.update(task, description=f"[{dbname}] Verifying (detect-ddl)…")
+                    drift_report = await detect_drift(cfg, dbname)
+                    if drift_report.has_drift:
+                        console.print(
+                            f"  [bold red]✗ [{dbname}] Post-bootstrap drift check: "
+                            f"{drift_report.summary}[/bold red]"
+                        )
+                        result.incomplete(
+                            f"schema drift remains after bootstrap ({drift_report.summary}) "
+                            f"— run 'detect-ddl --database {dbname}' for the itemised report"
+                        )
+                    else:
+                        console.print(f"  [{dbname}] Post-bootstrap drift check: clean")
+
+                    # Step 6b: report-only encryption check.  Report-only because
+                    # converting here would rewrite fully-loaded tables at the worst
+                    # possible moment — a migration that asked for encryption and
+                    # did not fully get it has to say so, not quietly paper over it.
+                    if use_pg_tde:
+                        progress.update(task, description=f"[{dbname}] Verifying encryption…")
+                        unencrypted = await verify_encrypted(cfg, dbname, schemas)
+                        if unencrypted:
+                            console.print(
+                                f"  [bold red]✗ [{dbname}] {len(unencrypted)} relation(s) "
+                                f"are NOT stored as {TDE_ACCESS_METHOD}[/bold red]"
+                            )
+                            result.incomplete(
+                                f"{len(unencrypted)} relation(s) are readable on disk "
+                                f"without the pg_tde key despite --using-pg-tde: "
+                                + ", ".join(unencrypted)
+                            )
+                        else:
+                            console.print(
+                                f"  [{dbname}] Encryption check: all relations use "
+                                f"{TDE_ACCESS_METHOD}"
+                            )
+
+                    progress.update(task, description=f"[{dbname}] ✓ Done")
 
             except BaseException as exc:
                 # BaseException, not Exception: Ctrl-C (KeyboardInterrupt) and
@@ -660,17 +708,39 @@ async def bootstrap(
                             IncompatibleTargetColumns,
                             UnsafeTruncate,
                             SlotInUse,
+                            ExcludedTableIsReferenced,
+                            ConcurrentMigration,
                         ))
                         else repr(exc)
                     )
-                    console.print(
-                        f"  [bold red]✗ [{dbname}] Bootstrap FAILED: {reason}[/bold red]"
-                    )
-                    console.print(
-                        f"  [bold red]  Cleaning up and aborting {dbname} before replication "
-                        f"setup — fix the cause and re-run bootstrap for this database.[/bold red]"
-                    )
+                    if isinstance(exc, _REFUSALS):
+                        console.print(
+                            f"  [bold red]✗ [{dbname}] Bootstrap REFUSED: {reason}[/bold red]"
+                        )
+                        console.print(
+                            f"  [bold red]  Nothing in {dbname} was copied or cleared. "
+                            f"Re-running unchanged will refuse again — resolve the "
+                            f"condition above first.[/bold red]"
+                        )
+                    else:
+                        console.print(
+                            f"  [bold red]✗ [{dbname}] Bootstrap FAILED: {reason}[/bold red]"
+                        )
+                        console.print(
+                            f"  [bold red]  Cleaning up and aborting {dbname} before replication "
+                            f"setup — fix the cause and re-run bootstrap for this database.[/bold red]"
+                        )
                 log.error("Bootstrap failed for %s: %s", dbname, reason)
+
+                if isinstance(exc, ConcurrentMigration):
+                    # Deliberately no rollback.  The slot and publication that
+                    # exist belong to the run that holds the lock; the cleanup
+                    # below drops an inactive slot by name, which is right for
+                    # this run's own debris and catastrophic for someone
+                    # else's.  Nothing was created here, so there is nothing to
+                    # undo.
+                    result.refuse(reason)
+                    continue
 
                 try:
                     # Bounded: an unreachable source must not turn an interrupt
@@ -692,7 +762,10 @@ async def bootstrap(
                         dbname, cleanup_exc, sub_name(cfg, dbname), dbname,
                     )
 
-                result.fail(reason)
+                if not interrupted and isinstance(exc, _REFUSALS):
+                    result.refuse(reason)
+                else:
+                    result.fail(reason)
                 if interrupted:
                     # The operator asked for this to stop, so stop — but only
                     # after the rollback above, and with the report intact so
@@ -790,8 +863,10 @@ def _print_summary(report: BootstrapReport) -> None:
     incomplete = report.by_outcome(Outcome.INCOMPLETE)
 
     for group, title, advice in (
-        (refused, "REFUSED — nothing was changed",
-         "Resolve the condition above and re-run bootstrap for these databases."),
+        (refused, "REFUSED — no data was copied or cleared",
+         "Re-running unchanged will refuse again. Resolve the condition above "
+         "first; any replication objects this run had created on the source "
+         "were rolled back."),
         (failed, "FAILED — replication was NOT configured",
          "The replication objects this run created on the source were rolled "
          "back. Fix the cause and re-run bootstrap for these databases."),

@@ -49,6 +49,16 @@ async def connect(
     * ``statement_timeout = 0`` / ``idle_in_transaction_session_timeout = 0``
       — a per-database timeout on the source would otherwise kill a long
       COPY read or the snapshot-holder transaction mid-bootstrap.
+    * ``standard_conforming_strings = on`` — every SQL literal this tool
+      builds is escaped by ``utils.ql()``, which doubles single quotes and
+      does nothing to backslashes because that is the correct escaping under
+      this setting.  It has been the default since PostgreSQL 9.1, but it is
+      a *setting*: a legacy application that carries ``ALTER DATABASE … SET
+      standard_conforming_strings = off`` turns backslashes back into escape
+      characters, and every literal built from source data — an enum label, a
+      view definition, a sequence name — would then be interpreted
+      differently from how it was quoted.  Pinning it makes the escaping
+      assumption true rather than merely usual.  (pg_dump does the same.)
     """
     dsn = _dsn(cfg, dbname)
     conn = await asyncpg.connect(dsn)
@@ -57,6 +67,7 @@ async def connect(
             "SELECT pg_catalog.set_config('search_path', '', false);"
             "SET statement_timeout = 0;"
             "SET idle_in_transaction_session_timeout = 0;"
+            "SET standard_conforming_strings = on;"
         )
         yield conn
     finally:

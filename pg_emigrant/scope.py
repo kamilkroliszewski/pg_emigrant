@@ -80,7 +80,27 @@ def filter_pairs(
 
 
 class ExcludedTableIsReferenced(Exception):
-    """A migrated table has a foreign key to an excluded table."""
+    """A migrated table has a foreign key to an excluded table.
+
+    Raised on the mutating path (bootstrap), not only reported by the
+    read-only preflight: preflight is skippable with ``--skip-preflight`` and
+    is a CLI step the library entry points and the web GUI never run, and this
+    is a condition no later stage can repair.  The target's foreign key can
+    never be satisfied against a table whose rows are deliberately not copied,
+    so the choice is between refusing before anything is cleared and producing
+    a target whose constraint silently does not exist.
+    """
+
+    @classmethod
+    def aggregate(cls, dbname: str, problems: list[str]) -> "ExcludedTableIsReferenced":
+        return cls(
+            f"exclude_tables leaves out {len(problems)} table(s) that a migrated "
+            f"table references by foreign key, so the target could never hold "
+            f"the constraint: " + "; ".join(problems) + f". Nothing in {dbname} "
+            f"was cleared or copied. Either drop those tables from "
+            f"'exclude_tables' (they are part of the same data set), or exclude "
+            f"the referencing table(s) as well."
+        )
 
 
 async def resolve_excluded(

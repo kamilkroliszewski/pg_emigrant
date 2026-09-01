@@ -99,7 +99,13 @@ SELECT
     i.relname               AS index_name,
     pg_get_indexdef(i.oid)  AS index_def,
     ix.indisprimary         AS is_primary,
-    ix.indisunique          AS is_unique
+    ix.indisunique          AS is_unique,
+    -- An index PostgreSQL created to back a PRIMARY KEY, UNIQUE or EXCLUDE
+    -- constraint.  Creating the constraint creates the index, under the same
+    -- name, so anything emitting both statements collides with itself.
+    EXISTS (
+        SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid
+    )                       AS backs_constraint
 FROM pg_index ix
 JOIN pg_class i ON i.oid = ix.indexrelid
 WHERE ix.indrelid = $1::regclass
@@ -668,24 +674,121 @@ async def _generate_constraint_ddl(
 async def _generate_index_ddl(
     conn: asyncpg.Connection, schema: str, table: str
 ) -> list[str]:
-    """Return CREATE INDEX statements (excluding primary-key indexes)."""
+    """Return CREATE INDEX statements for indexes nothing else creates.
+
+    Indexes that back a constraint are excluded, not only the primary key's.
+    ``_generate_constraint_ddl`` already emits ``ADD CONSTRAINT … UNIQUE (…)``
+    for those, and PostgreSQL builds the index as part of that statement, under
+    the same name — so following it with the index's own ``CREATE UNIQUE
+    INDEX`` fails with ``relation "…" already exists``.
+
+    That matters because the whole block generated here is applied as one
+    statement: the collision rolled back the ``CREATE TABLE`` alongside it, so
+    a table carrying any UNIQUE (or EXCLUDE) constraint could not be created on
+    the target at all by ``detect-ddl --apply`` or by the automatic pickup of
+    tables created after bootstrap.  The live schema-sync path never saw it —
+    it creates constraints first and then skips index names that already
+    exist — which is exactly why it survived to here.
+    """
     fqn = f"{qi(schema)}.{qi(table)}"
     indexes = await get_indexes(conn, fqn)
     return [
         idx["index_def"] + ";"
         for idx in indexes
-        if not idx["is_primary"]
+        if not idx["is_primary"] and not idx["backs_constraint"]
     ]
+
+
+_OWNED_SERIAL_SEQUENCES_SQL = """
+SELECT n.nspname AS schema_name, c.relname AS sequence_name, a.attname AS column_name
+FROM pg_depend d
+JOIN pg_class c ON c.oid = d.objid AND c.relkind = 'S'
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+WHERE d.classid = 'pg_class'::regclass
+  AND d.refclassid = 'pg_class'::regclass
+  -- 'a' (auto) is the serial-style link, where the column carries an explicit
+  -- DEFAULT nextval('<seq>').  'i' (internal) is an identity column's own
+  -- sequence, which CREATE TABLE ... GENERATED AS IDENTITY creates by itself
+  -- and which must NOT be pre-created: PostgreSQL would then attach a phantom
+  -- '<name>_seq1' to the column instead.
+  AND d.deptype = 'a'
+  AND d.refobjid = (quote_ident($1) || '.' || quote_ident($2))::regclass
+ORDER BY 1, 2;
+"""
+
+
+async def _generate_owned_sequence_ddl(
+    conn: asyncpg.Connection, schema: str, table: str
+) -> tuple[list[str], list[str]]:
+    """DDL for the ``serial``-style sequences *table*'s own defaults depend on.
+
+    Returned as ``(before, after)``: the ``CREATE SEQUENCE`` statements have to
+    run before the ``CREATE TABLE`` (whose column default is
+    ``nextval('<seq>')`` and fails outright if the sequence does not exist),
+    and the ``OWNED BY`` links after it (they name a column that does not exist
+    until the table does).
+
+    Without this, a table created on the source *after* bootstrap with a
+    ``serial``/``bigserial`` column — the single most common shape a
+    PostgreSQL table has — could never be created on the target: both the
+    automatic pickup in ``sync_new_tables`` and ``detect-ddl --apply`` emitted
+    a CREATE TABLE referencing a sequence nothing had made, failed with
+    ``relation "…_id_seq" does not exist``, and retried forever.  The table
+    stayed missing on the target and its rows were never replicated.
+
+    The ``OWNED BY`` link is not cosmetic: it is what makes the sequence
+    disappear with its table, keeps it out of scope when the table is excluded,
+    and stops sequence-sync reporting it as an orphan of unknown provenance.
+    """
+    rows = await conn.fetch(_OWNED_SERIAL_SEQUENCES_SQL, schema, table)
+    before: list[str] = []
+    after: list[str] = []
+    for row in rows:
+        seq_schema, seq_name = row["schema_name"], row["sequence_name"]
+        fqn = qt(seq_schema, seq_name)
+        meta = await conn.fetchrow(
+            "SELECT * FROM pg_sequences WHERE schemaname = $1 AND sequencename = $2",
+            seq_schema, seq_name,
+        )
+        if meta is None:  # unreadable (privileges) — the table DDL will say so
+            log.warning(
+                "Cannot read sequence %s that %s.%s depends on; the generated "
+                "DDL will not create it",
+                fqn, schema, table,
+            )
+            continue
+        before.append(
+            f"CREATE SEQUENCE IF NOT EXISTS {fqn}"
+            f" AS {meta['data_type']}"
+            f" INCREMENT BY {meta['increment_by']}"
+            f" MINVALUE {meta['min_value']}"
+            f" MAXVALUE {meta['max_value']}"
+            f" START WITH {meta['start_value']}"
+            f" CACHE {meta['cache_size']}"
+            f"{' CYCLE' if meta['cycle'] else ' NO CYCLE'};"
+        )
+        after.append(
+            f"ALTER SEQUENCE {fqn} OWNED BY "
+            f"{qt(schema, table)}.{qi(row['column_name'])};"
+        )
+    return before, after
 
 
 async def generate_full_table_ddl(
     conn: asyncpg.Connection, schema: str, table: str
 ) -> str:
     """Generate complete DDL to recreate a table: CREATE TABLE + constraints + indexes."""
-    parts = [await _generate_create_table_ddl(conn, schema, table)]
+    part = await _get_partition_info(conn, schema, table)
+    # A partition child's serial defaults come from the parent it is attached
+    # to, so it never owns a sequence of its own to pre-create.
+    seq_before, seq_after = (
+        ([], []) if part.get("is_partition")
+        else await _generate_owned_sequence_ddl(conn, schema, table)
+    )
+    parts = [*seq_before, await _generate_create_table_ddl(conn, schema, table), *seq_after]
     # Partition children inherit columns, constraints, PK and indexes from the
     # parent — emitting them again would fail with duplicate-object errors.
-    part = await _get_partition_info(conn, schema, table)
     if not part.get("is_partition"):
         parts.extend(await _generate_constraint_ddl(conn, schema, table))
         parts.extend(await _generate_index_ddl(conn, schema, table))

@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import pytest
 
+from pg_emigrant import exits
 from pg_emigrant.bootstrap import bootstrap
 from pg_emigrant.db import connect
 from pg_emigrant.ddl_detector import detect_drift
 from pg_emigrant.preflight import ERROR, run_preflight
-from pg_emigrant.report import BootstrapIncomplete
-from tests.helpers.replication import wait_for_catchup
+from pg_emigrant.report import BootstrapIncomplete, Outcome
+from tests.helpers.replication import all_slots, wait_for_catchup
 from tests.helpers.verify import assert_tables_identical
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
@@ -110,6 +111,66 @@ async def test_excluding_a_referenced_table_is_refused(cfg, source_db):
     # constraint either.
     with pytest.raises(BootstrapIncomplete):
         await bootstrap(cfg, database=source_db)
+
+
+async def test_the_exclusion_refusal_happens_before_the_target_is_touched(
+    cfg, source_db, target_pg
+):
+    """Preflight is skippable; this condition is not survivable, so the
+    refusal has to live on the mutating path too.
+
+    ``--skip-preflight`` exists, the web GUI never runs preflight, and neither
+    does a library caller — so relying on the read-only check alone means the
+    run proceeds, clears the target's tables, reloads them, and only then fails
+    to create a foreign key against a table it was told never to copy.  The
+    outcome would be ``incomplete``: replicating, exit 4, and an operator told
+    to "fix it and re-run" for a condition that no re-run can fix.
+
+    Here the target is pre-populated with a row that a truncate would destroy,
+    so the assertion is about *when* the refusal happens, not just that it does.
+    """
+    target_pg.psql(f'CREATE DATABASE "{source_db}"')
+    target_pg.psql("CREATE SCHEMA app", dbname=source_db)
+    target_pg.psql(
+        "CREATE TABLE app.orders (id integer PRIMARY KEY, customer_id bigint,"
+        " total_cents bigint, note text, placed_at timestamptz)",
+        dbname=source_db,
+    )
+    target_pg.psql(
+        "INSERT INTO app.orders VALUES (1, 1, 1, 'do not clear me', now())",
+        dbname=source_db,
+    )
+
+    cfg.exclude_tables = ["app.customers"]
+    with pytest.raises(BootstrapIncomplete) as excinfo:
+        await bootstrap(cfg, database=source_db)
+
+    result = excinfo.value.report.databases[0]
+    assert result.outcome is Outcome.REFUSED, (
+        f"an unsatisfiable exclusion reported {result.outcome.value!r} — a "
+        f"runbook that retries on 'failed' would retry this forever"
+    )
+    assert excinfo.value.report.exit_code == exits.UNSAFE_REFUSED
+    problems = " ".join(result.problems)
+    assert "app.orders" in problems and "app.customers" in problems, problems
+
+    async with connect(cfg.target, source_db) as tgt:
+        assert await tgt.fetchval("SELECT count(*) FROM app.orders") == 1, (
+            "the refusal came after the target had already been cleared"
+        )
+
+
+async def test_no_replication_object_survives_the_exclusion_refusal(cfg, source_db):
+    """A refusal must not leave a slot retaining WAL on the source."""
+    cfg.exclude_tables = ["app.customers"]
+    with pytest.raises(BootstrapIncomplete):
+        await bootstrap(cfg, database=source_db)
+
+    assert await all_slots(cfg) == [], (
+        "the refused run left a replication slot on the production source"
+    )
+    async with connect(cfg.source, source_db) as src:
+        assert await src.fetchval("SELECT count(*) FROM pg_publication") == 0
 
 
 async def test_glob_patterns_and_bare_names(cfg, source_db):

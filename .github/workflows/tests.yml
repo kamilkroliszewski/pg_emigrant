@@ -15,7 +15,9 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -e ".[web,test]"
-      - run: pytest tests/unit -q
+      # -rs: a skipped test must say why. A suite that silently skips is a
+      # suite that reports green for coverage it no longer has.
+      - run: pytest tests/unit -q -rs
 
   integration:
     # The PostgreSQL version matrix. Each pair is a separate job so that a
@@ -51,7 +53,7 @@ jobs:
           # Generated per run: nothing in this repository is a credential, and
           # the containers live for the length of one job.
           PG_EMIGRANT_TEST_PG_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-pgem
-        run: pytest tests/integration -q --pg-matrix "${{ matrix.pair }}"
+        run: pytest tests/integration -q -rs --pg-matrix "${{ matrix.pair }}"
 
       - name: Leave no containers behind
         if: always()

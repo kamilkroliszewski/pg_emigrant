@@ -264,7 +264,9 @@ subscriber would reject it.
 ## Requirements
 
 - **Python 3.11+**
-- **PostgreSQL 13+ source, 15+ recommended; any supported version as target.**
+- **PostgreSQL 13+ source, 15+ recommended; PostgreSQL 17 or 18 as target.**
+  (Those are the targets the matrix below actually covers — nothing exercises
+  an older one.)
   On a 15+ source the publication uses `CREATE PUBLICATION … FOR TABLES IN
   SCHEMA`, which automatically includes tables created later in an
   already-published schema. On a 13/14 source that syntax doesn't exist, so
@@ -291,6 +293,11 @@ subscriber would reject it.
 
   PostgreSQL 13 sources are handled by the same `< 15` publication code path as
   14 but are **not** covered by the suite; treat 14 as the oldest tested source.
+  Take that seriously rather than as boilerplate: four separate bugs in that
+  `< 15` path — one of which crashed `sync-sequences` outright, and one of
+  which silently left a table on the target permanently empty — were found and
+  fixed only once the suite started exercising it. See
+  [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md#bugs-found-and-fixed).
   See [Testing](#testing) to run the matrix yourself.
 - A migration role on each server with sufficient privileges:
   - **Source:** `REPLICATION` privilege — required for two things: creating the
@@ -530,8 +537,12 @@ Two things to know before using it:
   purpose is to leave data behind).
 - **Excluding a referenced table is refused.** If a migrated table has a foreign
   key to an excluded one, the target's constraint could never be satisfied, so
-  `preflight` fails and `bootstrap` refuses. Exclude the referencing tables too,
-  or don't exclude that table.
+  `preflight` fails and `bootstrap` refuses — *before* any target table is
+  created or cleared, and with outcome `refused` (exit 7), not `failed`. The
+  refusal is enforced on the migration path itself, not only in the read-only
+  preflight, because preflight is skippable with `--skip-preflight` and is
+  never run at all by the library entry points or the web GUI. Exclude the
+  referencing tables too, or don't exclude that table.
 
 On PostgreSQL 15+, any exclusion within a schema forces the publication into the
 enumerated `FOR TABLE` form, because `FOR TABLES IN SCHEMA` cannot leave one
@@ -672,7 +683,7 @@ Sections:
 
 | Section | Source of data | Shows |
 |---|---|---|
-| **Health** | slot + apply worker, together | the state (`HEALTHY` / `LAGGING` / `CRITICAL` / `BROKEN` / `ABSENT`), unapplied-WAL lag, **WAL retained by the slot on the source**, `wal_status`, apply-error count, and a plain-language reason for anything but `HEALTHY` |
+| **Health** | slot + apply worker + **per-table state**, together | the state (`HEALTHY` / `LAGGING` / `CRITICAL` / `BROKEN` / `ABSENT`), unapplied-WAL lag, **WAL retained by the slot on the source**, `wal_status`, apply- and sync-error counts, **which tables are not streaming yet and which are not in the subscription at all**, and a plain-language reason for anything but `HEALTHY` |
 | **Subscription** | `pg_stat_subscription` (target) | subscription name, worker PID, received/latest-end LSN, last-message timestamps |
 | **Slots** | `pg_replication_slots` (source) | slot name/type, active flag, active PID, restart LSN, confirmed-flush LSN, `wal_status` — warns loudly if no slot exists |
 | **Lag** | `pg_stat_replication` (source) | application, state, sent LSN, write/flush/replay lag |
@@ -698,6 +709,21 @@ limit output (handy across many databases):
 > obvious candidate — tracks what the *sender* last reported, and keepalives
 > advance it regardless of what the apply worker has actually done, so a lag
 > computed from it reads as zero on a badly behind subscription.
+>
+> Health also reads `pg_subscription_rel`, because a subscription is not one
+> stream: it is a shared apply worker plus one state machine per table, and the
+> two fail independently. A table whose initial sync (`tablesync`) never
+> completes is never handed over to the apply worker, so **none of its rows are
+> on the target** — while the slot, the apply worker and the lag all stay
+> genuinely perfect, since none of them is what is broken. Tables that are not
+> yet `r` (ready) with sync errors recorded against them are `BROKEN`; without
+> errors they are `LAGGING`, because a table mid-sync really is behind.
+>
+> And it compares the migration's in-scope source tables against what the
+> subscription actually tracks, which catches the case one step earlier: a
+> table that exists on both servers but is in no publication is replicated by
+> nothing, is in an error state on neither server, and `detect-ddl` reports
+> nothing precisely because it *does* exist on both sides.
 
 ```bash
 pg_emigrant status
@@ -728,7 +754,12 @@ pg_emigrant sync-sequences --database myapp --loop
 pg_emigrant sync-sequences --database myapp --margin 1000  # final cutover sync
 ```
 
-- **One-pass mode** prints a results table (rich/simple/json) and exits.
+- **One-pass mode** reconciles tables created since bootstrap, prints a results
+  table (rich/simple/json) and exits. The two jobs are independent: a table that
+  cannot be brought into replication is reported and makes the command exit
+  **4**, but it never stops the sequence sync — that is the half with a cutover
+  deadline, and a target whose sequences were not advanced hands out already-used
+  values on the first insert after cutover.
 - **`--loop`** runs `sync_sequences_once` **and** `sync_new_tables` for every
   database concurrently, each on its own `sequence_sync_interval` cycle,
   forever (recommended during a live migration). Errors are logged and the
@@ -899,6 +930,7 @@ Checks, per database:
 | `target_writable` | the target database is reachable and not a read-only standby |
 | `replication_healthy` | the state is `HEALTHY` — slot present and reserved, subscription enabled, apply worker running, publication present |
 | `replication_caught_up` | unapplied WAL is within `--max-lag-bytes` (default 8 MiB) |
+| `all_tables_streaming` | **every** published table has reached `srsubstate = 'r'` on the subscription — see below |
 | `sequences_synchronised` | no sequence is behind the source, missing on the target, or unreadable |
 | `no_schema_drift` | `detect-ddl` finds nothing (or `--accept-drift` was passed) |
 | `wal_retention` | the slot's WAL is `reserved`, and not close to `max_slot_wal_keep_size` |
@@ -906,6 +938,18 @@ Checks, per database:
 Every check defaults to **not ready**. A check that cannot be evaluated — an
 unreachable target, an unreadable catalog — counts *against* readiness, because
 a green light based on missing evidence is worse than a red one.
+
+`all_tables_streaming` exists because lag is a property of the subscription and
+being *in* the stream is a property of each table separately. A subscription is
+one apply worker plus one state machine per table, and they fail
+independently: a table whose initial sync never completed is skipped by the
+apply worker entirely, so its rows are simply absent from the target while the
+slot, the apply worker and the lag figure all read as perfectly healthy. The
+check also covers the case one step earlier: a table that exists on both
+servers but is in **no publication** is replicated by nothing, is in an error
+state on neither server, and is invisible to `detect-ddl` precisely because it
+*does* exist on both sides. Those are the two shapes of silent divergence a
+lag-based check cannot see.
 
 It changes nothing: it will not stop the application, disable the subscription,
 or move any traffic.
@@ -944,6 +988,10 @@ The rule the whole tool is built around: **if pg_emigrant cannot prove that
 source and target are consistent, it fails closed.** Concretely, and each of
 these is covered by an integration test against real PostgreSQL clusters:
 
+> For the full audit — every guarantee against the test that backs it, the
+> scenarios that are explicitly *not* supported, and the risks that remain —
+> see **[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md)**.
+
 **It will not report success on an incomplete migration.**
 Every database ends in exactly one terminal state, and the run reports the worst
 of them:
@@ -953,7 +1001,17 @@ of them:
 | `success` | copied, replicating, nothing outstanding | 0 |
 | `incomplete` | copied and replicating, but something the migration was asked to reproduce is missing (a view, a trigger, an FK, a sequence, residual drift) | 4 |
 | `failed` | aborted before replication; the slot and publication this run created on the source were rolled back | 4 |
-| `refused` | refused up front because proceeding would be unsafe | 7 |
+| `refused` | refused because proceeding would be unsafe, decided before the target's data was touched | 7 |
+
+`failed` and `refused` call for opposite responses, which is the whole reason
+they are different codes: `failed` means "fix the cause and re-run", `refused`
+means "re-running this unchanged will refuse again". A database is `refused`
+when it is already replicating (run `teardown` first), when a target column's
+type differs, when clearing the target would cascade into data outside the
+migration, when the named replication slot is in use by something else, when
+another `pg_emigrant` run is already migrating that database, and when
+`exclude_tables` leaves out a table an in-scope table references by
+foreign key.
 
 `incomplete` deliberately **leaves the subscription running** — the data is
 intact and tearing it down would force a needless full re-copy — but it is not
@@ -980,6 +1038,16 @@ cleared. CSV `COPY` will happily load a `bigint` into a `text` column, so
 without this the run would report success while the target quietly stopped
 being the same data.
 
+**It will not let two runs destroy each other.** Each database's bootstrap
+holds a session advisory lock on the source, keyed by its slot name, for the
+whole run. Without it, a second `bootstrap` started while the first was in its
+post-copy phase — minutes, during which the first run's slot exists but is
+*inactive* — would treat that slot as an orphan, replace it at a later LSN,
+and TRUNCATE the target, while the first run went on to replicate from a point
+after its own copy snapshot and exit 0. Server state alone cannot tell a live
+run apart from a killed one's debris; the lock can, and it dies with the
+process that holds it, so a SIGKILLed run stays recoverable.
+
 **It will not take over another migration's replication objects.** Slots are
 cluster-wide and named from the configuration, so two migrations that were
 never told about each other can collide on one. A slot that is **active** —
@@ -991,6 +1059,14 @@ for a publication this run did not create: a failed run rolls back only its own
 work. Reclaiming an *inactive* orphan — what an interrupted run leaves behind —
 still happens automatically. `teardown` is the explicit way to remove a live
 one.
+
+**It will not call a database healthy while one of its tables is not being
+replicated.** A subscription is one apply worker plus one state machine per
+table. A table whose initial sync never completes is skipped by the apply
+worker entirely — none of its rows reach the target — while the slot, the
+apply worker and the lag figure stay genuinely perfect, because none of them
+is what is broken. Health reads `pg_subscription_rel` alongside them, and
+`cutover-check` blocks outright on any table that has not reached `r` (ready).
 
 **It will not claim replication was repaired when it was not.** If the
 replication slot is gone or its WAL was recycled, everything committed since
@@ -1060,10 +1136,10 @@ failure is unaffected.
 | `1` | Generic failure with no more specific code. |
 | `2` | Configuration error — the config file is missing, invalid, or sets a removed option. Nothing was attempted. |
 | `3` | Preflight failed. Nothing was modified. |
-| `4` | Migration failed or finished incomplete, or a `detect-ddl --apply` fix failed. The target is not fit to cut over to. |
+| `4` | Migration failed or finished incomplete; a `detect-ddl --apply` fix failed; or `sync-sequences` could not bring a table created since bootstrap into replication. The target is not fit to cut over to. |
 | `5` | Replication unhealthy — also `cutover-check`'s "do not cut over". |
 | `6` | Recovery impossible — `reinit-sync` refused because streaming cannot close the gap. **Do not retry**; re-copy instead. |
-| `7` | Unsafe operation refused up front (e.g. source and target are the same cluster). |
+| `7` | Unsafe operation refused up front, and re-running it unchanged will refuse again (source and target are the same cluster, a database already replicating, a target column type that cannot hold the source's, a truncate that would cascade outside the migration, a slot in use, another `pg_emigrant` run already migrating that database, an `exclude_tables` entry a foreign key depends on). |
 
 ---
 
@@ -1112,7 +1188,7 @@ Options: `-c/--config` (config file), `--host` (default `127.0.0.1`),
 
 | Page | What it does |
 |---|---|
-| **Dashboard** (`/`) | Fleet summary tiles (total / healthy / warning / error) above a grid of auto-refreshing cards, one per discovered database, each with a health pill (ok / warning / error) computed from subscription, slot activity, lag, table counts and drift, and a colored strip along the top matching that health. Quick `bootstrap` / `start` / `stop` / `sync-sequences` buttons per card — `bootstrap` requires the same type-the-database-name confirmation as the detail page and streams its progress into the same floating job panel. |
+| **Dashboard** (`/`) | Fleet summary tiles (total / healthy / warning / error) above a grid of auto-refreshing cards, one per discovered database, each with a health pill and a colored strip along the top matching it. The pill shows the **same replication state the CLI computes** (`HEALTHY` / `LAGGING` / `CRITICAL` / `BROKEN` / `ABSENT`, hover for the reasons), not a separate heuristic — a subscription row, an active slot, a zero lag and matching table counts all read perfectly normal while an entire table's rows are missing from the target, and a dashboard that refreshes a cheap wrong answer every fifteen seconds is worse than one that refreshes a correct one. Quick `bootstrap` / `start` / `stop` / `sync-sequences` buttons per card — `bootstrap` requires the same type-the-database-name confirmation as the detail page and streams its progress into the same floating job panel. |
 | **Database** (`/database/<db>`) | Full status sections — subscription, replication slots, lag, tables per schema, sequence sync, and a schema-drift table with proposed fix DDL — plus an **Actions** panel. |
 | **Configuration** (`/config`) | **Read-only** view of the loaded `config.yaml`. Passwords are masked and never sent to the browser. Editing stays in the file / CLI. |
 | **Jobs** (`/jobs`) | List of background jobs with live, per-job captured logs and tracebacks. |
@@ -1614,6 +1690,12 @@ database; for differing per-database schema sets, run separate configs with
 The sequence below is the one the safety guarantees are designed around. Every
 step is either read-only or reversible until step 8.
 
+**Rehearse it on a clone first.** The exact rehearsal — including killing
+pg_emigrant mid-run, letting WAL retention grow, forcing a failover, and
+comparing the data by hand — is in
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md#recommended-production-rehearsal),
+alongside what is and is not covered by a test.
+
 ```bash
 # ── 1. Configure ───────────────────────────────────────────────────────────
 cp config.yaml.example config.yaml
@@ -1753,6 +1835,13 @@ environment**: what it contributes — leader election, DCS state, moving an
 endpoint — changes *which node* the tool connects to, not what PostgreSQL does
 about the slot, which is the part that determines whether data is recoverable.
 
+That distinction is a real limitation, not a technicality: nothing here
+exercises Patroni's DCS, its promotion path, a VIP moving mid-migration, or
+PostgreSQL 17+ failover slots under Patroni. **Rehearse a switchover on a clone
+before trusting this path in production** — see
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md#patroni-considerations) for
+exactly what is and is not covered, and the rehearsal procedure.
+
 ---
 
 ## Limitations
@@ -1809,6 +1898,7 @@ pip install -e ".[test]"
 pytest tests/unit                 # pure logic, no database, <1s
 pytest tests/integration          # real PostgreSQL in Docker
 pytest                            # both
+pytest tests/integration -rs      # …and say why anything was skipped
 ```
 
 The integration suite starts throw-away PostgreSQL containers and runs the real
@@ -1851,8 +1941,14 @@ replication test fail for the wrong reason.
 | Source mutation | The whole source photographed before and after; only replica identity, one publication and one slot may differ |
 | Pre-existing target | Pre-created databases, schemas and tables; out-of-scope data must survive |
 | COPY edges | Text-COPY sentinels as data, NULL vs empty string, NaN, timestamp infinities, TOAST, generated and identity columns, ctid slicing, a backend killed mid-stream |
-| Interrupts | `SIGINT`/`SIGTERM` must strand no slot; `SIGKILL` must leave a state the next run recovers from |
+| Concurrency | A second `bootstrap` started while the first is in its post-copy window must refuse (exit 7) and leave the first run's slot untouched — and the claim must die with the process, so a killed run is not locked out |
+| Interrupts | `SIGINT`/`SIGTERM` must strand no slot; `SIGKILL` must leave a state the next run recovers from. The per-phase variants pause the run *at* the named phase and wait for it to say so through a marker file, so the signal provably lands where the test claims |
+| WAL loss | A source configured with `max_slot_wal_keep_size=1MB`, written to until PostgreSQL *actually* invalidates the slot: health must go BROKEN, `reinit-sync` must refuse without changing anything, `cutover-check` must refuse, and the documented re-copy must converge |
+| Per-table replication | A table whose initial sync can never complete must not read as HEALTHY or SAFE TO CUT OVER — the failure with none of its rows on the target and a perfect lag figure |
+| Tables created after bootstrap | Picked up automatically, on every supported source version, including the `serial` and `UNIQUE`-constraint shapes; and blocking the cutover until they are |
+| Concurrent DDL | A column added on the source is reported as drift, blocks the cutover, and the stream converges once `detect-ddl --apply` has reconciled it |
 | Security | No command prints the database password on either stream, including the diagnostics that quote a connection string |
+| Size and time | A configurable large-table copy (`ctid` slicing under load) and a live-migration soak ending in a real cutover decision — see below |
 
 ### Docker environments
 
@@ -1882,6 +1978,36 @@ Failure injection is deliberately unreachable from `config.yaml`: config files
 get copied between environments, an environment variable named for testing does
 not. A unit test asserts it is inert by default.
 
+`PG_EMIGRANT_TEST_PAUSE_AT=<phase>` blocks at a phase instead of failing at it —
+what the signal tests need, since "SIGTERM during the index build" otherwise
+means racing a phase that lasts milliseconds. `PG_EMIGRANT_TEST_PAUSE_MARKER=<path>`
+names a file the pause writes the phase into before blocking, so the test waits
+for evidence that the run arrived rather than sleeping and hoping.
+
+### Stress and soak
+
+Both always run, at a size and duration small enough to cost a few seconds, so
+neither can quietly rot. The real runs are the same knobs turned up:
+
+```bash
+# A genuinely large initial copy — ctid slicing, streaming, convergence.
+# Raise the container datadir alongside the row count: a tmpfs that runs out
+# of space surfaces as a bare "connection was closed in the middle of
+# operation", which looks like a pg_emigrant bug and is not one.
+PG_EMIGRANT_STRESS_ROWS=5000000 PG_EMIGRANT_TEST_TMPFS_SIZE=8g \
+  pytest tests/integration/test_stress_and_soak.py -q -s
+
+# A live migration under continuous write load, ending in a cutover decision
+# and a full source/target comparison.
+PG_EMIGRANT_SOAK_SECONDS=3600 \
+  pytest tests/integration/test_stress_and_soak.py -k soak -q -s
+```
+
+The stress test prints rows, physical pages and elapsed time rather than
+asserting a threshold — a timing assertion would only be a flaky test on a busy
+machine. See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for the
+benchmark methodology and what to watch during a real migration.
+
 ---
 
 ## Project layout
@@ -1892,6 +2018,7 @@ pg_emigrant/
 ├── config.yaml.example     # sample configuration
 ├── LICENSE                 # MIT
 ├── README.md
+├── PRODUCTION_READINESS.md # guarantee matrix, unsupported scenarios, remaining risks
 ├── docker/                 # long-lived clusters for hand testing (not used by the suite)
 ├── .github/workflows/      # unit + per-version-pair integration + lint
 ├── tests/
@@ -1915,7 +2042,7 @@ pg_emigrant/
     ├── monitor.py          # read-only status dashboard (rich/simple/json)
     ├── health.py           # replication state, lag, WAL retention
     ├── cutover.py          # read-only cutover readiness
-    ├── guards.py           # unskippable pre-mutation checks (cluster identity)
+    ├── guards.py           # unskippable pre-mutation checks (cluster identity, migration lock)
     ├── scope.py            # exclude_tables matching, applied everywhere
     ├── report.py           # bootstrap terminal outcomes
     ├── exits.py            # stable CLI exit codes
@@ -1948,10 +2075,10 @@ pg_emigrant/
 | `sequence_sync.py` | `sync_sequences_once()` (forward-only writes, orphan handling), `get_sequence_status()` (read-only), `run_sequence_sync_loop()`. |
 | `ddl_detector.py` | `detect_drift()` (full object comparison → `DriftReport`/`DriftItem`) and `apply_drift_fixes()` (applies fixes, schedules tablesync for new tables). |
 | `monitor.py` | `build_status()` and the rich/simple/json renderers for the status dashboard. `_collect_db_status()` returns the raw per-database status dict reused by the web GUI. |
-| `health.py` | `replication_health()` — HEALTHY/LAGGING/CRITICAL/BROKEN/ABSENT plus unapplied-WAL lag, WAL retained by the slot, `wal_status` and apply-error count. Read-only. |
+| `health.py` | `replication_health()` — HEALTHY/LAGGING/CRITICAL/BROKEN/ABSENT plus unapplied-WAL lag, WAL retained by the slot, `wal_status`, apply/sync error counts, the per-table `pg_subscription_rel` state that says whether every published table is actually streaming, and the in-scope source tables the subscription does not know about at all. Read-only. |
 | `cutover.py` | `check_cutover_readiness()` — the read-only SAFE / DO NOT CUT OVER decision. Takes no action of its own. |
-| `guards.py` | `assert_distinct_clusters()` — the `system_identifier` check, enforced where mutation happens rather than only in the (skippable) preflight. |
-| `scope.py` | `exclude_tables` pattern matching and the safety check refusing to exclude a table a migrated table references. |
+| `guards.py` | Checks enforced where the mutation happens rather than only in the (skippable) preflight: `assert_distinct_clusters()` — the `system_identifier` check — and `migration_lock()`, the source-side session advisory lock that stops two concurrent runs of the same configuration destroying each other's work. |
+| `scope.py` | `exclude_tables` pattern matching and `check_exclusions_are_safe()`, which refuses to exclude a table a migrated table references by foreign key — enforced by `bootstrap` before anything is cleared, not only by preflight. |
 | `report.py` | `BootstrapReport` / `Outcome` — the four terminal states and their exit codes. |
 | `exits.py` | The stable exit-code table. |
 | `_testhooks.py` | Failure injection for the test suite; inert unless two environment variables are both set. |

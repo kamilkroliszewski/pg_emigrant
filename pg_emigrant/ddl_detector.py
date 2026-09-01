@@ -825,8 +825,6 @@ async def apply_drift_fixes(
     Args:
         drop_extra: When True, also DROP tables that exist on target but not on source.
     """
-    from pg_emigrant.replication import refresh_subscription
-
     outcome = DriftFixResult()
     new_tables: list[tuple[str, str]] = []  # (schema, table) of tables we just created
 
@@ -888,23 +886,39 @@ async def apply_drift_fixes(
                         f"{item.object_type} {item.schema}.{item.name}: {exc}"
                     )
 
-    # Refresh the subscription with copy_data=true so PostgreSQL's tablesync
-    # worker handles the initial data copy for newly added tables.  This
-    # coordinates the snapshot and WAL position internally, preventing the
-    # duplicate-key / WAL conflict that a manual COPY would cause.
+    # Bring the tables just created into replication.  Not a bare
+    # ALTER SUBSCRIPTION ... REFRESH: on a source older than PostgreSQL 15 the
+    # publication is a frozen FOR TABLE list, so a refresh finds nothing new
+    # and the table is never published at all.  The result was a target table
+    # created, reported as applied, permanently EMPTY — and then invisible:
+    # the next drift scan sees it on both sides and says "No drift detected",
+    # health says HEALTHY, and cutover-check says SAFE TO CUT OVER.  Reproduced
+    # against a PostgreSQL 14 source.
+    #
+    # sync_new_tables is the one place that gets publication membership right
+    # on every version, and it refreshes with copy_data = true itself so
+    # PostgreSQL's own tablesync performs the initial copy — coordinating the
+    # snapshot and WAL position internally, which is what avoids the
+    # duplicate-key conflict a manual COPY would cause.
     if new_tables:
+        from pg_emigrant.replication import sync_new_tables
+
         try:
-            await refresh_subscription(cfg, dbname, copy_data=True)
+            actions = await sync_new_tables(cfg, dbname)
             log.info(
-                "Scheduled tablesync for new tables in %s: %s",
+                "Scheduled replication for new tables in %s: %s%s",
                 dbname,
                 ", ".join(f"{s}.{t}" for s, t in new_tables),
+                f" ({'; '.join(actions)})" if actions else "",
             )
         except Exception as exc:
-            # A table created but never scheduled for tablesync stays empty on
+            # A table created but never brought into replication stays empty on
             # the target while looking present, so this is a failure, not a
             # warning.
-            log.error("Could not refresh subscription for %s — %s", dbname, exc)
-            outcome.failures.append(f"subscription refresh for new tables: {exc}")
+            log.error(
+                "Could not bring the new tables in %s into replication — %s",
+                dbname, exc,
+            )
+            outcome.failures.append(f"replication setup for new tables: {exc}")
 
     return outcome

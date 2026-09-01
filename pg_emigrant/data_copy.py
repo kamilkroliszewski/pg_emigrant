@@ -13,7 +13,7 @@ from typing import Callable
 from pg_emigrant.config import ReplicatorConfig
 from pg_emigrant.db import connect
 from pg_emigrant._testhooks import maybe_fail
-from pg_emigrant.utils import get_logger, qi, qt
+from pg_emigrant.utils import get_logger, qi, ql, qt
 
 log = get_logger(__name__)
 
@@ -210,7 +210,7 @@ async def copy_table_data_pipe(
             ):
                 await src.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
                 if snapshot_id:
-                    await src.execute(f"SET TRANSACTION SNAPSHOT '{snapshot_id}';")
+                    await src.execute(f"SET TRANSACTION SNAPSHOT {ql(snapshot_id)};")
                 await tgt.execute("SET session_replication_role = 'replica';")
                 rows = await _stream_query(src, tgt, query)
                 await src.execute("COMMIT;")
@@ -229,7 +229,7 @@ async def copy_table_data_pipe(
         ):
             await src.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
             if snapshot_id:
-                await src.execute(f"SET TRANSACTION SNAPSHOT '{snapshot_id}';")
+                await src.execute(f"SET TRANSACTION SNAPSHOT {ql(snapshot_id)};")
             await tgt.execute("SET session_replication_role = 'replica';")
             row_count = await _stream_query(src, tgt, query)
             await src.execute("COMMIT;")
@@ -462,7 +462,7 @@ async def verify_copy_counts(
     mismatches: dict[str, tuple[int, int]] = {}
     async with connect(cfg.source, dbname) as src:
         await src.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
-        await src.execute(f"SET TRANSACTION SNAPSHOT '{snapshot_id}';")
+        await src.execute(f"SET TRANSACTION SNAPSHOT {ql(snapshot_id)};")
         try:
             for t in tables:
                 key = f"{t['schema_name']}.{t['table_name']}"

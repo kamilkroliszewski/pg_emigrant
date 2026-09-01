@@ -126,6 +126,33 @@ async def test_incomplete_bootstrap_exits_non_zero_with_the_migration_code(
     assert "needs_helper" in problems, problems
 
 
+async def test_an_unsafe_bootstrap_exits_refused_not_merely_failed(
+    tmp_path, cfg, source_db
+):
+    """Exit 7 has to be reachable per database, not only for the whole run.
+
+    ``refused`` and ``failed`` call for opposite responses: one says "fix the
+    cause and re-run", the other says "re-running unchanged will refuse again".
+    Collapsing an unsafe configuration into exit 4 sends a runbook into a retry
+    loop against a condition no retry can clear — and every per-database
+    refusal used to be reported that way, leaving exit 7 reachable only from
+    the same-cluster guard.
+    """
+    cfg.exclude_tables = ["app.customers"]  # app.orders has a foreign key to it
+    path = write_config(tmp_path / "config.yaml", cfg)
+
+    result = run_cli("bootstrap", "-c", str(path), "--format", "json",
+                     "--skip-preflight")
+    assert result.returncode == exits.UNSAFE_REFUSED, (
+        f"an unsatisfiable exclusion exited {result.returncode} "
+        f"(expected {exits.UNSAFE_REFUSED} = refused); stdout={result.stdout[-1500:]}"
+    )
+    payload = result.json()
+    assert payload["outcome"] == "refused"
+    problems = " ".join(payload["databases"][0]["problems"])
+    assert "app.orders" in problems and "app.customers" in problems, problems
+
+
 async def test_reinit_sync_refusal_has_its_own_exit_code_and_json(
     tmp_path, cfg, source_db
 ):

@@ -392,6 +392,28 @@ def _render_rich(data: dict[str, Any], sections: frozenset[str]) -> None:
         ))
         if h.get("apply_error_count"):
             health_table.add_row("Apply errors", str(h["apply_error_count"]))
+        if h.get("sync_error_count"):
+            health_table.add_row("Table-sync errors", str(h["sync_error_count"]))
+        # Shown always, not only when something is wrong: "12/12 streaming" is
+        # the line that makes the zero case meaningful, and an operator who
+        # only ever sees this row when it is red has no idea it exists.
+        not_ready = h.get("tables_not_ready") or []
+        not_replicated = h.get("tables_not_replicated") or []
+        total = h.get("tables_total") or 0
+        if not_ready or not_replicated:
+            detail = "; ".join(
+                filter(None, [
+                    f"not streaming: {', '.join(not_ready[:5])}" if not_ready else "",
+                    (f"not in the subscription at all: "
+                     f"{', '.join(not_replicated[:5])}") if not_replicated else "",
+                ])
+            )
+            health_table.add_row(
+                "Tables streaming",
+                f"[bold red]{total - len(not_ready)}/{total}[/bold red] — {detail}",
+            )
+        else:
+            health_table.add_row("Tables streaming", f"{total}/{total}")
         health_table.add_row("Confirmed flush LSN", str(h.get("confirmed_flush_lsn") or "—"))
         health_table.add_row("Source LSN", str(h.get("source_lsn") or "—"))
         console.print(health_table)
@@ -527,6 +549,10 @@ def _render_simple(data: dict[str, Any], sections: frozenset[str]) -> None:
             f" wal_status={_kv_quote(h.get('slot_wal_status'))}"
             f" apply_worker_running={str(h.get('apply_worker_running')).lower()}"
             f" apply_error_count={h.get('apply_error_count')}"
+            f" sync_error_count={h.get('sync_error_count')}"
+            f" tables_total={h.get('tables_total')}"
+            f" tables_not_ready={len(h.get('tables_not_ready') or [])}"
+            f" tables_not_replicated={len(h.get('tables_not_replicated') or [])}"
         )
 
     if "subscription" in sections:

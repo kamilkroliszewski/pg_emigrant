@@ -139,6 +139,7 @@ async def check_cutover_readiness(
 
         await _check_target_writable(cfg, dbname, readiness)
         health = await _check_replication(cfg, dbname, readiness, max_lag_bytes)
+        _check_tables_streaming(health, readiness)
         await _check_sequences(cfg, dbname, readiness)
         await _check_drift(cfg, dbname, readiness, accept_drift)
         _check_wal_retention(health, readiness)
@@ -218,6 +219,64 @@ async def _check_replication(cfg, dbname, readiness, max_lag_bytes):
     return health
 
 
+def _check_tables_streaming(health, readiness) -> None:
+    """Every published table must actually be streaming, not merely published.
+
+    Lag is a property of the subscription as a whole; being *in* the stream is
+    a property of each table separately.  A table whose initial sync never
+    completed is not in the stream at all — the apply worker skips it — so its
+    rows are missing on the target while the slot, the apply worker and the lag
+    figure all read as perfectly healthy.  That combination is the one shape of
+    silent data loss a lag-based check cannot see, which is why it is a check
+    of its own and an outright blocker rather than a note: cutting over now
+    means switching the application onto a table that has no data.
+    """
+    if health is None or not health.subscription_exists:
+        readiness.add(
+            "all_tables_streaming", False,
+            "per-table replication state could not be established",
+            "Without it there is no evidence that every table is actually being "
+            "replicated, only that a subscription exists.",
+        )
+        return
+    if health.tables_not_replicated:
+        readiness.add(
+            "all_tables_streaming", False,
+            f"{len(health.tables_not_replicated)} table(s) on the source are "
+            f"not part of this subscription at all",
+            f"{human_list(health.tables_not_replicated)}. Nothing is "
+            f"replicating them: they are in no publication, or in one this "
+            f"subscription has never refreshed into. Their copy on the target "
+            f"is whatever happens to be there — most likely empty — and the "
+            f"drift scan will not say so, because the table does exist on both "
+            f"sides. Run 'pg_emigrant sync-sequences' to bring them in, or add "
+            f"them to exclude_tables if they are meant to be left behind.",
+        )
+        return
+    if health.tables_not_ready:
+        readiness.add(
+            "all_tables_streaming", False,
+            f"{len(health.tables_not_ready)} of {health.tables_total} published "
+            f"table(s) are NOT streaming",
+            f"{human_list(health.tables_not_ready)}. A table is only replicated "
+            f"once its state reaches 'r' (ready); until then its rows are not on "
+            f"the target and the lag figure says nothing about it. Check the "
+            f"TARGET's log for the tablesync worker's error "
+            f"(pg_stat_subscription_stats.sync_error_count = "
+            f"{health.sync_error_count}), fix the cause, and re-check.",
+        )
+        return
+    readiness.add(
+        "all_tables_streaming", True,
+        f"all {health.tables_total} published table(s) are streaming",
+    )
+
+
+def human_list(items: list[str], limit: int = 10) -> str:
+    shown = ", ".join(items[:limit])
+    return shown + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
+
+
 async def _check_sequences(cfg, dbname, readiness) -> None:
     try:
         status = await get_sequence_status(cfg, dbname)
@@ -279,6 +338,16 @@ def _check_wal_retention(health, readiness) -> None:
     worth surfacing at exactly the moment someone is deciding to proceed.
     """
     if health is None:
+        # The health probe itself failed, so retention is unknown.  Recorded as
+        # a blocker rather than omitted: a caller reading the checks list — the
+        # JSON output exists for exactly that — must not find this check simply
+        # absent and take silence for a pass.
+        readiness.add(
+            "wal_retention", False,
+            "WAL retention could not be measured",
+            "The replication health probe failed, so how much WAL the slot is "
+            "holding on the source is unknown.",
+        )
         return
     if health.slot_wal_status in ("unreserved", "lost"):
         readiness.add(

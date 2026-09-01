@@ -563,7 +563,7 @@ async def _warn_replication_slot_blockers(conn: asyncpg.Connection) -> None:
         )
 
 
-async def _publishable_tables(
+async def publishable_tables(
     conn: asyncpg.Connection,
     schemas: list[str],
     exclude_tables: list[str] | None = None,
@@ -623,7 +623,7 @@ async def _create_publication_on(
         )
         return
 
-    table_set = await _publishable_tables(conn, schemas, exclude_tables)
+    table_set = await publishable_tables(conn, schemas, exclude_tables)
     if table_set:
         table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in sorted(table_set))
         await conn.execute(f"CREATE PUBLICATION {qi(pub)} FOR TABLE {table_list};")
@@ -1030,6 +1030,25 @@ async def refresh_subscription(
         log.info("Refreshed subscription %s in %s (copy_data=%s)", sub, dbname, copy_data_val)
 
 
+async def _published_table_set(
+    conn: asyncpg.Connection, pub: str
+) -> set[tuple[str, str]]:
+    """The tables a publication actually publishes, as the SUBSCRIBER sees them.
+
+    ``pg_publication_tables`` expands a published partitioned parent into its
+    leaf partitions, which is what makes it the right view here: with the
+    default ``publish_via_partition_root = false`` the subscriber's
+    ``pg_subscription_rel`` tracks those same leaves, so the two sets are
+    comparable.  It is NOT the right view for deciding what to ``ADD TABLE`` —
+    see the note in :func:`sync_new_tables`.
+    """
+    rows = await conn.fetch(
+        "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1",
+        pub,
+    )
+    return {(r["schemaname"], r["tablename"]) for r in rows}
+
+
 async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
     """Bring tables created on the source AFTER bootstrap into replication —
     fully automatically, with no manual ``ALTER PUBLICATION`` / ``detect-ddl
@@ -1087,23 +1106,60 @@ async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
         schemas = await discover_schemas(src, cfg)
         major = src.get_server_version().major
 
-        published_rows = await src.fetch(
-            "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1",
+        # Two different questions, two different catalogs, and conflating them
+        # was a bug.
+        #
+        # pg_publication_tables is the EXPANDED view: a published partitioned
+        # parent appears there as its leaf partitions, never as itself.  That
+        # is the right set for the target-side comparison further down, because
+        # pg_subscription_rel on the subscriber tracks leaves too.
+        #
+        # pg_publication_rel is the MEMBERSHIP catalog: the relations actually
+        # named by ALTER PUBLICATION ... ADD TABLE.  That is the right set for
+        # deciding what still needs adding — and the only one that is
+        # comparable with publishable_tables(), which returns partitioned
+        # parents and never their children.  Differencing the parent-shaped set
+        # against the leaf-shaped one left every partitioned parent looking
+        # unpublished forever, so each pass re-issued ADD TABLE for it and
+        # raised "relation ... is already member of publication".  On a pre-15
+        # source — the only kind that takes this branch — that took the whole
+        # 'sync-sequences' command down with it on every run.
+        published_tables = await _published_table_set(src, pub)
+        directly_published_rows = await src.fetch(
+            """
+            SELECT n.nspname, c.relname
+            FROM pg_publication_rel pr
+            JOIN pg_publication p ON p.oid = pr.prpubid
+            JOIN pg_class c ON c.oid = pr.prrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE p.pubname = $1
+            """,
             pub,
         )
-        published_tables = {(r["schemaname"], r["tablename"]) for r in published_rows}
+        directly_published = {
+            (r["nspname"], r["relname"]) for r in directly_published_rows
+        }
 
         # Whether the publication auto-includes new tables depends on how it
         # was created, not on the server version alone: exclude_tables forces
         # the enumerated FOR TABLE form on 15+ too (see _create_publication_on).
-        pub_has_schemas = bool(await src.fetchval(
+        #
+        # pg_publication_namespace is itself a PostgreSQL 15 catalog — it
+        # arrived with FOR TABLES IN SCHEMA — so it must not be queried at all
+        # on an older source.  Doing so raised UndefinedTableError out of this
+        # function on every PG13/14 source, which took the whole
+        # 'sync-sequences' command down with it: no new table was ever picked
+        # up AND no sequence was ever advanced, on exactly the versions where
+        # the publication is a frozen FOR TABLE list and this pass is the only
+        # thing that could add to it.
+        pub_has_schemas = major >= 15 and bool(await src.fetchval(
             "SELECT 1 FROM pg_publication_namespace pn"
             " JOIN pg_publication p ON p.oid = pn.pnpubid WHERE p.pubname = $1",
             pub,
         ))
-        if major < 15 or not pub_has_schemas:
-            current_tables = await _publishable_tables(src, schemas, cfg.exclude_tables)
-            new_tables = sorted(current_tables - published_tables)
+        if not pub_has_schemas:
+            current_tables = await publishable_tables(src, schemas, cfg.exclude_tables)
+            new_tables = sorted(current_tables - directly_published)
             if new_tables:
                 table_list = ", ".join(f"{qi(s)}.{qi(t)}" for s, t in new_tables)
                 await src.execute(f"ALTER PUBLICATION {qi(pub)} ADD TABLE {table_list};")
@@ -1116,7 +1172,10 @@ async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
                     "(this publication enumerates its tables; PostgreSQL %d source): %s",
                     dbname, len(new_tables), pub, major, new_tables,
                 )
-                published_tables |= set(new_tables)
+                # Re-read rather than union the names just added: adding a
+                # partitioned parent publishes its leaves, and it is the leaves
+                # the target's subscription tracks.
+                published_tables = await _published_table_set(src, pub)
         else:
             pub_schema_rows = await src.fetch(
                 """
@@ -1139,12 +1198,7 @@ async def sync_new_tables(cfg: ReplicatorConfig, dbname: str) -> list[str]:
                     "sync_new_tables [%s]: added schema(s) %s to publication %s (auto-discover mode)",
                     dbname, new_schemas, pub,
                 )
-                published_rows = await src.fetch(
-                    "SELECT schemaname, tablename FROM pg_publication_tables"
-                    " WHERE pubname = $1",
-                    pub,
-                )
-                published_tables = {(r["schemaname"], r["tablename"]) for r in published_rows}
+                published_tables = await _published_table_set(src, pub)
             # Tables created later in an already-published schema join the
             # publication automatically (FOR TABLES IN SCHEMA) — no action.
 
@@ -1460,7 +1514,8 @@ async def reinit_sync(
                 "committed on the source since %s can no longer be streamed to "
                 "the target. Recreating the subscription now would produce a "
                 "target that is silently and permanently missing those rows "
-                "while reporting itself healthy. Nothing was changed. The only "
+                "while reporting itself healthy. No replication slot and no "
+                "subscription were touched. The only "
                 "repair that restores consistency is a re-copy: "
                 "'pg_emigrant teardown --database %s' then "
                 "'pg_emigrant bootstrap --database %s'. If you have verified "
@@ -1468,10 +1523,22 @@ async def reinit_sync(
                 "no writes in that window), re-run with --allow-data-gap.",
                 dbname, gap_start, dbname, dbname,
             )
+            # "Nothing was changed" has to be literally true, and step 1 may
+            # already have recreated a missing publication — additive, needed
+            # by either outcome, and not something a refusal should claim it
+            # did not do.  What matters is that no slot and no subscription
+            # were touched, so the broken state is still exactly as inspectable
+            # as it was; say that precisely instead.
+            unchanged = (
+                "No replication slot or subscription was touched"
+                + (" (a missing publication was recreated on the source)"
+                   if actions else "")
+                + "."
+            )
             issues.append(
                 "DATA-GAP REFUSED: the replication slot is gone/lost, so writes "
-                f"since {gap_start} can never reach the target. Nothing was "
-                f"changed. Re-copy to restore consistency ('teardown --database "
+                f"since {gap_start} can never reach the target. {unchanged} "
+                f"Re-copy to restore consistency ('teardown --database "
                 f"{dbname}' + 'bootstrap --database {dbname}'), or re-run with "
                 f"--allow-data-gap to accept permanent data loss."
             )

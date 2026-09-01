@@ -120,11 +120,13 @@ async def test_cutover_check_says_safe_only_when_everything_is_verified(cfg, sou
         "a healthy, caught-up migration was not considered ready: "
         + "; ".join(f"{c.name}: {c.summary}" for c in report.databases[0].blockers)
     )
+    # The complete set, pinned: a check silently disappearing is how a
+    # readiness report starts approving something it no longer verifies.
     names = {c.name for c in report.databases[0].checks}
     assert names == {
         "cluster_identity", "target_writable", "replication_healthy",
-        "replication_caught_up", "sequences_synchronised", "no_schema_drift",
-        "wal_retention",
+        "replication_caught_up", "all_tables_streaming",
+        "sequences_synchronised", "no_schema_drift", "wal_retention",
     }
 
 

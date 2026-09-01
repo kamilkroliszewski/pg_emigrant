@@ -20,6 +20,14 @@ switched on by one stray environment variable is a production hazard:
   means racing a phase that lasts milliseconds, and the test either misses the
   window or lands somewhere else entirely — asserting nothing while appearing
   to pass.
+* ``PG_EMIGRANT_TEST_PAUSE_MARKER=<path>`` names a file the pause writes the
+  phase into *before* it blocks.  Pausing alone is not enough to make the test
+  honest: the test still has to guess when the run has arrived, and a guess
+  ("the slot exists, so sleep three seconds") interrupts whichever phase the
+  run happens to be in when the sleep ends.  The marker turns that guess into
+  an observation — the test waits for the file to name the phase it asked for,
+  so a run that never reaches it fails on the marker's own timeout instead of
+  passing while asserting nothing.
 
 The arming switch is required for all of them.  With only a phase variable
 set, hooks stay inert and a loud warning is logged once, because that
@@ -41,6 +49,7 @@ log = get_logger(__name__)
 ARM_VAR = "PG_EMIGRANT_TEST_HOOKS_ENABLED"
 PHASE_VAR = "PG_EMIGRANT_TEST_FAIL_AT"
 PAUSE_VAR = "PG_EMIGRANT_TEST_PAUSE_AT"
+MARKER_VAR = "PG_EMIGRANT_TEST_PAUSE_MARKER"
 
 # How long a paused phase blocks before giving up.  Bounded so a test that
 # forgets to signal the process fails on its own timeout rather than hanging
@@ -124,8 +133,29 @@ async def maybe_fail(phase: str) -> None:
         log.error(
             "TEST HOOK: pausing at phase %r for up to %ds", phase, PAUSE_SECONDS
         )
+        _write_marker(phase)
         await asyncio.sleep(PAUSE_SECONDS)
         return
     if active_phase() == phase:
         log.error("TEST HOOK: injecting a failure at phase %r", phase)
         raise InjectedFailure(f"injected test failure at phase {phase!r}")
+
+
+def _write_marker(phase: str) -> None:
+    """Record that the run has actually arrived at *phase*, for the test to see.
+
+    Written before the pause blocks, and written atomically (temp file plus
+    ``os.replace``) so a test polling the path never reads a half-written name
+    and concludes the wrong phase.  Silent when no marker path is configured —
+    the pause hook is useful without one.
+    """
+    path = os.environ.get(MARKER_VAR)
+    if not path:
+        return
+    try:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(phase)
+        os.replace(tmp, path)
+    except OSError as exc:  # a marker is diagnostics, never a reason to abort
+        log.warning("TEST HOOK: could not write pause marker %s: %s", path, exc)

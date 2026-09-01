@@ -91,6 +91,19 @@ function sectionError(msg) {
 }
 
 /* ── Health computation (dashboard) ──────────────────────────────────────── */
+
+// Maps the authoritative state from pg_emigrant.health onto the pill's three
+// colours.  Anything that is not HEALTHY is at least a warning: the states
+// exist precisely because "a subscription row exists and the lag looks small"
+// is not the same question as "is this database safe to cut over to".
+const HEALTH_STATE_CLASS = {
+  healthy:  'ok',
+  lagging:  'warn',
+  critical: 'err',
+  broken:   'err',
+  absent:   'warn',
+};
+
 function computeHealth(data) {
   const errs = data.errors || {};
   const slots = data.slots || [];
@@ -100,6 +113,22 @@ function computeHealth(data) {
   // Hard failure: cannot reach servers for the core sections.
   if (errs.subscription || errs.slots || errs.lag) {
     return { cls: 'err', label: 'error' };
+  }
+
+  // Prefer the real health state whenever it was collected.  The heuristics
+  // below cannot see the two failures that look most like health: a table
+  // whose initial sync never completes, and a table that exists on both
+  // servers but is in no publication.  In both cases every signal this
+  // function has access to — a slot, a subscription, a zero lag, matching
+  // table COUNTS — reads perfectly normal while an entire table's rows are
+  // missing from the target.  Showing a green pill over that is exactly the
+  // misrepresentation the health state was added to prevent, so when the
+  // state is available it wins outright.
+  const health = data.health;
+  if (health && health.state && !errs.health) {
+    const cls = HEALTH_STATE_CLASS[health.state] || 'warn';
+    const label = health.state === 'healthy' ? 'ok' : health.state;
+    return { cls: cls, label: label, reasons: health.reasons || [] };
   }
   const slotActive = slots.some(s => s.active);
   const tableMismatch = tables.some(t => t.source !== t.target);
@@ -133,7 +162,11 @@ const driftLoaded = new Set();   // databases whose drift has already been scann
 // Light, cheap sections rendered for every database in a single batch request.
 // Schema drift is the most expensive section, so it is NOT fetched here — it is
 // loaded lazily, per card, only when a card scrolls into view (see below).
-const DASH_LIGHT_SECTIONS = 'subscription,slots,lag,tables';
+// 'health' is included despite being the least cheap of them: it is the only
+// section that answers "is this database actually safe", and a dashboard that
+// refreshes a cheap wrong answer every fifteen seconds is worse than one that
+// refreshes a correct one.
+const DASH_LIGHT_SECTIONS = 'health,subscription,slots,lag,tables';
 // Auto-refresh cadence for the dashboard.  Deliberately gentler than the other
 // pages because refreshing many databases at once is comparatively heavy.
 const DASH_REFRESH_MS = 15000;
@@ -325,6 +358,11 @@ function populateCard(data) {
   pill.className = 'health-pill ' + health.cls;
   pill.querySelector('.dot').className = 'dot dot-' + health.cls;
   pill.querySelector('.health-label').textContent = health.label;
+  // The reasons are what make a non-green pill actionable; without them the
+  // operator has a colour and no idea which table is missing.
+  pill.title = (health.reasons && health.reasons.length)
+    ? health.reasons.join('\n')
+    : '';
   setCardHealth(card, health.cls);
 
   const subs = data.subscription || [];
