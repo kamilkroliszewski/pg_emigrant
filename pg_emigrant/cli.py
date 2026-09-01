@@ -439,6 +439,11 @@ def sync_sequences(
             return '"' + v.replace('"', '\\"') + '"'
         return v
 
+    # Collected inside _sync() and inspected after it returns: a new-table
+    # reconciliation failure must not stop the sequence sync, but it must
+    # still make the command exit non-zero.
+    new_table_failures: list[str] = []
+
     async def _sync():
         dbs = [database] if database else await discover_databases(cfg)
 
@@ -457,11 +462,25 @@ def sync_sequences(
         # One-shot mode also reconciles newly created tables — including
         # right before a final cutover sync, where leaving a just-created
         # table unreplicated would be worse than catching it up.
+        #
+        # The two jobs are independent and the sequence sync is the one with a
+        # deadline: it is the last thing run before a cutover, and a target
+        # whose sequences were never advanced hands out already-used values on
+        # the first insert afterwards.  So a failure in the new-table pass is
+        # reported loudly and made to exit non-zero, but it does not take the
+        # sequence sync down with it.
         from pg_emigrant.replication import sync_new_tables
         new_table_actions = await asyncio.gather(
-            *[sync_new_tables(cfg, db) for db in dbs]
+            *[sync_new_tables(cfg, db) for db in dbs], return_exceptions=True
         )
         for db, actions in zip(dbs, new_table_actions):
+            if isinstance(actions, BaseException):
+                new_table_failures.append(f"{db}: {actions}")
+                console.print(
+                    f"  [bold red]✗ [{db}] could not reconcile tables created "
+                    f"since bootstrap: {actions}[/bold red]"
+                )
+                continue
             for action in actions:
                 console.print(f"  [{db}] {action}")
 
@@ -511,6 +530,26 @@ def sync_sequences(
             print(_json.dumps(all_data, indent=2, default=str))
 
     _run(_sync())
+
+    if new_table_failures:
+        # The sequences above were synchronised; these tables were not brought
+        # into replication, so the target is missing a table the source has.
+        # Exit 4 rather than 0: 'detect-ddl' will show it as drift and
+        # 'cutover-check' will refuse on it, and a runbook step that reported
+        # success here would hide both until the cutover.
+        console.print(
+            "\n[bold red]Sequences were synchronised, but "
+            f"{len(new_table_failures)} database(s) had tables created since "
+            "bootstrap that could NOT be brought into replication:[/bold red]"
+        )
+        for failure in new_table_failures:
+            console.print(f"  [red]• {failure}[/red]")
+        console.print(
+            "[red]Those tables are not being replicated. Run "
+            "'pg_emigrant detect-ddl --database <db>' to see what is missing on "
+            "the target; 'cutover-check' refuses while it is outstanding.[/red]"
+        )
+        raise typer.Exit(code=exits.MIGRATION_FAILED)
 
 
 @app.command(name="detect-ddl")
